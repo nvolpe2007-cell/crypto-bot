@@ -1,0 +1,39 @@
+# Crypto Scalping Bot Configuration
+
+exchange:
+  name: kraken
+  sandbox: true  # Use testnet/sandbox for paper trading
+
+trading:
+  mode: paper  # paper or live
+  initial_capital: 100
+  pairs:
+    - BTC/USD
+    - ETH/USD
+    - SOL/USD
+  timeframe: 1m
+
+strategy:
+  fast_ema: 9
+  slow_ema: 21
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+
+risk:
+  max_position_size: 50  # USD
+  stop_loss_pct: 2.0
+  take_profit_pct: 3.0
+  max_daily_loss: 10
+  max_open_positions: 3
+
+backtest:
+  # Historical period to test
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_balance: 100
+
+logging:
+  level: INFO
+  file: logs/bot.log
+  save_trades: true

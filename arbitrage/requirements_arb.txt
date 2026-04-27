@@ -1,0 +1,3 @@
+aiohttp>=3.9.0
+web3>=6.0.0  # For DEX interactions (optional)
+solana>=0.30.0  # For Solana DEX (optional)

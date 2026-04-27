@@ -1,0 +1,18 @@
+[Unit]
+Description=Crypto Scalping Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crypto-bot
+EnvironmentFile=/opt/crypto-bot/.env
+ExecStart=/opt/crypto-bot/venv/bin/python -m src.bot
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
