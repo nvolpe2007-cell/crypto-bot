@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent / "arbitrage"))
 
 from src.bot import ScalpingBot
+from src.dashboard import run_dashboard
 from arbitrage.dex_arb import DEXArbitrageBot, Chain
 from arbitrage.stablecoin_arb import StablecoinArbBot
 from arbitrage.funding_rate_arb import FundingRateArbBot
@@ -92,7 +93,10 @@ class MasterBotRunner:
             )
             asyncio.create_task(self.funding_arb_bot.start())
 
-        logger.info("✅ All bots started. Press Ctrl+C to stop.")
+        logger.info("✅ All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
+
+        # Start dashboard server alongside bots
+        asyncio.create_task(run_dashboard(host="0.0.0.0", port=8080))
 
         # Keep running
         while self.running:
