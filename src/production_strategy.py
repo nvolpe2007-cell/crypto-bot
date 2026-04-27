@@ -114,7 +114,7 @@ class ProductionStrategy:
             signal=sig,
             close=price,
             rsi=round(rsi_val, 2),
-            ema100=round(row['ema50'], 2),
+            ema100=round(row['ema50'], 2),  # field named ema100 but strategy uses ema50
             ema200=round(row['ema200'], 2),
             adx=round(row['adx'], 2),
             atr=round(atr, 4),

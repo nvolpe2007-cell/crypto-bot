@@ -276,9 +276,10 @@ async def main():
         for name, sym, r in test_only[:5]:
             print(f"    {name:<30} {sym:<10} PF={r.profit_factor:.2f}  Ret={r.total_return_pct:+.1f}%  T={r.trades}")
 
-    pd.DataFrame([vars(r) for _, r in all_results]).to_csv(
-        '/opt/crypto-bot/data/backtest_round6.csv', index=False)
-    print("\nSaved to /opt/crypto-bot/data/backtest_round6.csv")
+    out_path = os.path.join(os.path.dirname(__file__), 'data', 'backtest_round6.csv')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    pd.DataFrame([vars(r) for _, r in all_results]).to_csv(out_path, index=False)
+    print(f"\nSaved to {out_path}")
 
 
 if __name__ == '__main__':

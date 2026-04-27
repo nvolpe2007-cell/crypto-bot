@@ -8,8 +8,12 @@ import yaml
 import os
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 from dotenv import load_dotenv
+
+# Ensure logs/ directory exists before FileHandler is created
+Path('logs').mkdir(exist_ok=True)
 
 from .exchange import ExchangeConnection
 from .indicators import prepare_ohlcv_dataframe

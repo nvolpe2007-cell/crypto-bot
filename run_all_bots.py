@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent / "arbitrage"))
 
 from src.bot import ScalpingBot
-from src.advanced_indicators import AdvancedScalpingStrategy
 from arbitrage.dex_arb import DEXArbitrageBot, Chain
 from arbitrage.stablecoin_arb import StablecoinArbBot
 from arbitrage.funding_rate_arb import FundingRateArbBot
@@ -49,10 +48,13 @@ class MasterBotRunner:
         self.running = True
         logger.info("🚀 Starting Master Bot Runner...")
 
-        # Setup signal handlers
+        # Setup signal handlers (add_signal_handler is Unix-only)
         loop = asyncio.get_event_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+        try:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+        except NotImplementedError:
+            pass  # Windows: handled by KeyboardInterrupt in main()
 
         # Start scalping bot (paper trading mode)
         if self.config.get("scalping", {}).get("enabled", True):

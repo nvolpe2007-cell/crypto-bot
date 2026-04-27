@@ -39,26 +39,25 @@ class ExchangeConnection:
         await self.exchange.close()
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m',
-                          limit: int = 1000, since: Optional[int] = None) -> List:
+                          limit: int = 1000, since: Optional[int] = None,
+                          retries: int = 3) -> List:
         """
-        Fetch candlestick data
-
-        Args:
-            symbol: Trading pair (e.g., 'BTC/USD')
-            timeframe: Candle timeframe
-            limit: Number of candles to fetch
-            since: Unix timestamp in milliseconds to start from
+        Fetch candlestick data with automatic retry on network errors.
 
         Returns:
             List of [timestamp, open, high, low, close, volume]
         """
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
-            logger.debug(f"Fetched {len(ohlcv)} candles for {symbol}")
-            return ohlcv
-        except Exception as e:
-            logger.error(f"Error fetching OHLCV for {symbol}: {e}")
-            return []
+        for attempt in range(1, retries + 1):
+            try:
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
+                logger.debug(f"Fetched {len(ohlcv)} candles for {symbol}")
+                return ohlcv
+            except Exception as e:
+                logger.warning(f"OHLCV fetch attempt {attempt}/{retries} failed for {symbol}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(2 ** attempt)  # exponential backoff: 2s, 4s
+        logger.error(f"All {retries} OHLCV fetch attempts failed for {symbol}")
+        return []
 
     async def fetch_ohlcv_between(self, symbol: str, timeframe: str,
                                    start_date: str, end_date: str) -> List:
