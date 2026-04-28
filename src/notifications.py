@@ -106,17 +106,46 @@ class TelegramNotifier:
 
         return self.send_message(message)
 
+    def send_win(self, symbol: str, pnl: float, pnl_pct: float,
+                 exit_price: float, total_equity: float, reason: str = ""):
+        """Send a WIN notification with money emojis."""
+        money_emojis = "💰" * min(10, max(1, int(pnl // 5) + 1))
+        message = (
+            f"💸💸💸 <b>WIN</b> 💸💸💸\n\n"
+            f"{money_emojis}\n\n"
+            f"<b>+${pnl:.2f}</b>  ({pnl_pct:+.2f}%)\n\n"
+            f"Pair:   <code>{symbol}</code>\n"
+            f"Exit:   <code>${exit_price:.2f}</code>\n"
+            f"Reason: {reason}\n\n"
+            f"💼 Account: <b>${total_equity:.2f}</b>"
+        )
+        return self.send_message(message)
+
+    def send_loss(self, symbol: str, pnl: float, pnl_pct: float,
+                  exit_price: float, total_equity: float, reason: str = ""):
+        """Send a loss notification."""
+        message = (
+            f"🔴 <b>LOSS</b>\n\n"
+            f"<b>${pnl:.2f}</b>  ({pnl_pct:+.2f}%)\n\n"
+            f"Pair:   <code>{symbol}</code>\n"
+            f"Exit:   <code>${exit_price:.2f}</code>\n"
+            f"Reason: {reason}\n\n"
+            f"💼 Account: <b>${total_equity:.2f}</b>"
+        )
+        return self.send_message(message)
+
     def send_status(self, capital: float, pnl: float, pnl_pct: float,
                     open_positions: int, trades_today: int):
         """Send periodic status update"""
-        emoji = "✅" if pnl >= 0 else "❌"
+        emoji = "📈" if pnl >= 0 else "📉"
+        money = "💰" if pnl >= 0 else "🔴"
 
         message = (
             f"📊 <b>BOT STATUS</b>\n\n"
-            f"Capital: <code>${capital:.2f}</code>\n"
-            f"PnL: <code>${pnl:+.2f}</code> ({pnl_pct:+.2f}%) {emoji}\n"
-            f"Open Positions: <code>{open_positions}</code>\n"
-            f"Trades Today: <code>{trades_today}</code>"
+            f"{money} PnL: <b>${pnl:+.2f}</b> ({pnl_pct:+.2f}%) {emoji}\n"
+            f"💼 Account: <code>${capital:.2f}</code>\n"
+            f"📂 Open:    <code>{open_positions}</code>\n"
+            f"🔁 Trades:  <code>{trades_today}</code>"
         )
 
         return self.send_message(message)

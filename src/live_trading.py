@@ -181,19 +181,26 @@ class LiveTrader:
     def _notify_trade(self, symbol: str, price: float, pnl: float,
                       pnl_pct: float, reason: str, total_equity: float):
         if pnl > 0:
-            msg = (f"💵 <b>WINNING TRADE</b>\n\n"
-                   f"Pair:      <code>{symbol}</code>\n"
-                   f"Profit:    <code>+${pnl:.2f}</code> ({pnl_pct:+.2f}%) 💰\n"
-                   f"Exit:      <code>${price:.2f}</code>\n"
-                   f"Balance:   <code>${total_equity:.2f}</code>\n"
-                   f"Reason:    {reason}")
+            # Scale emoji count to size of win
+            money_emojis = "💰" * min(10, max(1, int(pnl // 5) + 1))
+            msg = (
+                f"💸💸💸 <b>WIN</b> 💸💸💸\n\n"
+                f"{money_emojis}\n\n"
+                f"<b>+${pnl:.2f}</b>  ({pnl_pct:+.2f}%)\n\n"
+                f"Pair:      <code>{symbol}</code>\n"
+                f"Exit:      <code>${price:.2f}</code>\n"
+                f"Reason:    {reason}\n\n"
+                f"💼 Account: <b>${total_equity:.2f}</b>"
+            )
         else:
-            msg = (f"🔴 <b>LOSS</b>\n\n"
-                   f"Pair:      <code>{symbol}</code>\n"
-                   f"Loss:      <code>${pnl:.2f}</code> ({pnl_pct:+.2f}%)\n"
-                   f"Exit:      <code>${price:.2f}</code>\n"
-                   f"Balance:   <code>${total_equity:.2f}</code>\n"
-                   f"Reason:    {reason}")
+            msg = (
+                f"🔴 <b>LOSS</b>\n\n"
+                f"<b>${pnl:.2f}</b>  ({pnl_pct:+.2f}%)\n\n"
+                f"Pair:      <code>{symbol}</code>\n"
+                f"Exit:      <code>${price:.2f}</code>\n"
+                f"Reason:    {reason}\n\n"
+                f"💼 Account: <b>${total_equity:.2f}</b>"
+            )
         self._notify(msg)
 
 
