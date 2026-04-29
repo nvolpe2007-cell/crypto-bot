@@ -138,7 +138,7 @@ class AdvancedStrategy:
         else:
             score += 7
 
-        return min(100, score)
+        return max(0, min(100, score))
 
     def calculate(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()

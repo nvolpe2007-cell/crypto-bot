@@ -26,6 +26,7 @@ class PaperPosition:
     size: float
     side: str
     unrealized_pnl: float = 0.0
+    entry_fee: float = 0.0  # buy-side fee paid at entry
 
 
 @dataclass
@@ -89,7 +90,8 @@ class PaperTrader:
             entry_time=timestamp,
             entry_price=exec_price,
             size=size,
-            side='buy'
+            side='buy',
+            entry_fee=fee,
         )
         self.account.positions[symbol] = position
 
@@ -106,14 +108,15 @@ class PaperTrader:
 
         # Apply slippage and fees
         exec_price = price * (1 - self.slippage_pct)
-        fee = exec_price * position.size * self.fee_pct
+        exit_fee = exec_price * position.size * self.fee_pct
+        total_fees = exit_fee + position.entry_fee
 
-        # Calculate PnL
-        pnl = (exec_price - position.entry_price) * position.size - fee
+        # Calculate PnL — include both entry and exit fees
+        pnl = (exec_price - position.entry_price) * position.size - total_fees
         pnl_pct = (exec_price - position.entry_price) / position.entry_price * 100
 
         # Update account
-        self.account.cash += exec_price * position.size - fee
+        self.account.cash += exec_price * position.size - exit_fee
         self.account.total_pnl += pnl
 
         # Create trade record
@@ -126,7 +129,7 @@ class PaperTrader:
             side='sell',
             pnl=pnl,
             pnl_pct=pnl_pct,
-            fees=fee
+            fees=total_fees,
         )
         self.account.closed_trades.append(trade)
         del self.account.positions[symbol]
