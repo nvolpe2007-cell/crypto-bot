@@ -334,11 +334,8 @@ async def run_live_trading_session(exchange: ExchangeConnection,
                 if signal is None:
                     continue
 
-                # Compute confidence score
-                df_calc = trader.strategy.calculate(df)
-                last_row = df_calc.iloc[-1].to_dict()
-                last_row['signal'] = signal.signal
-                score = trader.strategy.confidence_score(last_row)
+                # Use the confidence score already computed by the strategy
+                score = signal.confidence
 
                 indicators[symbol] = {
                     'signal': signal.signal.value,
