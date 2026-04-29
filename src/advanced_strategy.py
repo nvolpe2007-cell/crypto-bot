@@ -77,7 +77,7 @@ class AdvancedStrategy:
                  volume_period: int = 20,
                  volume_threshold: float = 1.3,
                  adx_period: int = 14,
-                 adx_threshold: float = 25.0):
+                 adx_threshold: float = 20.0):
         self.fast_ema = fast_ema
         self.slow_ema = slow_ema
         self.trend_ema = trend_ema
@@ -111,9 +111,9 @@ class AdvancedStrategy:
         adx = row.get('adx', 0) or 0
         score += min(25, int((adx / 40) * 25))
 
-        # Volume ratio (0-20 pts)
+        # Volume ratio (0-20 pts) — rewards high volume but no longer hard-blocks
         vr = row.get('volume_ratio', 0) or 0
-        score += min(20, int(((vr - 1) / 1.5) * 20))
+        score += min(20, max(0, int(((vr - 0.5) / 1.5) * 20)))
 
         # RSI position (0-20 pts): for buy, lower RSI = better; for sell, higher = better
         rsi = row.get('rsi', 50) or 50
@@ -127,16 +127,26 @@ class AdvancedStrategy:
         macd = abs(row.get('macd', 0.0001) or 0.0001)
         score += min(20, int((hist / (macd + 1e-9)) * 10))
 
-        # ATR / close ratio — volatility sweet spot (0-15 pts)
+        # ATR / close ratio — volatility sweet spot (0-10 pts)
         atr = row.get('atr', 0) or 0
         close = row.get('close', 1) or 1
         atr_pct = (atr / close) * 100
         if 0.3 <= atr_pct <= 2.0:
-            score += 15
+            score += 10
         elif atr_pct < 0.3 or atr_pct > 4.0:
             score += 0
         else:
-            score += 7
+            score += 5
+
+        # Trend alignment (0-10 pts) — reward but don't require uptrend
+        ema_trend = row.get('ema_trend') or 0
+        if ema_trend and close:
+            if is_buy and close > ema_trend:
+                score += 10
+            elif not is_buy and close < ema_trend:
+                score += 10
+            else:
+                score += 3   # counter-trend trades get partial credit
 
         return min(100, score)
 
@@ -150,6 +160,8 @@ class AdvancedStrategy:
         df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=self.atr_period)
         df['vol_sma'] = df['volume'].rolling(self.volume_period).mean()
         df['volume_ratio'] = df['volume'] / df['vol_sma'].replace(0, 1)
+        # If volume data is unavailable (all zeros), bypass the volume filter
+        volume_data_ok = df['volume'].sum() > 0
 
         macd = ta.macd(df['close'], fast=self.macd_fast, slow=self.macd_slow, signal=self.macd_signal_period)
         if macd is not None:
@@ -173,8 +185,9 @@ class AdvancedStrategy:
         df['macd_bullish'] = df['macd_hist'] > 0
         df['macd_bearish'] = df['macd_hist'] < 0
 
-        # Volume confirmation
-        df['vol_ok'] = df['volume_ratio'] >= self.volume_threshold
+        # Volume: require any volume present (ratio > 0), not a surge
+        # Kraken's 1m volume data is too inconsistent for a 1.3x threshold
+        df['vol_ok'] = (df['volume_ratio'] > 0) | (~volume_data_ok)
 
         # Trend filter
         df['uptrend'] = df['close'] > df['ema_trend']
@@ -184,21 +197,20 @@ class AdvancedStrategy:
         df['trend_strong'] = df['adx'] >= self.adx_threshold
 
         # Final signals
+        # uptrend/downtrend used as confidence boost in scorer, not hard gate
         df['signal'] = Signal.HOLD
+        # Core entry: EMA crossover + RSI not extreme + ADX shows trending
+        # MACD and trend direction used only in confidence scorer, not as hard gates
         buy_cond = (
             df['cross_up'] &
             (df['rsi'] < self.rsi_overbought) &
-            df['macd_bullish'] &
             df['vol_ok'] &
-            df['uptrend'] &
             df['trend_strong']
         )
         sell_cond = (
             df['cross_down'] &
             (df['rsi'] > self.rsi_oversold) &
-            df['macd_bearish'] &
             df['vol_ok'] &
-            df['downtrend'] &
             df['trend_strong']
         )
         df.loc[buy_cond, 'signal'] = Signal.BUY

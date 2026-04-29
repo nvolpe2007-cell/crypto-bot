@@ -8,27 +8,44 @@ Launches all bots in parallel:
 - Funding rate arb
 """
 
+import sys
+import logging
+from types import ModuleType as _ModuleType
+
+# Stub numba so pandas-ta loads on Python 3.14 (numba only supports up to 3.13)
+if 'numba' not in sys.modules:
+    _numba = _ModuleType('numba')
+    _numba.njit = lambda *a, **kw: (a[0] if a and callable(a[0]) else lambda f: f)
+    sys.modules['numba'] = _numba
+
+# Configure logging with UTF-8 before any imports so sub-modules inherit it
+import os as _os
+_os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(
+            stream=open(sys.stderr.fileno(), mode='w', encoding='utf-8', closefd=False)
+        ),
+        logging.FileHandler('logs/bot.log', encoding='utf-8'),
+    ]
+)
+logger = logging.getLogger(__name__)
+
 import asyncio
 import signal
-import logging
-import sys
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-sys.path.insert(0, str(Path(__file__).parent / "arbitrage"))
+sys.path.insert(0, str(str(Path(__file__).parent / "src")))
+sys.path.insert(0, str(str(Path(__file__).parent / "arbitrage")))
 
 from src.bot import ScalpingBot
 from src.dashboard import run_dashboard
 from arbitrage.dex_arb import DEXArbitrageBot, Chain
 from arbitrage.stablecoin_arb import StablecoinArbBot
 from arbitrage.funding_rate_arb import FundingRateArbBot
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 class MasterBotRunner:
@@ -57,11 +74,11 @@ class MasterBotRunner:
         except NotImplementedError:
             pass  # Windows: handled by KeyboardInterrupt in main()
 
-        # Start scalping bot (paper trading mode)
+        # Start scalping bot (mode from config.yaml: paper or live)
         if self.config.get("scalping", {}).get("enabled", True):
             logger.info("Starting scalping bot...")
             self.scalping_bot = ScalpingBot(self.config)
-            asyncio.create_task(self.scalping_bot._run_paper_mode())
+            asyncio.create_task(self.scalping_bot.start())
 
         # Start DEX arb
         if self.config.get("dex_arb", {}).get("enabled", True):
@@ -93,7 +110,7 @@ class MasterBotRunner:
             )
             asyncio.create_task(self.funding_arb_bot.start())
 
-        logger.info("✅ All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
+        logger.info("All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
 
         # Start dashboard server alongside bots
         asyncio.create_task(run_dashboard(host="0.0.0.0", port=8080))

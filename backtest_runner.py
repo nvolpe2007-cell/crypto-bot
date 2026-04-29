@@ -7,6 +7,9 @@ Run on VPS: python backtest_runner.py
 import asyncio
 import sys
 import os
+from types import ModuleType as _M
+if 'numba' not in sys.modules:
+    _n = _M('numba'); _n.njit = lambda *a, **k: (a[0] if a and callable(a[0]) else lambda f: f); sys.modules['numba'] = _n
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
@@ -25,7 +28,7 @@ async def fetch_data_binance(symbol: str, timeframe: str = '1h', days: int = 500
     """
     Fetch historical data from Binance public API.
     Binance provides 1000 candles per request, paginated.
-    symbol: e.g. 'BTC/USD' → converted to 'BTCUSDT'
+    symbol: e.g. 'BTC/USD' ->converted to 'BTCUSDT'
     """
     import aiohttp
     from datetime import datetime, timedelta, timezone
@@ -87,10 +90,80 @@ async def fetch_data_binance(symbol: str, timeframe: str = '1h', days: int = 500
     return df
 
 
-async def fetch_data(symbol: str, timeframe: str = '1h', days: int = 500) -> pd.DataFrame:
-    print(f"  Fetching {symbol} {timeframe} ({days} days) from Binance...")
-    df = await fetch_data_binance(symbol, timeframe, days)
-    print(f"  Got {len(df)} candles for {symbol} ({df.index[0].date()} to {df.index[-1].date()})")
+async def fetch_data_bybit(symbol: str, timeframe: str = '4h', days: int = 1200) -> pd.DataFrame:
+    """Fetch historical OHLCV from Bybit — full multi-year history, no auth needed."""
+    import ccxt.async_support as ccxt
+    from datetime import datetime, timedelta, timezone
+
+    sym_map = {'BTC/USD': 'BTC/USDT', 'ETH/USD': 'ETH/USDT', 'SOL/USD': 'SOL/USDT'}
+    bybit_sym = sym_map.get(symbol, symbol.replace('/USD', '/USDT'))
+
+    exchange = ccxt.bybit({'enableRateLimit': True})
+    await exchange.load_markets()
+
+    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    all_candles = []
+    while True:
+        batch = await exchange.fetch_ohlcv(bybit_sym, timeframe, since=since, limit=1000)
+        if not batch:
+            break
+        all_candles.extend(batch)
+        if len(batch) < 1000:
+            break
+        since = batch[-1][0] + 1
+        if since >= int(datetime.now(timezone.utc).timestamp() * 1000):
+            break
+
+    await exchange.close()
+
+    if not all_candles:
+        raise ValueError(f"No data from Bybit for {symbol}")
+
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col])
+    return df
+
+
+async def fetch_data_kraken(symbol: str, timeframe: str = '1d', days: int = 720) -> pd.DataFrame:
+    """Fetch OHLCV from Kraken public API via ccxt. Paginates to collect full history."""
+    import ccxt.async_support as ccxt
+    from datetime import datetime, timedelta, timezone
+
+    exchange = ccxt.kraken({'enableRateLimit': True})
+    await exchange.load_markets()
+
+    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    all_candles = []
+    while True:
+        batch = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=720)
+        if not batch:
+            break
+        all_candles.extend(batch)
+        if len(batch) < 720:
+            break
+        since = batch[-1][0] + 1
+        if since >= int(datetime.now(timezone.utc).timestamp() * 1000):
+            break
+
+    await exchange.close()
+    if not all_candles:
+        raise ValueError(f"No data from Kraken for {symbol}")
+
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col])
+    return df.loc[~df.index.duplicated(keep='last')]
+
+
+async def fetch_data(symbol: str, timeframe: str = '1d', days: int = 720) -> pd.DataFrame:
+    print(f"  Fetching {symbol} {timeframe} ({days} days) from Kraken...")
+    df = await fetch_data_kraken(symbol, timeframe, days)
+    print(f"  Got {len(df)} candles  {df.index[0].date()} to {df.index[-1].date()}")
     return df
 
 
@@ -459,11 +532,11 @@ def print_results(results: List[Result]):
         if r.trades == 0:
             print(f"  {r.name:<26} {r.symbol:<10} {'NO TRADES':>6}")
             continue
-        flag = " ★" if r.profit_factor >= 1.5 and r.win_rate >= 45 and r.trades >= 10 else ""
+        flag = " *" if r.profit_factor >= 1.5 and r.win_rate >= 45 and r.trades >= 10 else ""
         print(f"  {r.name:<26} {r.symbol:<10} {r.trades:>6} {r.win_rate:>7.1f}% {r.total_return_pct:>8.1f}% {r.profit_factor:>6.2f} {r.max_drawdown_pct:>7.1f}% {r.sharpe:>7.2f} {r.avg_win_pct:>6.2f}% {r.avg_loss_pct:>6.2f}% {r.expectancy:>9.4f}{flag}")
 
     print("=" * 110)
-    print("★ = profit factor ≥ 1.5 AND win rate ≥ 45% AND ≥ 10 trades\n")
+    print("* = profit factor >= 1.5 AND win rate >= 45% AND >= 10 trades\n")
 
     # Best per symbol
     print("BEST STRATEGY PER SYMBOL:")
@@ -471,7 +544,7 @@ def print_results(results: List[Result]):
         sym_results = [r for r in results if r.symbol == symbol and r.trades >= 5]
         if sym_results:
             best = max(sym_results, key=lambda r: r.profit_factor)
-            print(f"  {symbol:<10} → {best.name:<28} PF={best.profit_factor:.2f}  Return={best.total_return_pct:.1f}%  WR={best.win_rate:.1f}%  Trades={best.trades}")
+            print(f"  {symbol:<10} ->{best.name:<28} PF={best.profit_factor:.2f}  Return={best.total_return_pct:.1f}%  WR={best.win_rate:.1f}%  Trades={best.trades}")
 
     # Overall winner
     valid = [r for r in results if r.trades >= 10 and r.profit_factor > 0]
