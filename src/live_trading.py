@@ -17,6 +17,8 @@ from .learner import Learner
 from .exchange import ExchangeConnection
 from .backtester import Trade
 from .notifications import TelegramNotifier
+from .market_sentiment import SentimentMonitor
+from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
 from .state import write_state
 
 logger = logging.getLogger(__name__)
@@ -45,10 +47,16 @@ class LiveTrader:
     def __init__(self,
                  exchange: ExchangeConnection,
                  position_size_usd: float = 50.0,
-                 notifier: Optional[TelegramNotifier] = None):
+                 notifier: Optional[TelegramNotifier] = None,
+                 sentiment_monitor: Optional[SentimentMonitor] = None,
+                 public_ws: Optional[KrakenPublicWS] = None,
+                 private_ws: Optional[KrakenPrivateWS] = None):
         self.exchange = exchange
         self.position_size_usd = position_size_usd
         self.notifier = notifier
+        self.sentiment_monitor = sentiment_monitor
+        self.public_ws  = public_ws
+        self.private_ws = private_ws
         self.strategy = ProductionStrategy()
         self.positions: Dict[str, LivePosition] = {}
         self.account = LiveAccount(initial_capital=position_size_usd)
@@ -180,21 +188,11 @@ class LiveTrader:
 
     def _notify_trade(self, symbol: str, price: float, pnl: float,
                       pnl_pct: float, reason: str, total_equity: float):
-        if pnl > 0:
-            msg = (f"💵 <b>WINNING TRADE</b>\n\n"
-                   f"Pair:      <code>{symbol}</code>\n"
-                   f"Profit:    <code>+${pnl:.2f}</code> ({pnl_pct:+.2f}%) 💰\n"
-                   f"Exit:      <code>${price:.2f}</code>\n"
-                   f"Balance:   <code>${total_equity:.2f}</code>\n"
-                   f"Reason:    {reason}")
-        else:
-            msg = (f"🔴 <b>LOSS</b>\n\n"
-                   f"Pair:      <code>{symbol}</code>\n"
-                   f"Loss:      <code>${pnl:.2f}</code> ({pnl_pct:+.2f}%)\n"
-                   f"Exit:      <code>${price:.2f}</code>\n"
-                   f"Balance:   <code>${total_equity:.2f}</code>\n"
-                   f"Reason:    {reason}")
-        self._notify(msg)
+        if self.notifier:
+            if pnl >= 0:
+                self.notifier.send_win(symbol, pnl, pnl_pct, price, total_equity, reason=reason)
+            else:
+                self.notifier.send_loss(symbol, pnl, pnl_pct, price, total_equity, reason=reason)
 
 
 CONFIDENCE_THRESHOLD = 75   # minimum score to place a trade
@@ -242,13 +240,21 @@ async def _check_higher_timeframes(exchange: ExchangeConnection,
         price_15m = df15['close'].iloc[-1]
 
         if direction == 'BUY':
-            tf5_ok  = ema9_5m > ema21_5m and rsi_5m < 70
-            tf15_ok = price_15m > ema50_15m
+            ema_gap = (ema9_5m - ema21_5m) / ema21_5m * 100
+            if ema_gap < -0.15 or rsi_5m >= 72:
+                return False
+            if price_15m and ema50_15m:
+                if (price_15m - ema50_15m) / ema50_15m * 100 < -1.5:
+                    return False
         else:
-            tf5_ok  = ema9_5m < ema21_5m and rsi_5m > 30
-            tf15_ok = price_15m < ema50_15m
+            ema_gap = (ema9_5m - ema21_5m) / ema21_5m * 100
+            if ema_gap > 0.15 or rsi_5m <= 28:
+                return False
+            if price_15m and ema50_15m:
+                if (price_15m - ema50_15m) / ema50_15m * 100 > 1.5:
+                    return False
 
-        return tf5_ok and tf15_ok
+        return True
     except Exception as e:
         logger.debug(f"Higher TF check failed for {symbol}: {e}")
         return False
@@ -270,37 +276,60 @@ async def run_live_trading_session(exchange: ExchangeConnection,
     indicators: Dict[str, dict] = {}
     recent_trades: List[dict] = []
     equity_curve: List[dict] = []
-    last_sltp_check = 0.0
+
+    # Real-time SL/TP watcher — uses WS prices when available, else REST every 5s
+    async def _live_sltp_watcher():
+        while trader.running:
+            await asyncio.sleep(1 if trader.public_ws else 5)
+            if not trader.positions:
+                continue
+            for symbol in list(trader.positions.keys()):
+                try:
+                    price = (trader.public_ws.get_price(symbol) if trader.public_ws else None)
+                    if not price:
+                        ticker = await exchange.get_ticker(symbol)
+                        price = float(ticker.get('last', 0))
+                    if price <= 0:
+                        continue
+                    prices[symbol] = price
+                    pos = trader.positions.get(symbol)
+                    if not pos:
+                        continue
+                    if price <= pos.stop_loss_price:
+                        trade = await trader.close_position(symbol, price, "STOP_LOSS")
+                        if trade:
+                            recent_trades.append(_trade_dict(trade, symbol, "STOP_LOSS"))
+                            equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
+                    elif price >= pos.take_profit_price:
+                        trade = await trader.close_position(symbol, price, "TAKE_PROFIT")
+                        if trade:
+                            recent_trades.append(_trade_dict(trade, symbol, "TAKE_PROFIT"))
+                            equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
+                except Exception as e:
+                    logger.debug(f"Live SL/TP watcher error {symbol}: {e}")
+
+    asyncio.create_task(_live_sltp_watcher())
+
+    import os as _os
+    max_daily_loss_usd  = float(_os.getenv('MAX_DAILY_LOSS', 10))
+    session_start_pnl   = trader.account.total_pnl
 
     while trader.running:
         try:
             now = time.time()
 
-            # ── SL/TP fast poll (every SLTP_POLL_SECS) ──────────────────────
-            if now - last_sltp_check >= SLTP_POLL_SECS and trader.positions:
-                for symbol in list(trader.positions.keys()):
-                    try:
-                        ticker = await exchange.get_ticker(symbol)
-                        price = float(ticker.get('last', 0))
-                        if price <= 0:
-                            continue
-                        prices[symbol] = price
-                        pos = trader.positions.get(symbol)
-                        if pos is None:
-                            continue
-                        if price <= pos.stop_loss_price:
-                            trade = await trader.close_position(symbol, price, "STOP_LOSS")
-                            if trade:
-                                recent_trades.append(_trade_dict(trade, symbol, "STOP_LOSS"))
-                                equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
-                        elif price >= pos.take_profit_price:
-                            trade = await trader.close_position(symbol, price, "TAKE_PROFIT")
-                            if trade:
-                                recent_trades.append(_trade_dict(trade, symbol, "TAKE_PROFIT"))
-                                equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
-                    except Exception as e:
-                        logger.debug(f"SL/TP poll error {symbol}: {e}")
-                last_sltp_check = now
+            # ── Max daily loss circuit breaker ───────────────────────────────
+            session_loss = session_start_pnl - trader.account.total_pnl
+            if session_loss >= max_daily_loss_usd:
+                logger.warning(f"[RISK] Daily loss limit ${max_daily_loss_usd:.2f} reached — stopping live trading")
+                if trader.notifier:
+                    trader.notifier.send_message(
+                        f"<b>DAILY LOSS LIMIT HIT</b>\n"
+                        f"Loss ${session_loss:.2f} reached limit ${max_daily_loss_usd:.2f}\n"
+                        f"Bot stopped — restart manually"
+                    )
+                trader.running = False
+                break
 
             # ── Sleep until next candle close ────────────────────────────────
             sleep_secs = _seconds_until_next_candle(timeframe)
@@ -327,11 +356,8 @@ async def run_live_trading_session(exchange: ExchangeConnection,
                 if signal is None:
                     continue
 
-                # Compute confidence score
-                df_calc = trader.strategy.calculate(df)
-                last_row = df_calc.iloc[-1].to_dict()
-                last_row['signal'] = signal.signal
-                score = trader.strategy.confidence_score(last_row)
+                # Use the confidence score already computed by the strategy
+                score = signal.confidence
 
                 indicators[symbol] = {
                     'signal': signal.signal.value,
@@ -345,7 +371,9 @@ async def run_live_trading_session(exchange: ExchangeConnection,
                 }
 
                 # ── Entry: buy signal + learner-adjusted confidence ──────────
-                if signal.is_buy and symbol not in trader.positions:
+                if signal.is_buy and symbol not in trader.positions and (
+                    not trader.sentiment_monitor or trader.sentiment_monitor.allows_long(symbol)
+                ):
                     # Ask learner what threshold is needed given current conditions
                     current_features = {
                         'rsi':          signal.rsi or 50.0,
@@ -399,6 +427,11 @@ async def run_live_trading_session(exchange: ExchangeConnection,
                 }
                 for sym, pos in trader.positions.items()
             }
+            sentiment_data = (
+                trader.sentiment_monitor.get_snapshot().to_dict()
+                if trader.sentiment_monitor and trader.sentiment_monitor.get_snapshot()
+                else None
+            )
             write_state({
                 'status': 'running',
                 'mode': 'live',
@@ -411,6 +444,7 @@ async def run_live_trading_session(exchange: ExchangeConnection,
                 'recent_trades': recent_trades[-50:],
                 'equity_curve': equity_curve[-200:],
                 'learning': trader.journal.stats(),
+                'sentiment': sentiment_data,
             })
 
             if iteration % 10 == 0:

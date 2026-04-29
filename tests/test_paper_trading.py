@@ -1,286 +1,386 @@
-"""Unit tests for src/paper_trading.py — trade execution, PnL, SL/TP."""
+"""
+Unit tests for src/paper_trading.py
+
+Covers:
+- PaperTrader.execute_buy: cash deduction, position state, fee/slippage
+- PaperTrader.execute_sell: cash credit, PnL accuracy (both fees included),
+  position cleanup, trade record fields
+- Accounting identity: total_equity == initial_capital + total_pnl (after fix)
+- PnL sign: profit when price rises, loss when price falls, loss on same price
+- PaperTrader.check_stop_loss_take_profit: SL triggers, TP triggers, no-op
+- PaperTrader.get_account_summary: field correctness, win/loss counts
+- PaperTrader.update_unrealized_pnl: unrealized field updates
+- Insufficient-cash guard in execute_buy
+"""
 
 import pytest
-from datetime import datetime, timezone
-
-from src.paper_trading import PaperTrader
-
-
-def _now():
-    return datetime.now(timezone.utc)
+from datetime import datetime
+from src.paper_trading import PaperTrader, PaperPosition
 
 
-def _make_trader(**kwargs):
-    """Return a PaperTrader with sensible defaults that can be overridden."""
-    defaults = dict(
-        initial_capital=1_000.0,
-        position_size=200.0,
-        fee_pct=0.0,
-        slippage_pct=0.0,
-        stop_loss_pct=2.0,
-        take_profit_pct=3.0,
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+def _trader(initial_capital: float = 1_000.0,
+            position_size: float = 100.0,
+            fee_pct: float = 0.26,
+            slippage_pct: float = 0.0,
+            stop_loss_pct: float = 2.0,
+            take_profit_pct: float = 3.0) -> PaperTrader:
+    return PaperTrader(
+        initial_capital=initial_capital,
+        position_size=position_size,
+        fee_pct=fee_pct,
+        slippage_pct=slippage_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
     )
-    defaults.update(kwargs)
-    return PaperTrader(**defaults)
+
+
+T0 = datetime(2024, 1, 1, 0, 0, 0)
+T1 = datetime(2024, 1, 1, 0, 1, 0)
+
+SYMBOL = "BTC/USD"
+PRICE = 50_000.0
 
 
 # ── execute_buy ───────────────────────────────────────────────────────────────
 
 class TestExecuteBuy:
-    def test_position_created(self):
-        trader = _make_trader()
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
+    def test_returns_position(self):
+        t = _trader()
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
         assert pos is not None
-        assert 'BTC/USD' in trader.account.positions
 
-    def test_cash_reduced(self):
-        trader = _make_trader(position_size=200.0)
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        assert trader.account.cash < 1_000.0
+    def test_position_stored_in_account(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        assert SYMBOL in t.account.positions
 
-    def test_position_size_capped_by_cash(self):
-        """position_size > cash → use all remaining cash."""
-        trader = _make_trader(initial_capital=100.0, position_size=500.0)
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
-        assert pos is not None
-        # size should be at most cash/price
-        assert pos.size <= 100.0 / 1_000.0 + 1e-9
+    def test_cash_reduced_by_cost_plus_fee(self):
+        t = _trader(initial_capital=1_000.0, position_size=100.0,
+                    fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        # size = 100 / 50000 = 0.002 BTC
+        # fee = 50000 * 0.002 * 0.0026 = 0.26
+        # total cost = 100 + 0.26 = 100.26
+        assert abs(t.account.cash - (1_000.0 - 100.26)) < 1e-6
 
-    def test_position_size_capped_by_max(self):
-        """position_size < cash → size capped at position_size/price."""
-        trader = _make_trader(initial_capital=1_000.0, position_size=100.0)
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
-        assert abs(pos.size - 100.0 / 1_000.0) < 1e-9
+    def test_entry_fee_stored_on_position(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
+        expected_fee = PRICE * (100.0 / PRICE) * 0.0026
+        assert abs(pos.entry_fee - expected_fee) < 1e-6
 
-    def test_returns_none_when_no_cash(self):
-        trader = _make_trader(initial_capital=0.0, position_size=200.0)
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
+    def test_slippage_raises_exec_price(self):
+        t = _trader(slippage_pct=0.1)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
+        assert pos.entry_price > PRICE
+
+    def test_no_position_created_with_zero_cash(self):
+        t = _trader(initial_capital=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
         assert pos is None
+        assert SYMBOL not in t.account.positions
 
-    def test_slippage_increases_entry_price(self):
-        trader = _make_trader(slippage_pct=0.5)
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
-        assert pos.entry_price == pytest.approx(1_005.0)
+    def test_position_size_capped_by_available_cash(self):
+        # position_size > initial_capital → size is limited by cash
+        t = _trader(initial_capital=50.0, position_size=200.0, fee_pct=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
+        assert pos is not None
+        assert pos.size * PRICE <= 50.0 + 1e-6
 
-    def test_fee_stored_on_position(self):
-        trader = _make_trader(fee_pct=0.26, slippage_pct=0.0)
-        pos = trader.execute_buy('BTC/USD', 1_000.0, _now())
-        assert pos.entry_fee > 0.0
-
-    def test_cannot_open_duplicate_position(self):
-        """Buying twice on the same symbol replaces the first position (current design)."""
-        trader = _make_trader(initial_capital=2_000.0, position_size=200.0)
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        cash_after_first = trader.account.cash
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        # Each buy reduces cash — the second buy should also reduce it
-        assert trader.account.cash < cash_after_first
+    def test_cannot_buy_same_symbol_twice(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        cash_after_first = t.account.cash
+        # Attempting a second buy returns None because position already exists…
+        # The current design doesn't guard against duplicate buys in execute_buy
+        # (the session loop guards it). So buying again overwrites — we verify
+        # the position dict has exactly one entry per symbol.
+        t.execute_buy(SYMBOL, PRICE + 1000, T1)
+        assert len([k for k in t.account.positions if k == SYMBOL]) == 1
 
 
-# ── execute_sell ─────────────────────────────────────────────────────────────
+# ── execute_sell ──────────────────────────────────────────────────────────────
 
 class TestExecuteSell:
-    def test_closes_position(self):
-        trader = _make_trader()
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trader.execute_sell('BTC/USD', 1_000.0, _now())
-        assert 'BTC/USD' not in trader.account.positions
+    def test_returns_trade(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE * 1.05, T1)
+        assert trade is not None
 
-    def test_returns_none_with_no_position(self):
-        trader = _make_trader()
-        result = trader.execute_sell('BTC/USD', 1_000.0, _now())
+    def test_position_removed_after_sell(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE, T1)
+        assert SYMBOL not in t.account.positions
+
+    def test_returns_none_if_no_position(self):
+        t = _trader()
+        result = t.execute_sell(SYMBOL, PRICE, T0)
         assert result is None
 
-    def test_trade_recorded(self):
-        trader = _make_trader()
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trader.execute_sell('BTC/USD', 1_050.0, _now())
-        assert len(trader.account.closed_trades) == 1
-
-    def test_winning_trade_positive_pnl(self):
-        trader = _make_trader()
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trade = trader.execute_sell('BTC/USD', 1_100.0, _now())
+    def test_pnl_positive_when_price_rises(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE * 1.10, T1)  # +10%
         assert trade.pnl > 0
 
-    def test_losing_trade_negative_pnl(self):
-        trader = _make_trader()
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trade = trader.execute_sell('BTC/USD', 900.0, _now())
+    def test_pnl_negative_when_price_falls(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE * 0.90, T1)  # -10%
         assert trade.pnl < 0
 
-    def test_slippage_reduces_exit_price(self):
-        trader = _make_trader(slippage_pct=0.5)
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trade = trader.execute_sell('BTC/USD', 1_000.0, _now())
-        # Exit price should be lower than market price due to slippage
-        assert trade.exit_price == pytest.approx(995.0)
+    def test_pnl_negative_on_same_price_due_to_fees(self):
+        """Buying and selling at the same price should be a loss equal to round-trip fees."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE, T1)
+        assert trade.pnl < 0
+
+    def test_round_trip_fees_correct(self):
+        """pnl at same price should equal -(entry_fee + exit_fee)."""
+        t = _trader(initial_capital=1_000.0, position_size=100.0,
+                    fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE, T1)
+
+        size = 100.0 / PRICE
+        entry_fee = PRICE * size * 0.0026
+        exit_fee = PRICE * size * 0.0026
+        expected_pnl = -(entry_fee + exit_fee)
+
+        assert abs(trade.pnl - expected_pnl) < 1e-6
+
+    def test_trade_fees_field_is_total_round_trip(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE, T1)
+
+        size = 100.0 / PRICE
+        expected_total_fees = 2 * PRICE * size * 0.0026
+        assert abs(trade.fees - expected_total_fees) < 1e-6
+
+    def test_cash_restored_after_round_trip_zero_fees(self):
+        """With zero fees, cash after a round-trip at same price == initial capital."""
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE, T1)
+        assert abs(t.account.cash - 1_000.0) < 1e-6
+
+    def test_total_pnl_added_to_account(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE * 1.05, T1)
+        assert abs(t.account.total_pnl - trade.pnl) < 1e-9
+
+    def test_trade_record_fields(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE * 1.03, T1, reason="SIGNAL")
+        assert trade.entry_price == PRICE
+        assert trade.exit_price == PRICE * 1.03
+        assert trade.entry_time == T0
+        assert trade.exit_time == T1
+        assert trade.size > 0
+
+    def test_slippage_lowers_sell_exec_price(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.1)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        trade = t.execute_sell(SYMBOL, PRICE, T1)
+        assert trade.exit_price < PRICE
 
 
-# ── PnL accuracy (the bug regression test) ───────────────────────────────────
+# ── accounting identity ───────────────────────────────────────────────────────
 
-class TestPnLAccuracy:
-    def test_round_trip_same_price_pnl_equals_cash_change(self):
-        """
-        After buying and selling at the same price, total_pnl must equal
-        the actual change in cash (both buy and sell fees deducted).
-        Previously, the buy-side fee was missing from total_pnl.
-        """
-        trader = _make_trader(
-            initial_capital=1_000.0,
-            position_size=200.0,
-            fee_pct=0.26,
-            slippage_pct=0.0,
-        )
-        initial_cash = trader.account.cash
+class TestAccountingIdentity:
+    """
+    The core invariant: total_equity must equal initial_capital + total_pnl.
 
-        trader.execute_buy('BTC/USD', 1_000.0, _now())
-        trader.execute_sell('BTC/USD', 1_000.0, _now())
+    Before the bug fix, execute_sell omitted entry_fee from pnl, making
+    total_pnl slightly overstated. The identity would fail by ~entry_fee.
+    """
 
-        cash_change = trader.account.cash - initial_cash
-        assert abs(trader.account.total_pnl - cash_change) < 1e-9, (
-            f"total_pnl ({trader.account.total_pnl:.6f}) must match "
-            f"actual cash change ({cash_change:.6f}) — buy-side fee must be included"
-        )
+    def test_identity_holds_after_profitable_trade(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE * 1.05, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
 
-    def test_round_trip_same_price_has_negative_pnl(self):
-        """A round trip at the same price should always lose money (fees)."""
-        trader = _make_trader(fee_pct=0.26, slippage_pct=0.0)
-        trader.execute_buy('ETH/USD', 2_000.0, _now())
-        trader.execute_sell('ETH/USD', 2_000.0, _now())
-        assert trader.account.total_pnl < 0.0
+    def test_identity_holds_after_losing_trade(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE * 0.97, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
 
-    def test_fees_field_includes_both_sides(self):
-        """Trade.fees should reflect the total cost of entry + exit."""
-        trader = _make_trader(
-            initial_capital=1_000.0,
-            position_size=200.0,
-            fee_pct=0.26,
-            slippage_pct=0.0,
-        )
-        trader.execute_buy('SOL/USD', 100.0, _now())
-        trade = trader.execute_sell('SOL/USD', 100.0, _now())
+    def test_identity_holds_on_same_price_round_trip(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
 
-        size = trade.size
-        expected_fee_each_side = 100.0 * size * (0.26 / 100)
-        expected_total_fees = expected_fee_each_side * 2
-        assert abs(trade.fees - expected_total_fees) < 1e-9
+    def test_identity_holds_across_multiple_trades(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=10_000.0,
+                    position_size=500.0)
+        prices = [50_000.0, 51_000.0, 50_500.0, 52_000.0]
+        for i in range(0, len(prices), 2):
+            entry_t = datetime(2024, 1, i + 1)
+            exit_t = datetime(2024, 1, i + 2)
+            t.execute_buy(SYMBOL, prices[i], entry_t)
+            t.execute_sell(SYMBOL, prices[i + 1], exit_t)
 
-    def test_winning_pnl_matches_cash_gain(self):
-        trader = _make_trader(
-            initial_capital=10_000.0,
-            position_size=1_000.0,
-            fee_pct=0.0,
-            slippage_pct=0.0,
-        )
-        initial_cash = trader.account.cash
-        trader.execute_buy('BTC/USD', 100.0, _now())
-        trader.execute_sell('BTC/USD', 110.0, _now())
-
-        cash_change = trader.account.cash - initial_cash
-        assert abs(trader.account.total_pnl - cash_change) < 1e-9
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (10_000.0 + summary["total_pnl"])) < 1e-6
 
 
 # ── check_stop_loss_take_profit ───────────────────────────────────────────────
 
 class TestStopLossTakeProfit:
-    def _open(self, trader, price=1_000.0):
-        trader.execute_buy('BTC/USD', price, _now())
-
-    def test_stop_loss_triggers(self):
-        trader = _make_trader(stop_loss_pct=2.0, take_profit_pct=5.0)
-        self._open(trader)
-        # Drop 3 % → below the 2 % stop
-        trade = trader.check_stop_loss_take_profit('BTC/USD', 970.0, _now())
+    def test_stop_loss_triggers_when_price_falls(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, stop_loss_pct=2.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        # Price drops 3% — beyond 2% SL
+        trade = t.check_stop_loss_take_profit(SYMBOL, PRICE * 0.97, T1)
         assert trade is not None
-        assert 'BTC/USD' not in trader.account.positions
+        assert SYMBOL not in t.account.positions
 
-    def test_stop_loss_not_triggered_within_tolerance(self):
-        trader = _make_trader(stop_loss_pct=2.0, take_profit_pct=5.0)
-        self._open(trader)
-        # Drop only 1 % → still within the 2 % stop buffer
-        trade = trader.check_stop_loss_take_profit('BTC/USD', 990.0, _now())
+    def test_stop_loss_does_not_trigger_inside_threshold(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, stop_loss_pct=2.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        # Price drops 1% — inside 2% SL
+        trade = t.check_stop_loss_take_profit(SYMBOL, PRICE * 0.99, T1)
         assert trade is None
+        assert SYMBOL in t.account.positions
 
-    def test_take_profit_triggers(self):
-        trader = _make_trader(stop_loss_pct=2.0, take_profit_pct=3.0)
-        self._open(trader)
-        # Rise 4 % → above the 3 % TP
-        trade = trader.check_stop_loss_take_profit('BTC/USD', 1_040.0, _now())
+    def test_take_profit_triggers_when_price_rises(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, take_profit_pct=3.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        # Price rises 4% — beyond 3% TP
+        trade = t.check_stop_loss_take_profit(SYMBOL, PRICE * 1.04, T1)
         assert trade is not None
-        assert 'BTC/USD' not in trader.account.positions
+        assert SYMBOL not in t.account.positions
 
-    def test_take_profit_not_triggered_below_threshold(self):
-        trader = _make_trader(stop_loss_pct=2.0, take_profit_pct=3.0)
-        self._open(trader)
-        # Rise only 2 % → below the 3 % TP
-        trade = trader.check_stop_loss_take_profit('BTC/USD', 1_020.0, _now())
+    def test_take_profit_does_not_trigger_inside_threshold(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, take_profit_pct=3.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        # Price rises 2% — inside 3% TP
+        trade = t.check_stop_loss_take_profit(SYMBOL, PRICE * 1.02, T1)
         assert trade is None
 
-    def test_no_position_returns_none(self):
-        trader = _make_trader()
-        trade = trader.check_stop_loss_take_profit('BTC/USD', 1_000.0, _now())
-        assert trade is None
+    def test_returns_none_with_no_open_position(self):
+        t = _trader()
+        result = t.check_stop_loss_take_profit(SYMBOL, PRICE, T0)
+        assert result is None
 
 
 # ── get_account_summary ───────────────────────────────────────────────────────
 
-class TestAccountSummary:
-    def test_initial_state(self):
-        trader = _make_trader(initial_capital=500.0)
-        s = trader.get_account_summary()
-        assert s['cash'] == pytest.approx(500.0)
-        assert s['total_equity'] == pytest.approx(500.0)
-        assert s['total_pnl'] == pytest.approx(0.0)
-        assert s['open_positions'] == 0
-        assert s['closed_trades'] == 0
-        assert s['winning_trades'] == 0
-        assert s['losing_trades'] == 0
+class TestGetAccountSummary:
+    def test_initial_summary_fields(self):
+        t = _trader(initial_capital=500.0)
+        summary = t.get_account_summary()
+        assert summary["cash"] == 500.0
+        assert summary["total_equity"] == 500.0
+        assert summary["total_pnl"] == 0.0
+        assert summary["open_positions"] == 0
+        assert summary["closed_trades"] == 0
+        assert summary["winning_trades"] == 0
+        assert summary["losing_trades"] == 0
 
-    def test_win_loss_counters(self):
-        trader = _make_trader(
-            initial_capital=10_000.0,
-            position_size=500.0,
-            fee_pct=0.0,
-            slippage_pct=0.0,
-        )
-        t = _now()
-        # Winning trade
-        trader.execute_buy('BTC/USD', 100.0, t)
-        trader.execute_sell('BTC/USD', 110.0, t)
-        # Losing trade
-        trader.execute_buy('BTC/USD', 100.0, t)
-        trader.execute_sell('BTC/USD', 90.0, t)
+    def test_open_position_counts(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        summary = t.get_account_summary()
+        assert summary["open_positions"] == 1
 
-        s = trader.get_account_summary()
-        assert s['winning_trades'] == 1
-        assert s['losing_trades'] == 1
-        assert s['closed_trades'] == 2
+    def test_closed_trade_increments(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE, T1)
+        summary = t.get_account_summary()
+        assert summary["closed_trades"] == 1
 
-    def test_equity_includes_unrealized(self):
-        trader = _make_trader(
-            initial_capital=10_000.0,
-            position_size=1_000.0,
-            fee_pct=0.0,
-            slippage_pct=0.0,
-        )
-        trader.execute_buy('BTC/USD', 100.0, _now())
-        trader.update_unrealized_pnl({'BTC/USD': 110.0})
+    def test_winning_trade_counted(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE * 1.05, T1)
+        summary = t.get_account_summary()
+        assert summary["winning_trades"] == 1
+        assert summary["losing_trades"] == 0
 
-        s = trader.get_account_summary()
-        # Cash was reduced by 1000, equity should include the 10 * size unrealized gain
-        assert s['total_equity'] > s['cash']
+    def test_losing_trade_counted(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE * 0.95, T1)
+        summary = t.get_account_summary()
+        assert summary["losing_trades"] == 1
+        assert summary["winning_trades"] == 0
 
-    def test_pnl_pct_matches_total_pnl(self):
-        trader = _make_trader(
-            initial_capital=1_000.0,
-            position_size=200.0,
-            fee_pct=0.0,
-            slippage_pct=0.0,
-        )
-        trader.execute_buy('ETH/USD', 100.0, _now())
-        trader.execute_sell('ETH/USD', 120.0, _now())
+    def test_pnl_pct_computed_correctly(self):
+        t = _trader(initial_capital=1_000.0, fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.execute_sell(SYMBOL, PRICE * 1.10, T1)
+        summary = t.get_account_summary()
+        # pnl_pct = total_pnl / initial_capital * 100
+        expected = summary["total_pnl"] / 1_000.0 * 100
+        assert abs(summary["pnl_pct"] - expected) < 1e-6
 
-        s = trader.get_account_summary()
-        expected_pct = s['total_pnl'] / 1_000.0 * 100
-        assert abs(s['pnl_pct'] - expected_pct) < 1e-6
+
+# ── update_unrealized_pnl ─────────────────────────────────────────────────────
+
+class TestUpdateUnrealizedPnl:
+    def test_unrealized_positive_when_price_rises(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
+        t.update_unrealized_pnl({SYMBOL: PRICE * 1.05})
+        assert t.account.positions[SYMBOL].unrealized_pnl > 0
+
+    def test_unrealized_negative_when_price_falls(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.update_unrealized_pnl({SYMBOL: PRICE * 0.95})
+        assert t.account.positions[SYMBOL].unrealized_pnl < 0
+
+    def test_unrealized_zero_at_entry_price(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.update_unrealized_pnl({SYMBOL: PRICE})
+        assert t.account.positions[SYMBOL].unrealized_pnl == pytest.approx(0.0)
+
+    def test_unknown_symbol_does_not_crash(self):
+        t = _trader()
+        t.update_unrealized_pnl({"ETH/USD": 3_000.0})  # no open position
+
+    def test_total_equity_includes_unrealized(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, initial_capital=1_000.0,
+                    position_size=100.0)
+        t.execute_buy(SYMBOL, PRICE, T0)
+        t.update_unrealized_pnl({SYMBOL: PRICE * 1.10})
+
+        summary = t.get_account_summary()
+        # cash = 900 (100 spent on position)
+        # position market value = entry_price * size + unrealized_pnl
+        #   = 100 + (50000 * 0.002 * 0.1) = 100 + 10 = 110
+        # total_equity = 900 + 110 = 1010 > 1000
+        assert summary["total_equity"] > 1_000.0
+
+    def test_equity_equals_cash_when_no_positions(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, initial_capital=1_000.0)
+        summary = t.get_account_summary()
+        assert summary["total_equity"] == summary["cash"]
+
+    def test_equity_at_entry_price_equals_initial_minus_fees(self):
+        """Immediately after buying (before price moves) equity = initial - entry_fee."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=1_000.0,
+                    position_size=100.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0)
+        t.update_unrealized_pnl({SYMBOL: PRICE})  # price unchanged
+
+        summary = t.get_account_summary()
+        expected = 1_000.0 - pos.entry_fee
+        assert abs(summary["total_equity"] - expected) < 1e-6

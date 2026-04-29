@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wmic *)",
+      "Bash(curl -s http://localhost:*)",
+      "WebFetch",
+      "Skill(*)"
+    ]
+  }
+}

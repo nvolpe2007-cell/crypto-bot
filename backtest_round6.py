@@ -8,6 +8,9 @@ Walk-forward: Train 2023-2024, Validate 2025-2026.
 
 import asyncio
 import sys, os
+from types import ModuleType as _M
+if 'numba' not in sys.modules:
+    _n = _M('numba'); _n.njit = lambda *a, **k: (a[0] if a and callable(a[0]) else lambda f: f); sys.modules['numba'] = _n
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
@@ -195,21 +198,21 @@ STRATEGIES = {
     'Combined (Donchian+RSI)':  lambda d, b: combined_best(d, b),
 }
 
-SYMBOLS    = ['ETH/USD', 'SOL/USD']
+SYMBOLS    = ['BTC/USD', 'ETH/USD']
 TRAIN_END  = '2024-12-31'
 TEST_START = '2025-01-01'
 
 
 async def main():
     print("=" * 65)
-    print("  ROUND 6: BREAKOUT + MOMENTUM STRATEGIES (4h candles)")
+    print("  ROUND 6: BREAKOUT + MOMENTUM STRATEGIES (daily candles)")
     print("=" * 65)
 
     print("\nFetching data...")
     dfs, btc_daily = {}, None
     for sym in SYMBOLS:
-        dfs[sym] = await fetch_data(sym, '4h', 1200)
-    btc_daily = await fetch_data('BTC/USD', '1d', 1200)
+        dfs[sym] = await fetch_data(sym, '1d', 720)
+    btc_daily = dfs.get('BTC/USD', await fetch_data('BTC/USD', '1d', 720))
 
     all_results = []
 

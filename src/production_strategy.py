@@ -31,6 +31,19 @@ class ProductionSignal:
     confidence: int
     timestamp: Optional[int] = None
 
+    # Aliases so live_trading can use same field names as AdvancedSignal
+    @property
+    def ema_fast(self) -> float:
+        return self.ema100
+
+    @property
+    def ema_slow(self) -> float:
+        return self.ema200
+
+    @property
+    def volume_ratio(self) -> float:
+        return 1.0   # ProductionStrategy doesn't track volume ratio
+
     @property
     def is_buy(self): return self.signal == Signal.BUY
     @property
@@ -60,9 +73,35 @@ class ProductionStrategy:
         self.atr_sl_mult  = atr_sl_mult
         self.atr_tp_mult  = atr_tp_mult
 
+    def confidence_score(self, row) -> int:
+        """0-100 confidence score, compatible with AdvancedStrategy interface."""
+        sig = row.get('signal')
+        if sig is None or str(sig) == 'Signal.HOLD':
+            return 0
+        is_buy = str(sig) == 'Signal.BUY'
+        score = 0
+        rsi = float(row.get('rsi') or 50)
+        adx = float(row.get('adx') or 0)
+        atr = float(row.get('atr') or 0)
+        close = float(row.get('close') or 1)
+        # RSI distance from 50 (0-30 pts)
+        score += min(30, int(abs(rsi - 50) * 1.5))
+        # ADX strength (0-30 pts)
+        score += min(30, int(adx / 40 * 30))
+        # ATR sweet spot — not too calm, not too wild (0-20 pts)
+        atr_pct = atr / close * 100 if close else 0
+        score += 20 if 0.2 <= atr_pct <= 3.0 else (10 if atr_pct > 0 else 0)
+        # Trend alignment (0-20 pts)
+        ema200 = float(row.get('ema200') or 0)
+        if ema200 and close:
+            if (is_buy and close > ema200) or (not is_buy and close < ema200):
+                score += 20
+        return min(100, score)
+
     def calculate(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df['ema200']    = ta.ema(df['close'], length=self.ema_trend)
+        df['ema100']    = ta.ema(df['close'], length=100)
         df['ema50']     = ta.ema(df['close'], length=50)
         df['rsi']       = ta.rsi(df['close'], length=self.rsi_period)
         df['atr']       = ta.atr(df['high'], df['low'], df['close'], length=14)
@@ -114,7 +153,7 @@ class ProductionStrategy:
             signal=sig,
             close=price,
             rsi=round(rsi_val, 2),
-            ema100=round(row['ema50'], 2),  # field named ema100 but strategy uses ema50
+            ema100=round(row['ema100'], 2),
             ema200=round(row['ema200'], 2),
             adx=round(row['adx'], 2),
             atr=round(atr, 4),

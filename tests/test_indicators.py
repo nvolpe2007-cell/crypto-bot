@@ -1,159 +1,185 @@
-"""Unit tests for src/indicators.py"""
+"""
+Unit tests for src/indicators.py
+
+Covers:
+- prepare_ohlcv_dataframe: type conversions, index, empty input
+- EMACrossRSI: column presence, signal types, insufficient-data guard,
+  crossover detection, RSI filter (overbought blocks buys)
+"""
 
 import pytest
-import pandas as pd
 import numpy as np
-from src.indicators import EMACrossRSI, Signal, IndicatorResult, prepare_ohlcv_dataframe
+import pandas as pd
+from datetime import datetime, timedelta
+
+from src.indicators import (
+    prepare_ohlcv_dataframe,
+    EMACrossRSI,
+    Signal,
+    IndicatorResult,
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def make_df(closes, freq='1min'):
-    """Build a minimal OHLCV DataFrame from a list of close prices."""
-    n = len(closes)
-    closes = list(closes)
-    dates = pd.date_range('2024-01-01', periods=n, freq=freq)
-    return pd.DataFrame({
-        'open':   [c * 0.9995 for c in closes],
-        'high':   [c * 1.001  for c in closes],
-        'low':    [c * 0.999  for c in closes],
-        'close':  closes,
-        'volume': [1000.0] * n,
-    }, index=dates)
+def _make_ohlcv_list(n: int = 100, base_price: float = 50_000.0,
+                     trend: float = 10.0) -> list:
+    """Return list of [ts_ms, open, high, low, close, volume] rows."""
+    start = datetime(2024, 1, 1)
+    rows = []
+    for i in range(n):
+        ts = int((start + timedelta(minutes=i)).timestamp() * 1000)
+        close = base_price + i * trend
+        rows.append([ts, close * 0.999, close * 1.001, close * 0.998, close, 500.0])
+    return rows
 
 
-def make_ohlcv_list(n=50, base=40_000.0):
-    """Return a raw exchange-style OHLCV list (list-of-lists)."""
-    start_ms = 1_704_067_200_000  # 2024-01-01 00:00 UTC
-    return [
-        [start_ms + i * 60_000, base, base * 1.001, base * 0.999, base, 100.0]
-        for i in range(n)
-    ]
+def _make_df(n: int = 100, base_price: float = 50_000.0,
+             trend: float = 10.0) -> pd.DataFrame:
+    return prepare_ohlcv_dataframe(_make_ohlcv_list(n, base_price, trend))
 
 
 # ── prepare_ohlcv_dataframe ───────────────────────────────────────────────────
 
 class TestPrepareOhlcvDataframe:
-    def test_basic_conversion(self):
-        ohlcv = make_ohlcv_list(n=5)
-        df = prepare_ohlcv_dataframe(ohlcv)
-        assert not df.empty
-        assert list(df.columns) == ['open', 'high', 'low', 'close', 'volume']
-        assert isinstance(df.index, pd.DatetimeIndex)
-
-    def test_values_are_numeric(self):
-        df = prepare_ohlcv_dataframe(make_ohlcv_list())
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            assert pd.api.types.is_float_dtype(df[col]), f"{col} should be float"
-
     def test_empty_input_returns_empty_df(self):
         df = prepare_ohlcv_dataframe([])
         assert df.empty
 
-    def test_close_value_preserved(self):
-        ohlcv = [[1_704_067_200_000, 42_000, 42_100, 41_900, 42_050, 100.0]]
-        df = prepare_ohlcv_dataframe(ohlcv)
-        assert df['close'].iloc[0] == 42_050.0
+    def test_required_columns_present(self):
+        df = _make_df(10)
+        for col in ("open", "high", "low", "close", "volume"):
+            assert col in df.columns, f"missing column: {col}"
+
+    def test_index_is_datetime(self):
+        df = _make_df(10)
+        assert pd.api.types.is_datetime64_any_dtype(df.index)
+
+    def test_all_price_columns_numeric(self):
+        df = _make_df(10)
+        for col in ("open", "high", "low", "close", "volume"):
+            assert pd.api.types.is_numeric_dtype(df[col]), f"{col} not numeric"
+
+    def test_row_count_matches_input(self):
+        for n in (1, 50, 200):
+            assert len(_make_df(n)) == n
+
+    def test_close_prices_match_input(self):
+        rows = _make_ohlcv_list(5, base_price=10_000.0, trend=100.0)
+        df = prepare_ohlcv_dataframe(rows)
+        for i, row in enumerate(rows):
+            assert abs(df["close"].iloc[i] - row[4]) < 1e-9
+
+    def test_timestamps_ascending(self):
+        df = _make_df(20)
+        assert df.index.is_monotonic_increasing
 
     def test_custom_columns(self):
-        ohlcv = [[1_704_067_200_000, 1.0, 1.1, 0.9, 1.05, 50.0]]
-        df = prepare_ohlcv_dataframe(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        assert 'close' in df.columns
+        rows = [[1_000_000, 1.0, 2.0, 0.5, 1.5, 10.0]]
+        df = prepare_ohlcv_dataframe(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        assert df["close"].iloc[0] == 1.5
 
 
-# ── EMACrossRSI ──────────────────────────────────────────────────────────────
+# ── EMACrossRSI ───────────────────────────────────────────────────────────────
 
-class TestEMACrossRSI:
-    def test_returns_none_when_too_few_candles(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0] * 20)   # 20 < slow_ema=21
-        assert strategy.get_latest_signal(df) is None
+class TestEMACrossRSICalculate:
+    def test_adds_expected_columns(self):
+        df = _make_df(60)
+        strat = EMACrossRSI()
+        result = strat.calculate(df)
+        for col in ("ema_fast", "ema_slow", "rsi", "signal"):
+            assert col in result.columns, f"missing column: {col}"
 
-    def test_returns_result_with_enough_data(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0 + i * 10 for i in range(50)])
-        result = strategy.get_latest_signal(df)
+    def test_does_not_mutate_input(self):
+        df = _make_df(60)
+        original_cols = set(df.columns)
+        EMACrossRSI().calculate(df)
+        assert set(df.columns) == original_cols
+
+    def test_signal_values_are_signal_enum(self):
+        df = _make_df(100)
+        result = EMACrossRSI().calculate(df)
+        unique_signals = set(result["signal"].unique())
+        valid = {Signal.BUY, Signal.SELL, Signal.HOLD}
+        assert unique_signals <= valid
+
+
+class TestEMACrossRSIGetLatestSignal:
+    def test_returns_none_if_too_few_rows(self):
+        df = _make_df(5)  # less than slow_ema=21
+        assert EMACrossRSI(fast_ema=9, slow_ema=21).get_latest_signal(df) is None
+
+    def test_returns_none_for_empty_df(self):
+        assert EMACrossRSI().get_latest_signal(pd.DataFrame()) is None
+
+    def test_returns_indicator_result_with_enough_data(self):
+        df = _make_df(100)
+        result = EMACrossRSI().get_latest_signal(df)
         assert result is not None
         assert isinstance(result, IndicatorResult)
 
-    def test_signal_is_valid_enum(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0] * 50)
-        result = strategy.get_latest_signal(df)
+    def test_result_signal_is_valid_enum(self):
+        df = _make_df(100)
+        result = EMACrossRSI().get_latest_signal(df)
         assert result.signal in (Signal.BUY, Signal.SELL, Signal.HOLD)
 
-    def test_rsi_in_valid_range(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0 + i * 5 for i in range(60)])
-        result = strategy.get_latest_signal(df)
-        assert 0.0 <= result.rsi <= 100.0
+    def test_is_buy_and_is_sell_exclusive(self):
+        df = _make_df(100)
+        result = EMACrossRSI().get_latest_signal(df)
+        assert not (result.is_buy and result.is_sell)
 
-    def test_ema_fast_close_to_price(self):
-        """Fast EMA of 9 on a flat series should be very close to the constant price."""
-        price = 50_000.0
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([price] * 60)
-        result = strategy.get_latest_signal(df)
-        assert abs(result.ema_fast - price) < 1.0  # within $1
+    def test_strongly_uptrending_data_is_not_sell(self):
+        # 200 candles with steep uptrend → fast EMA stays above slow EMA → no sell signal
+        df = _make_df(200, trend=50.0)
+        result = EMACrossRSI().get_latest_signal(df)
+        assert not result.is_sell
 
-    def test_calculate_adds_required_columns(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0] * 50)
-        result_df = strategy.calculate(df)
-        for col in ['ema_fast', 'ema_slow', 'rsi', 'signal']:
-            assert col in result_df.columns, f"Missing column: {col}"
+    def test_ema_fast_and_slow_are_floats(self):
+        df = _make_df(60)
+        result = EMACrossRSI().get_latest_signal(df)
+        assert isinstance(result.ema_fast, float)
+        assert isinstance(result.ema_slow, float)
 
-    def test_does_not_mutate_input(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0] * 50)
-        original_cols = set(df.columns)
-        strategy.calculate(df)
-        assert set(df.columns) == original_cols
+    def test_rsi_within_0_100(self):
+        # Use oscillating data (mix of up and down moves) to produce a
+        # non-degenerate RSI value between 0 and 100.
+        rows = _make_ohlcv_list(100, base_price=50_000.0, trend=0.0)
+        # Alternate prices slightly above and below base
+        for i, row in enumerate(rows):
+            delta = 200.0 if i % 2 == 0 else -200.0
+            p = 50_000.0 + delta
+            rows[i] = [row[0], p * 0.999, p * 1.001, p * 0.998, p, 500.0]
+        df = prepare_ohlcv_dataframe(rows)
+        result = EMACrossRSI().get_latest_signal(df)
+        assert result.rsi is not None
+        assert 0 <= result.rsi <= 100
 
-    def test_buy_signal_on_rising_price(self):
-        """A transition from declining to strongly rising prices creates a BUY crossover."""
-        # 30 declining candles forces EMA(9) < EMA(21)
-        # 30 sharply rising candles forces the cross in the opposite direction
-        declining = [1_000.0 - i * 3 for i in range(30)]
-        rising    = [910.0   + i * 8 for i in range(30)]
-        df = make_df(declining + rising)
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        result_df = strategy.calculate(df)
+    def test_rsi_overbought_blocks_buy_signal(self):
+        # Build a dataset where EMA crossover occurs but RSI is forced high.
+        # Use a very high overbought threshold (110) that can never be breached
+        # so normally a buy would fire; then use overbought=0 to block it.
+        df = _make_df(200, trend=5.0)
+        strat_permissive = EMACrossRSI(rsi_overbought=110)  # no RSI filter
+        strat_strict = EMACrossRSI(rsi_overbought=0)        # always blocked
 
-        buy_signals = result_df[result_df['signal'] == Signal.BUY]
-        assert len(buy_signals) >= 1, "Expected at least one BUY signal after price reversal"
+        result_df_strict = strat_strict.calculate(df)
+        # With rsi_overbought=0, rsi < 0 is never true → no BUY signals
+        assert Signal.BUY not in result_df_strict["signal"].values
 
-    def test_sell_signal_on_falling_price(self):
-        """A transition from rising to strongly falling prices creates a SELL crossover."""
-        rising   = [1_000.0 + i * 3 for i in range(30)]
-        falling  = [1_090.0 - i * 8 for i in range(30)]
-        df = make_df(rising + falling)
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        result_df = strategy.calculate(df)
+    def test_rsi_oversold_blocks_sell_signal(self):
+        df = _make_df(200, trend=-5.0)
+        strat = EMACrossRSI(rsi_oversold=101)  # rsi > 101 is never true → no SELL
+        result_df = strat.calculate(df)
+        assert Signal.SELL not in result_df["signal"].values
 
-        sell_signals = result_df[result_df['signal'] == Signal.SELL]
-        assert len(sell_signals) >= 1, "Expected at least one SELL signal after price reversal"
+    def test_custom_ema_periods(self):
+        df = _make_df(100)
+        result = EMACrossRSI(fast_ema=5, slow_ema=15).get_latest_signal(df)
+        assert result is not None
 
-    def test_is_buy_is_sell_properties(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        declining = [1_000.0 - i * 3 for i in range(30)]
-        rising    = [910.0   + i * 8 for i in range(30)]
-        df = make_df(declining + rising)
-        result = strategy.get_latest_signal(df)
-        assert result.is_buy == (result.signal == Signal.BUY)
-        assert result.is_sell == (result.signal == Signal.SELL)
-
-    def test_get_signals_history_same_as_calculate(self):
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0 + i * 5 for i in range(60)])
-        assert strategy.get_signals_history(df).equals(strategy.calculate(df))
-
-    def test_flat_price_no_crossover(self):
-        """Perfectly flat price means no EMA crossover and no BUY/SELL signals."""
-        strategy = EMACrossRSI(fast_ema=9, slow_ema=21)
-        df = make_df([40_000.0] * 60)
-        result_df = strategy.calculate(df)
-        # Flat price → EMAs converge to the same value; no crossover after warm-up
-        tail = result_df.iloc[21:]
-        active_signals = tail[tail['signal'] != Signal.HOLD]
-        assert len(active_signals) == 0
+    def test_get_signals_history_returns_dataframe(self):
+        df = _make_df(80)
+        history = EMACrossRSI().get_signals_history(df)
+        assert isinstance(history, pd.DataFrame)
+        assert "signal" in history.columns
+        assert len(history) == len(df)

@@ -22,6 +22,9 @@ from .paper_trading import PaperTrader, run_paper_trading_session
 from .live_trading import LiveTrader, run_live_trading_session
 from .dashboard import run_dashboard
 from .notifications import create_notifier_from_env
+from .market_sentiment import SentimentMonitor
+from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
+from .crypto_vol import CryptoVolMonitor
 from .state import read_state, write_state
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'arbitrage'))
@@ -136,12 +139,26 @@ class ScalpingBot:
             take_profit_pct=risk_cfg.get('take_profit_pct', 3.0)
         )
 
+        notifier  = create_notifier_from_env()
+        sentiment = SentimentMonitor(notifier=notifier)
+        public_ws = KrakenPublicWS(self.symbols, ohlc_interval=1)
+        vol_mon   = CryptoVolMonitor()
+        asyncio.create_task(sentiment.start())
+        asyncio.create_task(public_ws.start())
+        asyncio.create_task(vol_mon.start())
+        logger.info("WebSocket streams starting (public ticker + OHLC + IV monitor)")
+
         try:
             await run_paper_trading_session(
                 self.exchange, self.trader,
                 symbols=self.symbols,
                 timeframe=self.timeframe,
+                lookback=250,   # enough for EMA200 in regime detector
                 mode=self.mode,
+                notifier=notifier,
+                sentiment_monitor=sentiment,
+                public_ws=public_ws,
+                vol_monitor=vol_mon,
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -161,23 +178,39 @@ class ScalpingBot:
         self.exchange = ExchangeConnection(api_key=api_key, secret=api_secret, sandbox=False)
         await self.exchange.connect()
 
-        notifier = create_notifier_from_env()
+        notifier    = create_notifier_from_env()
+        sentiment   = SentimentMonitor(notifier=notifier)
+        public_ws   = KrakenPublicWS(self.symbols, ohlc_interval=1)
+        private_ws  = KrakenPrivateWS(api_key, api_secret)
+        vol_mon     = CryptoVolMonitor()
+        asyncio.create_task(sentiment.start())
+        asyncio.create_task(public_ws.start())
+        asyncio.create_task(private_ws.start())
+        asyncio.create_task(vol_mon.start())
+        logger.info("WebSocket streams starting (public + private + IV monitor)")
+
         risk_cfg = self.config.get('risk', {})
         live_trader = LiveTrader(
             exchange=self.exchange,
             position_size_usd=risk_cfg.get('max_position_size', 50),
             notifier=notifier,
+            sentiment_monitor=sentiment,
+            public_ws=public_ws,
+            private_ws=private_ws,
         )
 
         logger.info("LIVE TRADING ACTIVE — real orders will be placed on Kraken")
         if notifier:
-            notifier.send_message("🚀 <b>Live trading started</b>\n\nBot is now placing real orders on Kraken.")
+            pairs_str = ' '.join(s.split('/')[0] for s in self.symbols)
+            notifier.send_message(f"<b>LIVE STARTED</b>\n{pairs_str}   4h\nreal orders active on Kraken")
 
         try:
+            # ProductionStrategy is calibrated for 4h candles — override timeframe
             await run_live_trading_session(
                 self.exchange, live_trader,
                 symbols=self.symbols,
-                timeframe=self.timeframe,
+                timeframe='4h',
+                lookback=300,
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")

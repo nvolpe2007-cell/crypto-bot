@@ -61,70 +61,47 @@ class TelegramNotifier:
     def send_trade_alert(self, action: str, symbol: str, price: float,
                          size: float, pnl: Optional[float] = None,
                          reason: str = ""):
-        """Send formatted trade alert"""
         if action.upper() == "BUY":
-            emoji = "🟢"
-        elif action.upper() == "SELL":
-            emoji = "🔴"
-        else:
-            emoji = "⚪"
-
-        if pnl is not None:
-            pnl_emoji = "✅" if pnl >= 0 else "❌"
-            message = (
-                f"{emoji} <b>{action.upper()}</b>\n\n"
-                f"Pair: <code>{symbol}</code>\n"
-                f"Price: <code>${price:.2f}</code>\n"
-                f"Size: <code>${size:.2f}</code>\n"
-                f"PnL: <code>${pnl:+.2f}</code> {pnl_emoji}\n"
-                f"Reason: {reason}"
+            return self.send_message(
+                f"<b>IN  {symbol}</b>\n"
+                f"${price:,.2f}   size ${size:.2f}\n"
+                f"<i>{reason}</i>"
             )
-        else:
-            message = (
-                f"{emoji} <b>{action.upper()}</b>\n\n"
-                f"Pair: <code>{symbol}</code>\n"
-                f"Price: <code>${price:.2f}</code>\n"
-                f"Size: <code>${size:.2f}</code>\n"
-                f"Reason: {reason}"
-            )
-
-        return self.send_message(message)
+        return self.send_message(
+            f"<b>OUT  {symbol}</b>\n"
+            f"${price:,.2f}"
+        )
 
     def send_signal(self, symbol: str, signal: str, price: float,
                     rsi: float, ema_fast: float, ema_slow: float):
-        """Send signal notification with indicator values"""
-        emoji = "📈" if signal == "BUY" else "📉" if signal == "SELL" else "⏸️"
+        return self.send_message(f"<b>{signal}  {symbol}</b>  ${price:,.2f}  RSI {rsi:.0f}")
 
-        message = (
-            f"{emoji} <b>{signal} SIGNAL</b>\n\n"
-            f"Pair: <code>{symbol}</code>\n"
-            f"Price: <code>${price:.2f}</code>\n"
-            f"RSI: <code>{rsi:.1f}</code>\n"
-            f"EMA Fast: <code>{ema_fast:.2f}</code>\n"
-            f"EMA Slow: <code>{ema_slow:.2f}</code>"
+    def send_win(self, symbol: str, pnl: float, pnl_pct: float,
+                 exit_price: float, total_equity: float, reason: str = ""):
+        return self.send_message(
+            f"<b>WIN  +${pnl:.2f}</b>\n"
+            f"{symbol}   ${exit_price:,.2f}   {pnl_pct:+.1f}%\n"
+            f"balance ${total_equity:.2f}"
         )
 
-        return self.send_message(message)
+    def send_loss(self, symbol: str, pnl: float, pnl_pct: float,
+                  exit_price: float, total_equity: float, reason: str = ""):
+        return self.send_message(
+            f"<b>LOSS  ${pnl:.2f}</b>\n"
+            f"{symbol}   ${exit_price:,.2f}   {pnl_pct:+.1f}%\n"
+            f"balance ${total_equity:.2f}"
+        )
 
     def send_status(self, capital: float, pnl: float, pnl_pct: float,
                     open_positions: int, trades_today: int):
-        """Send periodic status update"""
-        emoji = "✅" if pnl >= 0 else "❌"
-
-        message = (
-            f"📊 <b>BOT STATUS</b>\n\n"
-            f"Capital: <code>${capital:.2f}</code>\n"
-            f"PnL: <code>${pnl:+.2f}</code> ({pnl_pct:+.2f}%) {emoji}\n"
-            f"Open Positions: <code>{open_positions}</code>\n"
-            f"Trades Today: <code>{trades_today}</code>"
+        arrow = "+" if pnl >= 0 else ""
+        return self.send_message(
+            f"<b>{arrow}${pnl:.2f}</b>  ({pnl_pct:+.1f}%)\n"
+            f"balance ${capital:.2f}   open {open_positions}   trades {trades_today}"
         )
 
-        return self.send_message(message)
-
     def send_error(self, error_message: str):
-        """Send error alert"""
-        message = f"🚨 <b>ERROR ALERT</b>\n\n<code>{error_message}</code>"
-        return self.send_message(message)
+        return self.send_message(f"<b>ERROR</b>  {error_message}")
 
     def test_connection(self) -> bool:
         """Test Telegram connection"""

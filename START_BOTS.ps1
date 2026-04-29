@@ -19,4 +19,4 @@ Start-Job -ScriptBlock {
 } | Out-Null
 
 # Run the bots (dashboard auto-starts on port 8080)
-python run_all_bots.py
+py -3.12 run_all_bots.py

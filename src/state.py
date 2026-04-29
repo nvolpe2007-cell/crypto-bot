@@ -16,7 +16,7 @@ def write_state(data: Dict[str, Any]):
     # Preserve fields written by other components
     try:
         existing = read_state()
-        for key in ('funding_opportunities',):
+        for key in ('funding_opportunities', 'sentiment'):
             if key not in data and key in existing:
                 data[key] = existing[key]
     except Exception:
