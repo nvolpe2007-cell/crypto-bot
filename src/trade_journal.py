@@ -37,20 +37,42 @@ class TradeRecord:
     won:           bool
     reason:        str       # SIGNAL | STOP_LOSS | TAKE_PROFIT
 
+    # Extended ML features (optional — default 0 for backward-compat with old JSON)
+    ofi:               float = 0.0
+    lead_lag_strength: float = 0.0
+    lead_lag_aligned:  bool  = False
+    confidence:        float = 0.0
+    ofi_score:         float = 0.0
+    lead_lag_score:    float = 0.0
+    regime_score:      float = 0.0
+    regime_confidence: float = 0.5
+    funding_rate:      float = 0.0
+    direction:         str   = 'buy'
+
     def to_dict(self):
         return asdict(self)
 
     def features(self) -> Dict[str, float]:
-        """Numeric features used for similarity comparison."""
+        """Numeric features used for similarity comparison and ML training."""
         return {
-            'rsi':          self.rsi,
-            'adx':          self.adx,
-            'volume_ratio': self.volume_ratio,
-            'atr_pct':      self.atr_pct,
-            'ema100_gap':   self.ema100_gap,
-            'ema200_gap':   self.ema200_gap,
-            'hour_utc':     float(self.hour_utc),
-            'day_of_week':  float(self.day_of_week),
+            'rsi':               self.rsi,
+            'adx':               self.adx,
+            'volume_ratio':      self.volume_ratio,
+            'atr_pct':           self.atr_pct,
+            'ema100_gap':        self.ema100_gap,
+            'ema200_gap':        self.ema200_gap,
+            'hour_utc':          float(self.hour_utc),
+            'day_of_week':       float(self.day_of_week),
+            'ofi':               self.ofi,
+            'lead_lag_strength': self.lead_lag_strength,
+            'lead_lag_aligned':  float(self.lead_lag_aligned),
+            'regime_confidence': self.regime_confidence,
+            'funding_rate':      self.funding_rate,
+            'ofi_score':         self.ofi_score,
+            'lead_lag_score':    self.lead_lag_score,
+            'regime_score':      self.regime_score,
+            'confidence':        self.confidence,
+            'is_buy':            float(self.direction == 'buy'),
         }
 
 
@@ -59,12 +81,20 @@ class TradeJournal:
         self.records: List[TradeRecord] = []
         self._load()
 
+    # Fields added after initial release — provide defaults for old records
+    _DEFAULTS = {
+        'ofi': 0.0, 'lead_lag_strength': 0.0, 'lead_lag_aligned': False,
+        'confidence': 0.0, 'ofi_score': 0.0, 'lead_lag_score': 0.0,
+        'regime_score': 0.0, 'regime_confidence': 0.5,
+        'funding_rate': 0.0, 'direction': 'buy',
+    }
+
     def _load(self):
         try:
             os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
             with open(JOURNAL_FILE) as f:
                 raw = json.load(f)
-            self.records = [TradeRecord(**r) for r in raw]
+            self.records = [TradeRecord(**{**self._DEFAULTS, **r}) for r in raw]
         except Exception:
             self.records = []
 
