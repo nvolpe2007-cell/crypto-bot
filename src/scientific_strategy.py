@@ -239,9 +239,16 @@ class ScientificStrategy:
         if not has_buy and not has_sell:
             return _hold_signal(price, ema9_v, ema21_v, rsi_v, adx_v, atr_v, vol_ratio, ofi, lead_dir, regime, funding_rate)
 
-        # Hard block: no longs in CRASH regime
-        if not has_sell and regime == 'CRASH':
-            return _hold_signal(price, ema9_v, ema21_v, rsi_v, adx_v, atr_v, vol_ratio, ofi, lead_dir, regime, funding_rate)
+        # Hard block: no longs in CRASH regime.
+        # Even when both buy and sell signals are present (e.g. overbought RSI
+        # triggers has_sell while strong OFI triggers has_buy), a CRASH regime
+        # must never produce a long.  Suppress has_buy so direction selection
+        # below can only resolve to SELL or HOLD.
+        if regime == 'CRASH':
+            if has_sell:
+                has_buy = False   # redirect to the short side
+            else:
+                return _hold_signal(price, ema9_v, ema21_v, rsi_v, adx_v, atr_v, vol_ratio, ofi, lead_dir, regime, funding_rate)
 
         # If only one direction has a signal, use it
         if has_buy and not has_sell:
