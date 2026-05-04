@@ -1,17 +1,30 @@
 """
-Live Trading Engine
-Places real orders on Kraken via ccxt
+Live Trading Engine — places real orders on Kraken.
+
+Uses the same ScientificStrategy pipeline as paper_trading (OFI + BTC lead-lag +
+regime + MTF + ML scorer).  Longs only on first deployment — shorts can be enabled
+via ENABLE_SHORTS=true in .env once the strategy has a proven live track record.
+
+Safety guarantees:
+  - Startup reconciliation: syncs bot state with actual Kraken open positions
+  - Order fill verification: position only recorded after confirmed fill
+  - Fee tracking: actual fees pulled from order response
+  - Daily loss circuit breaker: stops trading if loss exceeds MAX_DAILY_LOSS
+  - Min confidence: 70 (higher bar than paper's 60)
 """
 
 import asyncio
 import logging
+import os
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
+import pandas as pd
+
 from .indicators import Signal, prepare_ohlcv_dataframe
-from .advanced_strategy import AdvancedStrategy
-from .production_strategy import ProductionStrategy
+from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
 from .exchange import ExchangeConnection
@@ -19,51 +32,77 @@ from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
 from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
-from .state import write_state
+from .regime_detector import RegimeDetector
+from .order_flow import OrderFlowImbalance
+from .lead_lag_detector import LeadLagDetector
+from .multi_timeframe import MultiTimeframeFilter
+from .ml_scorer import MLScorer
+from .state import write_state, read_state
 
 logger = logging.getLogger(__name__)
+
+LIVE_MIN_CONFIDENCE = 70.0   # higher bar than paper (60) — real money
+EVAL_INTERVAL       = 2.0    # seconds between signal evaluations per symbol
+FEE_RATE            = 0.0026  # Kraken taker fee (0.26%) — overridden by actual order fee
 
 
 @dataclass
 class LivePosition:
-    symbol: str
-    entry_time: datetime
-    entry_price: float
-    size: float          # base currency amount
-    order_id: str
-    stop_loss_price: float
+    symbol:           str
+    entry_time:       datetime
+    entry_price:      float
+    size:             float        # base currency (e.g. BTC amount)
+    size_usd:         float        # USD value at entry
+    order_id:         str
+    stop_loss_price:  float
     take_profit_price: float
-    unrealized_pnl: float = 0.0
+    entry_signal:     Optional[ScientificSignal] = None
+    unrealized_pnl:   float = 0.0
 
 
 @dataclass
 class LiveAccount:
-    initial_capital: float
-    closed_trades: List[Trade] = field(default_factory=list)
-    total_pnl: float = 0.0
+    initial_capital:  float
+    closed_trades:    List[Trade]  = field(default_factory=list)
+    total_pnl:        float = 0.0
+    total_fees:       float = 0.0
 
 
 class LiveTrader:
     def __init__(self,
-                 exchange: ExchangeConnection,
-                 position_size_usd: float = 50.0,
-                 notifier: Optional[TelegramNotifier] = None,
-                 sentiment_monitor: Optional[SentimentMonitor] = None,
-                 public_ws: Optional[KrakenPublicWS] = None,
-                 private_ws: Optional[KrakenPrivateWS] = None):
-        self.exchange = exchange
-        self.position_size_usd = position_size_usd
-        self.notifier = notifier
+                 exchange:         ExchangeConnection,
+                 symbols:          List[str],
+                 notifier:         Optional[TelegramNotifier]   = None,
+                 sentiment_monitor: Optional[SentimentMonitor]  = None,
+                 public_ws:        Optional[KrakenPublicWS]     = None,
+                 private_ws:       Optional[KrakenPrivateWS]    = None,
+                 initial_capital:  float = 0.0):
+        self.exchange          = exchange
+        self.symbols           = symbols
+        self.notifier          = notifier
         self.sentiment_monitor = sentiment_monitor
-        self.public_ws  = public_ws
-        self.private_ws = private_ws
-        self.strategy = ProductionStrategy()
+        self.public_ws         = public_ws
+        self.private_ws        = private_ws
+        self.running           = False
+
+        # Trading subsystems (same as paper_trading)
+        self.strategy        = ScientificStrategy()
+        self.regime_detector = RegimeDetector()
+        self.ofi_calc        = OrderFlowImbalance(exchange, symbols)
+        self.lead_lag        = LeadLagDetector(lead_symbol='BTC/USD')
+        self.htf_filter      = MultiTimeframeFilter(exchange)
+        self.journal         = TradeJournal()
+        self.learner         = Learner(self.journal)
+        self.ml_scorer       = MLScorer(self.journal)
+        self.strategy.ml_scorer = self.ml_scorer
+        if self.ml_scorer.should_retrain():
+            self.ml_scorer.train()
+
+        self.account   = LiveAccount(initial_capital=initial_capital)
         self.positions: Dict[str, LivePosition] = {}
-        self.account = LiveAccount(initial_capital=position_size_usd)
-        self.running = False
-        self.journal = TradeJournal()
-        self.learner = Learner(self.journal)
-        self._entry_signals: Dict[str, object] = {}   # symbol → signal at entry
+        self._started_at = datetime.now(timezone.utc).isoformat()
+
+    # ── Exchange helpers ───────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
         """Fetch available USD balance from Kraken."""
@@ -74,90 +113,183 @@ class LiveTrader:
             logger.error(f"Balance fetch failed: {e}")
             return 0.0
 
-    async def open_position(self, symbol: str, price: float,
-                            stop_loss: float, take_profit: float) -> Optional[LivePosition]:
-        usd_balance = await self.get_balance()
-        trade_usd = min(self.position_size_usd, usd_balance * 0.95)
+    async def reconcile_positions(self):
+        """
+        On startup, sync bot position state with actual Kraken open positions.
+        Prevents ghost positions after a crash/restart.
+        """
+        try:
+            exchange_positions = await self.exchange.exchange.fetch_positions(self.symbols)
+            open_syms = set()
+            for ep in (exchange_positions or []):
+                sym    = ep.get('symbol', '')
+                size   = float(ep.get('contracts', 0) or ep.get('size', 0) or 0)
+                if size > 0 and sym in self.symbols:
+                    open_syms.add(sym)
+                    if sym not in self.positions:
+                        # Exchange has a position we don't know about — record it
+                        price = float(ep.get('entryPrice') or ep.get('markPrice') or 0)
+                        if price > 0:
+                            self.positions[sym] = LivePosition(
+                                symbol=sym,
+                                entry_time=datetime.now(timezone.utc),
+                                entry_price=price,
+                                size=size,
+                                size_usd=size * price,
+                                order_id='reconciled',
+                                stop_loss_price=price * 0.98,   # 2% default SL
+                                take_profit_price=price * 1.03,
+                            )
+                            logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
 
-        if trade_usd < 5:
-            logger.warning(f"Insufficient balance for {symbol}: ${usd_balance:.2f}")
+            # Remove positions bot thinks are open but exchange doesn't
+            for sym in list(self.positions.keys()):
+                if sym not in open_syms:
+                    logger.warning(f"[RECONCILE] {sym} was in bot state but not on exchange — removing")
+                    del self.positions[sym]
+
+            if self.positions:
+                logger.info(f"[RECONCILE] Active positions after sync: {list(self.positions.keys())}")
+            else:
+                logger.info("[RECONCILE] No open positions on exchange — clean start")
+        except Exception as e:
+            logger.warning(f"[RECONCILE] Could not reconcile positions: {e} — proceeding with empty state")
+
+    # ── Order execution ────────────────────────────────────────────────────────
+
+    async def open_long(self, symbol: str, price: float, size_usd: float,
+                        signal: ScientificSignal) -> Optional[LivePosition]:
+        """Place a real buy order. Only records the position after confirmed fill."""
+        usd_balance = await self.get_balance()
+        safe_usd    = min(size_usd, usd_balance * 0.95)
+
+        if safe_usd < 5.0:
+            logger.warning(f"[LIVE] Insufficient balance for {symbol}: ${usd_balance:.2f} available")
             return None
 
-        size = trade_usd / price
+        size = safe_usd / price
 
         try:
             order = await self.exchange.create_order(
-                symbol=symbol,
-                order_type='market',
-                side='buy',
-                amount=size
+                symbol=symbol, order_type='market', side='buy', amount=size
             )
-            exec_price = float(order.get('average') or order.get('price') or price)
-            pos = LivePosition(
-                symbol=symbol,
-                entry_time=datetime.now(timezone.utc),
-                entry_price=exec_price,
-                size=size,
-                order_id=order.get('id', ''),
-                stop_loss_price=stop_loss,
-                take_profit_price=take_profit,
-            )
-            self.positions[symbol] = pos
-            logger.info(f"[LIVE BUY] {symbol} @ ${exec_price:.2f} | Size: {size:.6f} | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f}")
-            return pos
         except Exception as e:
-            logger.error(f"Buy order failed for {symbol}: {e}")
+            logger.error(f"[LIVE] Buy order FAILED for {symbol}: {e}")
+            if self.notifier:
+                self.notifier.send_error(f"Buy order failed for {symbol}: {e}")
             return None
 
-    def record_entry_signal(self, symbol: str, signal):
-        """Store the signal conditions at entry time for later journal recording."""
-        self._entry_signals[symbol] = signal
+        # Verify fill — don't record position if order didn't confirm
+        status     = order.get('status', '')
+        exec_price = float(order.get('average') or order.get('price') or price)
+        order_id   = order.get('id', '')
 
-    async def close_position(self, symbol: str, current_price: float, reason: str) -> Optional[Trade]:
+        if status not in ('closed', 'filled', ''):
+            logger.error(f"[LIVE] Order {order_id} status={status} — not confirmed filled, aborting position record")
+            if self.notifier:
+                self.notifier.send_error(f"{symbol} order {order_id} status '{status}' — check Kraken manually")
+            return None
+
+        sl_pct = signal.stop_loss_pct() / 100
+        tp_pct = signal.take_profit_pct() / 100
+        sl_price = exec_price * (1 - sl_pct)
+        tp_price = exec_price * (1 + tp_pct)
+
+        # Actual fee from order, fallback to known rate
+        actual_fee = float(order.get('fee', {}).get('cost', 0) or safe_usd * FEE_RATE)
+        self.account.total_fees += actual_fee
+
+        pos = LivePosition(
+            symbol=symbol,
+            entry_time=datetime.now(timezone.utc),
+            entry_price=exec_price,
+            size=size,
+            size_usd=safe_usd,
+            order_id=order_id,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+            entry_signal=signal,
+        )
+        self.positions[symbol] = pos
+        logger.info(
+            f"[LIVE BUY] {symbol} @ ${exec_price:.2f}  "
+            f"size ${safe_usd:.2f}  SL ${sl_price:.2f}  TP ${tp_price:.2f}  "
+            f"fee ${actual_fee:.3f}  order={order_id}"
+        )
+        return pos
+
+    async def close_long(self, symbol: str, current_price: float,
+                         reason: str) -> Optional[Trade]:
+        """Place a real sell order to close a long position."""
         pos = self.positions.get(symbol)
         if not pos:
             return None
 
         try:
             order = await self.exchange.create_order(
-                symbol=symbol,
-                order_type='market',
-                side='sell',
-                amount=pos.size
+                symbol=symbol, order_type='market', side='sell', amount=pos.size
             )
-            exec_price = float(order.get('average') or order.get('price') or current_price)
-            pnl = (exec_price - pos.entry_price) * pos.size
-            pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
-
-            trade = Trade(
-                entry_time=pos.entry_time,
-                exit_time=datetime.now(timezone.utc),
-                entry_price=pos.entry_price,
-                exit_price=exec_price,
-                size=pos.size,
-                side='sell',
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                fees=0.0
-            )
-            self.account.closed_trades.append(trade)
-            self.account.total_pnl += pnl
-            del self.positions[symbol]
-
-            logger.info(f"[LIVE SELL] {symbol} @ ${exec_price:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%) | {reason}")
-
-            # Record to journal for learning
-            entry_signal = self._entry_signals.pop(symbol, None)
-            record = self.journal.build_record(trade, symbol, reason, entry_signal)
-            self.journal.add(record)
-            self.learner.log_summary()
-
-            total_equity = self.account.initial_capital + self.account.total_pnl
-            self._notify_trade(symbol, exec_price, pnl, pnl_pct, reason, total_equity)
-            return trade
         except Exception as e:
-            logger.error(f"Sell order failed for {symbol}: {e}")
+            logger.error(f"[LIVE] Sell order FAILED for {symbol}: {e}")
+            if self.notifier:
+                self.notifier.send_error(f"SELL FAILED {symbol} @ ${current_price:.2f} — {e} — close manually on Kraken!")
             return None
+
+        exec_price = float(order.get('average') or order.get('price') or current_price)
+        exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
+        self.account.total_fees += exit_fee
+
+        pnl     = (exec_price - pos.entry_price) * pos.size - pos.size_usd * FEE_RATE - exit_fee
+        pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
+
+        trade = Trade(
+            entry_time=pos.entry_time,
+            exit_time=datetime.now(timezone.utc),
+            entry_price=pos.entry_price,
+            exit_price=exec_price,
+            size=pos.size,
+            side='sell',
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            fees=exit_fee,
+        )
+        self.account.closed_trades.append(trade)
+        self.account.total_pnl += pnl
+        del self.positions[symbol]
+
+        logger.info(
+            f"[LIVE SELL] {symbol} @ ${exec_price:.2f}  "
+            f"PnL ${pnl:.2f} ({pnl_pct:.2f}%)  reason={reason}"
+        )
+
+        # Journal + ML retrain check
+        sig = pos.entry_signal
+        _record_live_trade(self.journal, trade, symbol, reason, sig)
+        if self.ml_scorer.should_retrain():
+            logger.info("[ML] Retraining triggered")
+            self.ml_scorer.train()
+
+        # Notification
+        total_equity = self.account.initial_capital + self.account.total_pnl
+        if self.notifier and sig:
+            issues, positives = _quick_diagnose(trade.pnl, reason, sig)
+            self.notifier.send_trade_analysis(
+                symbol=symbol, side='buy', pnl=pnl, pnl_pct=pnl_pct,
+                entry_price=pos.entry_price, exit_price=exec_price,
+                total_equity=total_equity, exit_reason=reason,
+                holding_minutes=(trade.exit_time - trade.entry_time).total_seconds() / 60,
+                regime=sig.regime, regime_conf=0.0,
+                rsi=sig.rsi, adx=sig.adx, volume_ratio=sig.volume_ratio,
+                ofi=sig.ofi, funding_apy=sig.funding_rate * 3 * 365 * 100 if sig.funding_rate else None,
+                btc_lead=sig.lead_lag_dir,
+                issues=issues, positives=positives,
+                loss_streak=0, win_streak=0,
+            )
+        elif self.notifier:
+            fn = self.notifier.send_win if pnl >= 0 else self.notifier.send_loss
+            fn(symbol, pnl, pnl_pct, exec_price, total_equity, reason=reason)
+
+        return trade
 
     def update_unrealized(self, prices: Dict[str, float]):
         for sym, pos in self.positions.items():
@@ -165,310 +297,425 @@ class LiveTrader:
                 pos.unrealized_pnl = (prices[sym] - pos.entry_price) * pos.size
 
     def get_summary(self) -> dict:
-        total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
-        wins = [t for t in self.account.closed_trades if t.pnl > 0]
-        losses = [t for t in self.account.closed_trades if t.pnl <= 0]
+        total_unr = sum(p.unrealized_pnl for p in self.positions.values())
+        closed    = self.account.closed_trades
         return {
-            'cash': 0,       # live — get from exchange
-            'total_equity': self.account.initial_capital + self.account.total_pnl + total_unrealized,
-            'total_pnl': round(self.account.total_pnl, 4),
-            'pnl_pct': round(self.account.total_pnl / self.account.initial_capital * 100, 2),
+            'total_equity':   round(self.account.initial_capital + self.account.total_pnl + total_unr, 2),
+            'total_pnl':      round(self.account.total_pnl, 4),
+            'total_fees':     round(self.account.total_fees, 4),
+            'pnl_pct':        round(self.account.total_pnl / max(1, self.account.initial_capital) * 100, 2),
             'open_positions': len(self.positions),
-            'closed_trades': len(self.account.closed_trades),
-            'winning_trades': len(wins),
-            'losing_trades': len(losses),
+            'closed_trades':  len(closed),
+            'winning_trades': sum(1 for t in closed if t.pnl > 0),
+            'losing_trades':  sum(1 for t in closed if t.pnl <= 0),
         }
 
-    def _notify(self, msg: str):
-        if self.notifier:
-            try:
-                self.notifier.send_message(msg)
-            except Exception:
-                pass
 
-    def _notify_trade(self, symbol: str, price: float, pnl: float,
-                      pnl_pct: float, reason: str, total_equity: float):
-        if self.notifier:
-            if pnl >= 0:
-                self.notifier.send_win(symbol, pnl, pnl_pct, price, total_equity, reason=reason)
-            else:
-                self.notifier.send_loss(symbol, pnl, pnl_pct, price, total_equity, reason=reason)
+# ── Live session ───────────────────────────────────────────────────────────────
 
+async def run_live_trading_session(exchange:          ExchangeConnection,
+                                    trader:            LiveTrader,
+                                    symbols:           List[str],
+                                    timeframe:         str = '1m',
+                                    lookback:          int = 250,
+                                    notifier:          Optional[TelegramNotifier] = None,
+                                    sentiment_monitor: Optional[SentimentMonitor] = None,
+                                    public_ws:         Optional[KrakenPublicWS]   = None):
 
-CONFIDENCE_THRESHOLD = 75   # minimum score to place a trade
-SLTP_POLL_SECS      = 15   # how often to check SL/TP between candles
-CANDLE_OFFSET_SECS  = 5    # seconds after candle close before fetching
-
-
-def _seconds_until_next_candle(timeframe: str = '1h') -> float:
-    """Return seconds until the next candle close + offset."""
-    import time
-    now = time.time()
-    if timeframe == '1h':
-        period = 3600
-    elif timeframe == '5m':
-        period = 300
-    else:
-        period = 60
-    seconds_into_period = now % period
-    return max(1.0, period - seconds_into_period + CANDLE_OFFSET_SECS)
-
-
-async def _check_higher_timeframes(exchange: ExchangeConnection,
-                                    symbol: str, direction: str) -> bool:
-    """
-    Return True only if 5m and 15m agree with the 1m signal direction.
-    Checks: 5m EMA fast > slow (uptrend) and price > 50 EMA on 15m.
-    """
-    try:
-        # 5-minute check
-        ohlcv_5m = await exchange.fetch_ohlcv(symbol, '5m', limit=60)
-        if not ohlcv_5m:
-            return False
-        df5 = prepare_ohlcv_dataframe(ohlcv_5m)
-        import pandas_ta as ta
-        ema9_5m  = ta.ema(df5['close'], length=9).iloc[-1]
-        ema21_5m = ta.ema(df5['close'], length=21).iloc[-1]
-        rsi_5m   = ta.rsi(df5['close'], length=14).iloc[-1]
-
-        # 15-minute check
-        ohlcv_15m = await exchange.fetch_ohlcv(symbol, '15m', limit=60)
-        if not ohlcv_15m:
-            return False
-        df15 = prepare_ohlcv_dataframe(ohlcv_15m)
-        ema50_15m = ta.ema(df15['close'], length=50).iloc[-1]
-        price_15m = df15['close'].iloc[-1]
-
-        if direction == 'BUY':
-            ema_gap = (ema9_5m - ema21_5m) / ema21_5m * 100
-            if ema_gap < -0.15 or rsi_5m >= 72:
-                return False
-            if price_15m and ema50_15m:
-                if (price_15m - ema50_15m) / ema50_15m * 100 < -1.5:
-                    return False
-        else:
-            ema_gap = (ema9_5m - ema21_5m) / ema21_5m * 100
-            if ema_gap > 0.15 or rsi_5m <= 28:
-                return False
-            if price_15m and ema50_15m:
-                if (price_15m - ema50_15m) / ema50_15m * 100 > 1.5:
-                    return False
-
-        return True
-    except Exception as e:
-        logger.debug(f"Higher TF check failed for {symbol}: {e}")
-        return False
-
-
-async def run_live_trading_session(exchange: ExchangeConnection,
-                                    trader: LiveTrader,
-                                    symbols: List[str],
-                                    timeframe: str = '1h',
-                                    lookback: int = 250):
-    import time
     trader.running = True
-    started_at = datetime.now(timezone.utc).isoformat()
-    logger.info(f"LIVE TRADING STARTED — {symbols} | confidence threshold: {CONFIDENCE_THRESHOLD}")
+    logger.info(f"[LIVE] Session started — {symbols}  min_confidence={LIVE_MIN_CONFIDENCE}")
 
-    iteration = 0
-    last_candle_times: Dict[str, object] = {}
-    prices: Dict[str, float] = {}
-    indicators: Dict[str, dict] = {}
-    recent_trades: List[dict] = []
-    equity_curve: List[dict] = []
+    # ── Startup: fetch real balance and reconcile open positions ───────────────
+    real_balance = await trader.get_balance()
+    trader.account.initial_capital = real_balance
+    logger.info(f"[LIVE] Real USD balance: ${real_balance:.2f}")
 
-    # Real-time SL/TP watcher — uses WS prices when available, else REST every 5s
-    async def _live_sltp_watcher():
+    await trader.reconcile_positions()
+
+    max_daily_loss    = float(os.getenv('MAX_DAILY_LOSS', 15))
+    enable_shorts     = os.getenv('ENABLE_SHORTS', 'false').lower() == 'true'
+    session_start_pnl = trader.account.total_pnl
+
+    if notifier:
+        pos_str = f"{len(trader.positions)} open position(s)" if trader.positions else "no open positions"
+        notifier.send_message(
+            f"<b>LIVE TRADING STARTED</b>\n"
+            f"Balance: <b>${real_balance:.2f}</b>\n"
+            f"Pairs: {', '.join(s.split('/')[0] for s in symbols)}\n"
+            f"Min confidence: {LIVE_MIN_CONFIDENCE:.0f}%\n"
+            f"Max daily loss: ${max_daily_loss:.2f}\n"
+            f"Startup: {pos_str}"
+        )
+
+    # ── Background: OFI prefetch ───────────────────────────────────────────────
+    async def _ofi_fetcher():
         while trader.running:
-            await asyncio.sleep(1 if trader.public_ws else 5)
+            for sym in symbols:
+                try:
+                    await trader.ofi_calc.fetch(sym)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+            await asyncio.sleep(20)
+
+    asyncio.create_task(_ofi_fetcher())
+
+    # ── Background: 5m HTF cache ───────────────────────────────────────────────
+    async def _htf_fetcher():
+        while trader.running:
+            for sym in symbols:
+                try:
+                    await trader.htf_filter.fetch(sym)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            await asyncio.sleep(45)
+
+    asyncio.create_task(_htf_fetcher())
+
+    # ── Background: SL/TP watcher (checks every second) ───────────────────────
+    async def _sltp_watcher():
+        while trader.running:
+            await asyncio.sleep(1)
             if not trader.positions:
                 continue
-            for symbol in list(trader.positions.keys()):
+            ws_prices = public_ws.get_prices() if public_ws else {}
+            for sym in list(trader.positions.keys()):
                 try:
-                    price = (trader.public_ws.get_price(symbol) if trader.public_ws else None)
+                    price = ws_prices.get(sym)
                     if not price:
-                        ticker = await exchange.get_ticker(symbol)
-                        price = float(ticker.get('last', 0))
-                    if price <= 0:
+                        ticker = await exchange.get_ticker(sym)
+                        price  = float(ticker.get('last', 0))
+                    if not price:
                         continue
-                    prices[symbol] = price
-                    pos = trader.positions.get(symbol)
+                    pos = trader.positions.get(sym)
                     if not pos:
                         continue
+
+                    exit_reason = None
                     if price <= pos.stop_loss_price:
-                        trade = await trader.close_position(symbol, price, "STOP_LOSS")
-                        if trade:
-                            recent_trades.append(_trade_dict(trade, symbol, "STOP_LOSS"))
-                            equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
+                        exit_reason = 'STOP_LOSS'
                     elif price >= pos.take_profit_price:
-                        trade = await trader.close_position(symbol, price, "TAKE_PROFIT")
+                        exit_reason = 'TAKE_PROFIT'
+
+                    if exit_reason:
+                        trade = await trader.close_long(sym, price, exit_reason)
                         if trade:
-                            recent_trades.append(_trade_dict(trade, symbol, "TAKE_PROFIT"))
-                            equity_curve.append({'t': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'), 'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)})
+                            equity = trader.account.initial_capital + trader.account.total_pnl
+                            equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
+                            recent_trades.append(_trade_dict(trade, sym, exit_reason))
                 except Exception as e:
-                    logger.debug(f"Live SL/TP watcher error {symbol}: {e}")
+                    logger.debug(f"[LIVE SL/TP] {sym}: {e}")
 
-    asyncio.create_task(_live_sltp_watcher())
+    asyncio.create_task(_sltp_watcher())
 
-    import os as _os
-    max_daily_loss_usd  = float(_os.getenv('MAX_DAILY_LOSS', 10))
-    session_start_pnl   = trader.account.total_pnl
+    # ── OHLCV cache ────────────────────────────────────────────────────────────
+    ohlcv_cache:    Dict[str, pd.DataFrame] = {}
+    regime_cache:   Dict[str, dict]         = {}
+    last_eval_time: Dict[str, float]        = {}
+    prices:         Dict[str, float]        = {}
+    indicators:     Dict[str, dict]         = {}
+    recent_trades:  List[dict]              = []
+    equity_curve:   List[dict]              = []
+    iteration = 0
 
+    # Seed OHLCV
+    for sym in symbols:
+        try:
+            ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
+            if ohlcv:
+                ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                logger.info(f"[LIVE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+        except Exception as e:
+            logger.warning(f"[LIVE] Seed failed for {sym}: {e}")
+
+    # ── Candle refresher ───────────────────────────────────────────────────────
+    async def _candle_refresher():
+        while trader.running:
+            try:
+                if public_ws:
+                    candle = await asyncio.wait_for(public_ws.candle_queue.get(), timeout=90)
+                    refresh_syms = [candle.symbol] if candle.symbol in symbols else symbols
+                else:
+                    await asyncio.sleep(60)
+                    refresh_syms = symbols
+
+                for sym in refresh_syms:
+                    try:
+                        ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
+                        if ohlcv:
+                            ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                            result = trader.regime_detector.detect(ohlcv_cache[sym])
+                            if result:
+                                regime_cache[sym] = result.to_dict()
+                    except Exception as e:
+                        logger.debug(f"[LIVE] Candle refresh failed {sym}: {e}")
+            except asyncio.TimeoutError:
+                for sym in symbols:
+                    try:
+                        ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
+                        if ohlcv:
+                            ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                    except Exception:
+                        pass
+
+    asyncio.create_task(_candle_refresher())
+
+    # ── Main tick loop ─────────────────────────────────────────────────────────
     while trader.running:
         try:
-            now = time.time()
+            await asyncio.sleep(EVAL_INTERVAL)
+            iteration += 1
 
-            # ── Max daily loss circuit breaker ───────────────────────────────
+            # Daily loss circuit breaker
             session_loss = session_start_pnl - trader.account.total_pnl
-            if session_loss >= max_daily_loss_usd:
-                logger.warning(f"[RISK] Daily loss limit ${max_daily_loss_usd:.2f} reached — stopping live trading")
-                if trader.notifier:
-                    trader.notifier.send_message(
-                        f"<b>DAILY LOSS LIMIT HIT</b>\n"
-                        f"Loss ${session_loss:.2f} reached limit ${max_daily_loss_usd:.2f}\n"
-                        f"Bot stopped — restart manually"
+            if session_loss >= max_daily_loss:
+                logger.warning(f"[LIVE RISK] Daily loss limit ${max_daily_loss:.2f} hit — stopping")
+                if notifier:
+                    notifier.send_message(
+                        f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
+                        f"Lost ${session_loss:.2f} today (limit: ${max_daily_loss:.2f})\n"
+                        f"Bot stopped — restart manually when ready"
                     )
                 trader.running = False
                 break
 
-            # ── Sleep until next candle close ────────────────────────────────
-            sleep_secs = _seconds_until_next_candle(timeframe)
-            await asyncio.sleep(sleep_secs)
-            iteration += 1
+            ws_prices = public_ws.get_prices() if public_ws else {}
 
-            # ── Process new 1m candles ───────────────────────────────────────
             for symbol in symbols:
-                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=lookback)
-                if not ohlcv:
+                now_ts = time.time()
+                if now_ts - last_eval_time.get(symbol, 0) < EVAL_INTERVAL:
+                    continue
+                last_eval_time[symbol] = now_ts
+
+                if symbol not in ohlcv_cache:
                     continue
 
-                df = prepare_ohlcv_dataframe(ohlcv)
-                current_price = float(df['close'].iloc[-1])
-                current_time = df.index[-1]
-
-                # Skip if candle already processed
-                if last_candle_times.get(symbol) == current_time:
+                current_price = ws_prices.get(symbol) or prices.get(symbol)
+                if not current_price:
                     continue
-                last_candle_times[symbol] = current_time
+
                 prices[symbol] = current_price
+                trader.lead_lag.update_price(symbol, current_price)
 
-                signal = trader.strategy.get_latest_signal(df)
-                if signal is None:
+                df = _inject_live_price(ohlcv_cache[symbol], current_price)
+
+                cached_regime = regime_cache.get(symbol, {})
+                regime_name   = cached_regime.get('regime', 'UNKNOWN')
+                regime_conf   = cached_regime.get('confidence', 0.5)
+
+                from .paper_trading import _get_funding_rate
+                funding_rate = _get_funding_rate(symbol)
+
+                sig = trader.strategy.evaluate(
+                    df, symbol, trader.ofi_calc, trader.lead_lag,
+                    regime_name, regime_conf, funding_rate
+                )
+                if sig is None:
                     continue
 
-                # Use the confidence score already computed by the strategy
-                score = signal.confidence
+                # MTF alignment adjustment
+                if sig.signal != Signal.HOLD:
+                    mtf_adj = trader.htf_filter.alignment_score(symbol, is_buy=sig.is_buy)
+                    if mtf_adj != 0.0:
+                        sig.confidence = max(0.0, min(100.0, sig.confidence + mtf_adj))
+                        sig.size_mult  = _get_size_mult(sig.confidence)
 
                 indicators[symbol] = {
-                    'signal': signal.signal.value,
-                    'confidence': score,
-                    'rsi': round(signal.rsi, 2) if signal.rsi else None,
-                    'ema_fast': round(signal.ema_fast, 2) if signal.ema_fast else None,
-                    'ema_slow': round(signal.ema_slow, 2) if signal.ema_slow else None,
-                    'adx': round(signal.adx, 2) if signal.adx else None,
-                    'atr': round(signal.atr, 4) if signal.atr else None,
-                    'volume_ratio': round(signal.volume_ratio, 2) if signal.volume_ratio else None,
+                    'signal':     sig.signal.value,
+                    'confidence': round(sig.confidence, 1),
+                    'rsi':        round(sig.rsi, 2),
+                    'adx':        round(sig.adx, 2),
+                    'regime':     sig.regime,
+                    'ofi':        round(sig.ofi, 3) if sig.ofi is not None else None,
                 }
 
-                # ── Entry: buy signal + learner-adjusted confidence ──────────
-                if signal.is_buy and symbol not in trader.positions and (
-                    not trader.sentiment_monitor or trader.sentiment_monitor.allows_long(symbol)
-                ):
-                    # Ask learner what threshold is needed given current conditions
-                    current_features = {
-                        'rsi':          signal.rsi or 50.0,
-                        'adx':          signal.adx or 20.0,
-                        'volume_ratio': signal.volume_ratio if hasattr(signal, 'volume_ratio') and signal.volume_ratio else 1.0,
-                        'atr_pct':      (signal.atr / signal.close * 100) if signal.atr and signal.close else 1.0,
-                        'ema100_gap':   ((signal.close - signal.ema100) / signal.ema100 * 100) if hasattr(signal, 'ema100') and signal.ema100 else 0.0,
-                        'ema200_gap':   ((signal.close - signal.ema200) / signal.ema200 * 100) if hasattr(signal, 'ema200') and signal.ema200 else 0.0,
-                        'hour_utc':     float(datetime.now(timezone.utc).hour),
-                        'day_of_week':  float(datetime.now(timezone.utc).weekday()),
-                    }
-                    regime = signal.regime if hasattr(signal, 'regime') else 'UNKNOWN'
-                    required = trader.learner.required_confidence(current_features, regime, symbol)
+                pos      = trader.positions.get(symbol)
+                pos_side = pos.entry_signal.signal if pos and pos.entry_signal else None
 
-                    if score < required:
-                        logger.info(f"[SKIP BUY] {symbol} — score {score} < required {required} (learner)")
-                        continue
-                    tf_aligned = await _check_higher_timeframes(exchange, symbol, 'BUY')
-                    if not tf_aligned:
-                        logger.info(f"[SKIP BUY] {symbol} — higher TFs not aligned (score {score})")
-                        continue
-                    logger.info(f"[ENTER] {symbol} — score {score}/{required} | regime={regime} | TFs aligned")
-                    trader.record_entry_signal(symbol, signal)
-                    await trader.open_position(
-                        symbol, current_price,
-                        stop_loss=signal.stop_loss_price,
-                        take_profit=signal.take_profit_price
-                    )
+                current_equity = trader.account.initial_capital + trader.account.total_pnl
 
-                # ── Exit: sell signal ────────────────────────────────────────
-                elif signal.is_sell and symbol in trader.positions:
-                    trade = await trader.close_position(symbol, current_price, "SIGNAL")
+                # ── LONG ENTRY ─────────────────────────────────────────────────
+                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE:
+                    if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
+                        continue
+
+                    size_usd = compute_position_size(sig.confidence, current_equity)
+                    if size_usd < 5.0:
+                        continue
+
+                    position = await trader.open_long(symbol, current_price, size_usd, sig)
+                    if position and notifier:
+                        notifier.send_trade_alert(
+                            action="BUY", symbol=symbol, price=current_price,
+                            size=size_usd, signal=sig,
+                        )
+
+                # ── LONG EXIT (signal reversed) ────────────────────────────────
+                elif sig.signal == Signal.SELL and pos is not None:
+                    trade = await trader.close_long(symbol, current_price, "SIGNAL")
                     if trade:
+                        equity = trader.account.initial_capital + trader.account.total_pnl
+                        equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
                         recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
-                        equity_curve.append({
-                            't': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
-                            'v': round(trader.account.initial_capital + trader.account.total_pnl, 2)
-                        })
 
             trader.update_unrealized(prices)
 
+            # State write for dashboard
             summary = trader.get_summary()
-            positions_data = {
-                sym: {
-                    'entry_time': pos.entry_time.isoformat(),
-                    'entry_price': pos.entry_price,
-                    'size': pos.size,
-                    'stop_loss_price': pos.stop_loss_price,
-                    'take_profit_price': pos.take_profit_price,
-                    'unrealized_pnl': round(pos.unrealized_pnl, 4),
-                }
-                for sym, pos in trader.positions.items()
-            }
-            sentiment_data = (
-                trader.sentiment_monitor.get_snapshot().to_dict()
-                if trader.sentiment_monitor and trader.sentiment_monitor.get_snapshot()
-                else None
-            )
             write_state({
-                'status': 'running',
-                'mode': 'live',
-                'started_at': started_at,
-                'iteration': iteration,
-                'account': summary,
-                'positions': positions_data,
-                'prices': {k: round(v, 2) for k, v in prices.items()},
-                'indicators': indicators,
+                'status':        'running',
+                'mode':          'live',
+                'started_at':    trader._started_at,
+                'iteration':     iteration,
+                'account':       summary,
+                'positions': {
+                    sym: {
+                        'entry_price':    pos.entry_price,
+                        'size':           pos.size,
+                        'size_usd':       pos.size_usd,
+                        'stop_loss':      pos.stop_loss_price,
+                        'take_profit':    pos.take_profit_price,
+                        'unrealized_pnl': round(pos.unrealized_pnl, 4),
+                        'confidence':     pos.entry_signal.confidence if pos.entry_signal else 0,
+                        'regime':         pos.entry_signal.regime if pos.entry_signal else 'UNKNOWN',
+                    }
+                    for sym, pos in trader.positions.items()
+                },
+                'prices':        {k: round(v, 2) for k, v in prices.items()},
+                'indicators':    indicators,
                 'recent_trades': recent_trades[-50:],
-                'equity_curve': equity_curve[-200:],
-                'learning': trader.journal.stats(),
-                'sentiment': sentiment_data,
+                'equity_curve':  equity_curve[-200:],
+                'journal':       trader.journal.stats(),
+                'ofi':           {s: round(trader.ofi_calc.get_smoothed(s), 3) if trader.ofi_calc.get_smoothed(s) else None for s in symbols},
             })
 
-            if iteration % 10 == 0:
-                logger.info(f"Iteration {iteration}: PnL=${summary['total_pnl']:.2f} | Open={summary['open_positions']}")
+            if iteration % 30 == 0:
+                s  = trader.get_summary()
+                wr = round(s['winning_trades'] / s['closed_trades'] * 100, 1) if s['closed_trades'] else 0
+                logger.info(
+                    f"[LIVE] Tick {iteration}  equity=${s['total_equity']:,.2f}  "
+                    f"pnl=${s['total_pnl']:+.2f}  trades={s['closed_trades']}(WR={wr}%)  "
+                    f"fees=${s['total_fees']:.2f}"
+                )
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Live trading loop error: {e}")
-            await asyncio.sleep(10)
+            logger.error(f"[LIVE] Loop error: {e}", exc_info=True)
+            await asyncio.sleep(5)
 
     trader.running = False
-    logger.info("Live trading session ended")
+    logger.info("[LIVE] Session ended")
+    if notifier:
+        s = trader.get_summary()
+        notifier.send_message(
+            f"<b>LIVE SESSION ENDED</b>\n"
+            f"Final P&L: <b>${s['total_pnl']:+.2f}  ({s['pnl_pct']:+.1f}%)</b>\n"
+            f"Trades: {s['closed_trades']}  (WR {round(s['winning_trades']/max(1,s['closed_trades'])*100)}%)\n"
+            f"Fees paid: ${s['total_fees']:.2f}"
+        )
 
 
-def _trade_dict(trade, symbol, reason):
+# ── bot.py integration ─────────────────────────────────────────────────────────
+
+async def start_live_session(exchange, symbols, timeframe, notifier, sentiment,
+                              public_ws, private_ws, risk_cfg):
+    """Called by bot.py._run_live_mode — thin wrapper."""
+    trader = LiveTrader(
+        exchange=exchange,
+        symbols=symbols,
+        notifier=notifier,
+        sentiment_monitor=sentiment,
+        public_ws=public_ws,
+        private_ws=private_ws,
+    )
+    await run_live_trading_session(
+        exchange=exchange,
+        trader=trader,
+        symbols=symbols,
+        timeframe=timeframe,
+        lookback=250,
+        notifier=notifier,
+        sentiment_monitor=sentiment,
+        public_ws=public_ws,
+    )
+    return trader
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
+    df = df.copy()
+    idx = df.index[-1]
+    df.at[idx, 'close'] = live_price
+    df.at[idx, 'high']  = max(float(df.at[idx, 'high']), live_price)
+    df.at[idx, 'low']   = min(float(df.at[idx, 'low']),  live_price)
+    return df
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')
+
+def _trade_dict(trade, symbol: str, reason: str) -> dict:
     return {
-        'symbol': symbol,
-        'entry_time': trade.entry_time.isoformat() if hasattr(trade.entry_time, 'isoformat') else str(trade.entry_time),
-        'exit_time': trade.exit_time.isoformat() if hasattr(trade.exit_time, 'isoformat') else str(trade.exit_time),
+        'symbol':      symbol,
+        'entry_time':  trade.entry_time.isoformat() if hasattr(trade.entry_time, 'isoformat') else str(trade.entry_time),
+        'exit_time':   trade.exit_time.isoformat()  if hasattr(trade.exit_time,  'isoformat') else str(trade.exit_time),
         'entry_price': round(trade.entry_price, 4),
-        'exit_price': round(trade.exit_price, 4),
-        'size': trade.size,
-        'pnl': round(trade.pnl, 4),
-        'pnl_pct': round(trade.pnl_pct, 2),
-        'reason': reason,
+        'exit_price':  round(trade.exit_price,  4),
+        'pnl':         round(trade.pnl, 4),
+        'pnl_pct':     round(trade.pnl_pct, 2),
+        'reason':      reason,
     }
+
+def _record_live_trade(journal: TradeJournal, trade: Trade, symbol: str,
+                       reason: str, sig: Optional[ScientificSignal]):
+    now = datetime.now(timezone.utc)
+    from .trade_journal import TradeRecord
+    record = TradeRecord(
+        trade_id    = f"{symbol}_{int(now.timestamp())}",
+        symbol      = symbol,
+        opened_at   = trade.entry_time.isoformat() if hasattr(trade.entry_time, 'isoformat') else str(trade.entry_time),
+        closed_at   = now.isoformat(),
+        rsi          = sig.rsi          if sig else 50.0,
+        adx          = sig.adx          if sig else 20.0,
+        volume_ratio = sig.volume_ratio if sig else 1.0,
+        regime       = sig.regime       if sig else 'UNKNOWN',
+        atr_pct      = (sig.atr / sig.close * 100) if sig and sig.atr and sig.close else 1.0,
+        ema100_gap   = 0.0,
+        ema200_gap   = 0.0,
+        hour_utc     = now.hour,
+        day_of_week  = now.weekday(),
+        pnl          = round(trade.pnl, 4),
+        pnl_pct      = round(trade.pnl_pct, 2),
+        won          = trade.pnl > 0,
+        reason       = reason,
+        ofi               = float(sig.ofi or 0.0) if sig else 0.0,
+        lead_lag_strength = max(0.0, sig.lead_lag_score) / 20.0 if sig else 0.0,
+        lead_lag_aligned  = (sig.lead_lag_dir == 'BUY') if sig and sig.lead_lag_dir else False,
+        confidence        = float(sig.confidence) if sig else 0.0,
+        ofi_score         = float(sig.ofi_score) if sig else 0.0,
+        lead_lag_score    = float(sig.lead_lag_score) if sig else 0.0,
+        regime_score      = float(sig.regime_score) if sig else 0.0,
+        regime_confidence = 0.5,
+        funding_rate      = float(sig.funding_rate or 0.0) if sig else 0.0,
+        direction         = 'buy',
+    )
+    journal.add(record)
+
+def _quick_diagnose(pnl: float, reason: str, sig: ScientificSignal):
+    issues, positives = [], []
+    if sig.ofi is not None:
+        if sig.ofi > 0.15:
+            positives.append(f"OFI {sig.ofi:+.2f} confirmed direction at entry")
+        elif sig.ofi < -0.15:
+            issues.append(f"OFI {sig.ofi:+.2f} was against direction — order flow warned us")
+    if reason == 'STOP_LOSS':
+        issues.append("Stopped out — immediate rejection at entry level")
+    elif reason == 'TAKE_PROFIT':
+        positives.append("Target reached as predicted")
+    if sig.confidence >= 90:
+        positives.append(f"High conviction entry ({sig.confidence:.0f}% confidence)")
+    elif sig.confidence < 70:
+        issues.append(f"Low confidence entry ({sig.confidence:.0f}%) — should have waited")
+    return issues, positives

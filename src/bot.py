@@ -19,7 +19,7 @@ from .exchange import ExchangeConnection
 from .indicators import prepare_ohlcv_dataframe
 from .backtester import Backtester, run_backtest, print_backtest_report
 from .paper_trading import PaperTrader, run_paper_trading_session
-from .live_trading import LiveTrader, run_live_trading_session
+from .live_trading import LiveTrader, run_live_trading_session, start_live_session
 from .dashboard import run_dashboard
 from .notifications import create_notifier_from_env
 from .market_sentiment import SentimentMonitor
@@ -168,7 +168,7 @@ class ScalpingBot:
 
     async def _run_live_mode(self):
         """Run live trading with real money on Kraken."""
-        api_key = os.getenv('KRAKEN_API_KEY')
+        api_key    = os.getenv('KRAKEN_API_KEY')
         api_secret = os.getenv('KRAKEN_API_SECRET')
 
         if not api_key or not api_secret:
@@ -178,39 +178,36 @@ class ScalpingBot:
         self.exchange = ExchangeConnection(api_key=api_key, secret=api_secret, sandbox=False)
         await self.exchange.connect()
 
-        notifier    = create_notifier_from_env()
-        sentiment   = SentimentMonitor(notifier=notifier)
-        public_ws   = KrakenPublicWS(self.symbols, ohlc_interval=1)
-        private_ws  = KrakenPrivateWS(api_key, api_secret)
-        vol_mon     = CryptoVolMonitor()
+        notifier   = create_notifier_from_env()
+        sentiment  = SentimentMonitor(notifier=notifier)
+        public_ws  = KrakenPublicWS(self.symbols, ohlc_interval=1)
+        private_ws = KrakenPrivateWS(api_key, api_secret)
+        vol_mon    = CryptoVolMonitor()
         asyncio.create_task(sentiment.start())
         asyncio.create_task(public_ws.start())
         asyncio.create_task(private_ws.start())
         asyncio.create_task(vol_mon.start())
-        logger.info("WebSocket streams starting (public + private + IV monitor)")
+        logger.info("[LIVE] WebSocket streams starting")
 
         risk_cfg = self.config.get('risk', {})
-        live_trader = LiveTrader(
-            exchange=self.exchange,
-            position_size_usd=risk_cfg.get('max_position_size', 50),
-            notifier=notifier,
-            sentiment_monitor=sentiment,
-            public_ws=public_ws,
-            private_ws=private_ws,
-        )
-
-        logger.info("LIVE TRADING ACTIVE — real orders will be placed on Kraken")
-        if notifier:
-            pairs_str = ' '.join(s.split('/')[0] for s in self.symbols)
-            notifier.send_message(f"<b>LIVE STARTED</b>\n{pairs_str}   4h\nreal orders active on Kraken")
 
         try:
-            # ProductionStrategy is calibrated for 4h candles — override timeframe
             await run_live_trading_session(
-                self.exchange, live_trader,
+                exchange=self.exchange,
+                trader=LiveTrader(
+                    exchange=self.exchange,
+                    symbols=self.symbols,
+                    notifier=notifier,
+                    sentiment_monitor=sentiment,
+                    public_ws=public_ws,
+                    private_ws=private_ws,
+                ),
                 symbols=self.symbols,
-                timeframe='4h',
-                lookback=300,
+                timeframe=self.timeframe,
+                lookback=250,
+                notifier=notifier,
+                sentiment_monitor=sentiment,
+                public_ws=public_ws,
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")

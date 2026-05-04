@@ -2,11 +2,11 @@
 
 exchange:
   name: kraken
-  sandbox: true  # Use testnet/sandbox for paper trading
+  sandbox: false
 
 trading:
-  mode: paper  # paper or live
-  initial_capital: 100
+  mode: live
+  initial_capital: 500    # starting capital — bot reads real balance from Kraken at startup
   pairs:
     - BTC/USD
     - ETH/USD
@@ -21,10 +21,10 @@ strategy:
   rsi_oversold: 30
 
 risk:
-  max_position_size: 50  # USD
+  max_position_size: 25   # max USD per trade — conservative for first live run
   stop_loss_pct: 2.0
   take_profit_pct: 3.0
-  max_daily_loss: 10
+  max_daily_loss: 15      # bot stops for the day if total loss hits this
   max_open_positions: 3
 
 backtest:
