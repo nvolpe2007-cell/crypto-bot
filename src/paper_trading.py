@@ -341,7 +341,7 @@ class PaperTrader:
         pnl         = (pos.entry_price - exec_price) * pos.size - total_fees
         cost_basis  = pos.entry_price * pos.size + pos.entry_fee
         pnl_pct     = pnl / cost_basis * 100
-        returned    = pos.entry_price * pos.size - pos.entry_fee
+        returned    = pos.entry_price * pos.size + pos.entry_fee
         self.account.cash      += returned + pnl
         self.account.total_pnl += pnl
         trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,

@@ -396,3 +396,186 @@ class TestUpdateUnrealizedPnl:
         summary = t.get_account_summary()
         expected = 1_000.0 - pos.entry_fee
         assert abs(summary["total_equity"] - expected) < 1e-6
+
+
+# ── execute_short ─────────────────────────────────────────────────────────────
+
+class TestExecuteShort:
+    def test_returns_position(self):
+        t = _trader()
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos is not None
+
+    def test_position_side_is_short(self):
+        t = _trader()
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos.side == 'short'
+
+    def test_position_stored_in_account(self):
+        t = _trader()
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert SYMBOL in t.account.positions
+
+    def test_cash_reduced_by_margin(self):
+        # margin = exec_price * size + entry_fee; size = 100/50000 = 0.002
+        # entry_fee = 50000 * 0.002 * 0.0026 = 0.26; margin = 100.26
+        t = _trader(initial_capital=1_000.0, fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        expected_fee    = PRICE * (100.0 / PRICE) * 0.0026
+        expected_margin = 100.0 + expected_fee
+        assert abs(t.account.cash - (1_000.0 - expected_margin)) < 1e-6
+
+    def test_slippage_lowers_exec_price(self):
+        # For a short, slippage means you sell at a slightly lower price
+        t = _trader(slippage_pct=0.1)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos.entry_price < PRICE
+
+    def test_entry_fee_stored_on_position(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        expected_fee = PRICE * (100.0 / PRICE) * 0.0026
+        assert abs(pos.entry_fee - expected_fee) < 1e-6
+
+    def test_no_position_with_zero_cash(self):
+        t = _trader(initial_capital=0.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos is None
+        assert SYMBOL not in t.account.positions
+
+    def test_position_size_capped_by_cash(self):
+        t = _trader(initial_capital=50.0, fee_pct=0.0, slippage_pct=0.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=200.0)
+        assert pos is not None
+        assert pos.size * PRICE <= 50.0 + 1e-6
+
+
+# ── execute_cover ─────────────────────────────────────────────────────────────
+
+class TestExecuteCover:
+    def test_returns_trade(self):
+        t = _trader()
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 0.95, T1)
+        assert trade is not None
+
+    def test_position_removed_after_cover(self):
+        t = _trader()
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_cover(SYMBOL, PRICE * 0.95, T1)
+        assert SYMBOL not in t.account.positions
+
+    def test_returns_none_if_no_position(self):
+        t = _trader()
+        assert t.execute_cover(SYMBOL, PRICE, T0) is None
+
+    def test_trade_side_is_cover(self):
+        t = _trader()
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 0.95, T1)
+        assert trade.side == 'cover'
+
+    def test_pnl_positive_when_price_falls(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 0.90, T1)  # -10%
+        assert trade.pnl > 0
+
+    def test_pnl_negative_when_price_rises(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 1.10, T1)  # +10%
+        assert trade.pnl < 0
+
+    def test_pnl_negative_on_same_price_due_to_fees(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE, T1)
+        assert trade.pnl < 0
+
+    def test_round_trip_pnl_equals_negative_total_fees(self):
+        """Cover at entry price → pnl = -(entry_fee + exit_fee)."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE, T1)
+        size      = 100.0 / PRICE
+        entry_fee = PRICE * size * 0.0026
+        exit_fee  = PRICE * size * 0.0026
+        assert abs(trade.pnl - (-(entry_fee + exit_fee))) < 1e-6
+
+    def test_total_pnl_updated_on_account(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 0.95, T1)
+        assert abs(t.account.total_pnl - trade.pnl) < 1e-9
+
+    def test_slippage_raises_cover_exec_price(self):
+        # Buying back (covering) with slippage means paying more
+        t = _trader(fee_pct=0.0, slippage_pct=0.1)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE, T1)
+        assert trade.exit_price > PRICE
+
+    def test_cover_on_long_position_delegates_to_sell(self):
+        """execute_cover called on a long position must delegate to execute_sell."""
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_cover(SYMBOL, PRICE * 1.05, T1)
+        assert trade is not None
+        assert SYMBOL not in t.account.positions
+
+
+# ── accounting identity (shorts) ──────────────────────────────────────────────
+
+class TestAccountingIdentityShorts:
+    """
+    The core invariant must hold for shorts too:
+        total_equity == initial_capital + total_pnl
+
+    Before the bug fix, execute_cover used
+        returned = entry_price * size - entry_fee   (wrong sign)
+    instead of
+        returned = entry_price * size + entry_fee   (correct: full margin return)
+    which caused the identity to fail by 2 * entry_fee per round-trip because
+    pnl already deducts entry_fee via total_fees = entry_fee + exit_fee.
+    """
+
+    def test_identity_holds_after_profitable_short(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_cover(SYMBOL, PRICE * 0.95, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
+
+    def test_identity_holds_after_losing_short(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_cover(SYMBOL, PRICE * 1.03, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
+
+    def test_identity_holds_on_same_price_round_trip(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_cover(SYMBOL, PRICE, T1)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
+
+    def test_identity_holds_across_multiple_short_trades(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=10_000.0)
+        price_pairs = [(50_000.0, 49_000.0), (51_000.0, 52_000.0), (48_000.0, 47_500.0)]
+        for i, (ep, cp) in enumerate(price_pairs):
+            entry_t = datetime(2024, 1, i * 2 + 1)
+            exit_t  = datetime(2024, 1, i * 2 + 2)
+            t.execute_short(SYMBOL, ep, entry_t, size_usd=500.0)
+            t.execute_cover(SYMBOL, cp, exit_t)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (10_000.0 + summary["total_pnl"])) < 1e-6
+
+    def test_cash_after_zero_fee_profitable_short(self):
+        """With zero fees, cash after round-trip equals initial + price_diff * size."""
+        t = _trader(fee_pct=0.0, slippage_pct=0.0, initial_capital=1_000.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        lower_price = PRICE * 0.90
+        trade = t.execute_cover(SYMBOL, lower_price, T1)
+        assert abs(t.account.cash - (1_000.0 + trade.pnl)) < 1e-6
