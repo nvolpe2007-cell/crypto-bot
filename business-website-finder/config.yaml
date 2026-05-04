@@ -1,0 +1,38 @@
+location:
+  city: "Your City"   # change to your target city
+  state: "XX"         # change to your state abbreviation (e.g. TX, NY, FL)
+
+search:
+  business_types:
+    - "general contractor"
+    - "roofing contractor"
+    - "remodeling contractor"
+    - "painter"
+    - "plumber"
+    - "electrician"
+    - "HVAC contractor"
+    - "landscaping"
+    - "lawn care"
+    - "tree service"
+    - "pressure washing"
+    - "handyman"
+    - "flooring contractor"
+    - "fence company"
+    - "gutter cleaning"
+  results_per_type: 60
+  headless: true
+
+rate_limits:
+  maps_scroll_delay_sec: 2.5
+  maps_page_load_sec: 4.0
+  yelp_request_delay_sec: 3.0
+  facebook_request_delay_sec: 4.0
+  email_send_delay_sec: 30
+
+email:
+  sender_name: "Nick Volpe"
+  subject_line: "Quick question about your business"
+
+logging:
+  level: INFO
+  file: logs/bot.log

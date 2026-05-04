@@ -1,0 +1,22 @@
+# Credentials
+.env
+
+# Runtime data
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Playwright
+.playwright/
