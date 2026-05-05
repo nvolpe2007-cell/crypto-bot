@@ -33,8 +33,30 @@ class _FakeExchange:
 _ccxt_async = types.ModuleType("ccxt.async_support")
 _ccxt_async.kraken = lambda **kw: _FakeExchange()
 
+# Exception hierarchy mirroring real ccxt so exchange.py's _RETRYABLE tuple
+# resolves to the same classes that test code raises.
+class _BaseError(Exception): pass
+class _NetworkError(_BaseError): pass
+class _RequestTimeout(_NetworkError): pass
+class _RateLimitExceeded(_NetworkError): pass
+class _ExchangeError(_BaseError): pass
+class _AuthenticationError(_ExchangeError): pass
+
+_ccxt_async.BaseError = _BaseError
+_ccxt_async.NetworkError = _NetworkError
+_ccxt_async.RequestTimeout = _RequestTimeout
+_ccxt_async.RateLimitExceeded = _RateLimitExceeded
+_ccxt_async.ExchangeError = _ExchangeError
+_ccxt_async.AuthenticationError = _AuthenticationError
+
 _ccxt_root = types.ModuleType("ccxt")
 _ccxt_root.async_support = _ccxt_async
+_ccxt_root.BaseError = _BaseError
+_ccxt_root.NetworkError = _NetworkError
+_ccxt_root.RequestTimeout = _RequestTimeout
+_ccxt_root.RateLimitExceeded = _RateLimitExceeded
+_ccxt_root.ExchangeError = _ExchangeError
+_ccxt_root.AuthenticationError = _AuthenticationError
 
 sys.modules["ccxt"] = _ccxt_root
 sys.modules["ccxt.async_support"] = _ccxt_async
