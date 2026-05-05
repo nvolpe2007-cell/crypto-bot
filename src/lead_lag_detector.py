@@ -96,6 +96,13 @@ class LeadLagDetector:
         sig = self.get_signal(symbol)
         return sig != 'BUY'
 
+    def get_momentum_signal(self) -> Optional[str]:
+        """
+        Returns the lead symbol's own momentum signal ('BUY', 'SELL', or None).
+        Used in BTC-only mode where there are no alt symbols to lead.
+        """
+        return self.get_signal(self.lead_symbol)
+
     def summary(self, symbol: str) -> str:
         """Human-readable summary for Telegram analysis."""
         sig = self.get_signal(symbol)
@@ -136,6 +143,11 @@ class LeadLagDetector:
                 # Only update if no signal, or new magnitude is larger
                 if not existing or magnitude > existing[2]:
                     self._signals[sym] = (direction, now, magnitude)
+
+        # BTC-only mode: also emit a momentum signal for the lead symbol itself
+        existing_self = self._signals.get(self.lead_symbol)
+        if not existing_self or magnitude > existing_self[2]:
+            self._signals[self.lead_symbol] = (direction, now, magnitude)
 
         logger.info(
             f"[LEAD-LAG] BTC moved {move*100:+.2f}% → {direction} signal on alts "

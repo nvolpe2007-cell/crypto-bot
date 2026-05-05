@@ -18,13 +18,13 @@ Entry requirements:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 import pandas as pd
 import pandas_ta as ta
 
-from .indicators import Signal
+from .indicators import Signal, VWAPCalculator, BBSqueezeDetector, VolumeProfileCalculator, CMEGapDetector
 from .order_flow import OrderFlowImbalance
 from .lead_lag_detector import LeadLagDetector
 
@@ -80,6 +80,12 @@ class ScientificSignal:
     ema_slow:       float
     volume_ratio:   float
     funding_rate:   Optional[float]
+
+    # BTC-specific scores and context (defaults so existing code doesn't break)
+    vwap_score:     float = 0.0
+    cme_score:      float = 0.0
+    vwap_dev_pct:   float = 0.0
+    bb_squeezing:   bool  = False
 
     @property
     def is_buy(self) -> bool:
@@ -140,6 +146,16 @@ class ScientificStrategy:
         self.lead_lag_min   = lead_lag_min
         self.min_confidence = min_confidence
         self.ml_scorer      = None   # set by paper_trading after MLScorer is ready
+
+        # BTC-specific alpha components
+        self._vwap       = VWAPCalculator()
+        self._bb_squeeze = BBSqueezeDetector()
+        self._vol_prof   = VolumeProfileCalculator()
+        self._cme_gap    = CMEGapDetector()
+
+        # Funding rate thresholds for directional bias
+        self._funding_bearish_threshold =  0.0005   # > +0.05% 8h → crowded long
+        self._funding_bullish_threshold = -0.0002   # < -0.02% 8h → shorts paying
 
     def evaluate(self,
                  df: pd.DataFrame,
@@ -209,8 +225,16 @@ class ScientificStrategy:
             elif ofi < -0.15: ofi_dir = 'BEARISH'
 
         # ── Lead-lag signal ────────────────────────────────────────────────────
-        lead_dir      = lead_lag.get_signal(symbol) if lead_lag else None
-        lead_strength = lead_lag.get_strength(symbol) if lead_lag else 0.0
+        # In BTC-only mode, BTC leads itself — use momentum signal
+        is_lead_symbol = (lead_lag and hasattr(lead_lag, 'lead_symbol')
+                          and symbol == lead_lag.lead_symbol
+                          and hasattr(lead_lag, 'get_momentum_signal'))
+        if is_lead_symbol:
+            lead_dir      = lead_lag.get_momentum_signal()
+            lead_strength = lead_lag.get_strength(symbol)
+        else:
+            lead_dir      = lead_lag.get_signal(symbol) if lead_lag else None
+            lead_strength = lead_lag.get_strength(symbol) if lead_lag else 0.0
 
         # ── Determine candidate direction ──────────────────────────────────────
         # Evaluate BOTH directions, then pick the one with higher confidence.
@@ -235,6 +259,27 @@ class ScientificStrategy:
 
         has_buy  = _has_buy_signal()
         has_sell = _has_sell_signal()
+
+        if not has_buy and not has_sell:
+            return _hold_signal(price, ema9_v, ema21_v, rsi_v, adx_v, atr_v, vol_ratio, ofi, lead_dir, regime, funding_rate)
+
+        # ── Funding rate pre-direction gate ────────────────────────────────────
+        # Suppress weak signals that go against the crowd-positioning bias.
+        # OFI or BTC momentum must confirm before allowing a counter-funding trade.
+        funding_bearish = funding_rate is not None and funding_rate > self._funding_bearish_threshold
+        funding_bullish = funding_rate is not None and funding_rate < self._funding_bullish_threshold
+
+        if funding_bearish and has_buy and not has_sell:
+            ofi_confirms = ofi is not None and ofi > 0.20
+            lead_confirms = lead_dir == 'BUY'
+            if not ofi_confirms and not lead_confirms:
+                has_buy = False   # crowded long — suppress weak buy
+
+        if funding_bullish and has_sell and not has_buy:
+            ofi_confirms = ofi is not None and ofi < -0.20
+            lead_confirms = lead_dir == 'SELL'
+            if not ofi_confirms and not lead_confirms:
+                has_sell = False  # crowded short — suppress weak sell
 
         if not has_buy and not has_sell:
             return _hold_signal(price, ema9_v, ema21_v, rsi_v, adx_v, atr_v, vol_ratio, ofi, lead_dir, regime, funding_rate)
@@ -346,23 +391,105 @@ class ScientificStrategy:
         if vol_ratio > 1.2:                tech_score += 2.0
         tech_score = min(tech_score, 15.0)
 
-        # 6. Funding rate score (0-10 pts)
+        # 6. Funding rate score (0-10 pts) — enhanced thresholds
         funding_score = 0.0
         if funding_rate is not None:
-            annual = funding_rate * 3 * 365 * 100
             if is_buy:
-                if funding_rate < -0.001:   funding_score = 10.0  # paid to be long
-                elif funding_rate < 0.0005: funding_score = 5.0   # neutral-positive
-                elif funding_rate > 0.001:  funding_score = -5.0  # longs paying
+                if funding_rate < self._funding_bullish_threshold:   funding_score = 10.0   # paid to be long
+                elif funding_rate < 0.0005:                          funding_score = 5.0    # neutral-positive
+                elif funding_rate > self._funding_bearish_threshold: funding_score = -8.0   # crowded long
+                elif funding_rate > 0.0003:                          funding_score = -3.0
             else:
-                if funding_rate > 0.001:    funding_score = 10.0  # market over-long → short pays
-                elif funding_rate > 0.0005: funding_score = 5.0
-                elif funding_rate < -0.001: funding_score = -5.0
+                if funding_rate > self._funding_bearish_threshold:   funding_score = 10.0   # shorts collect
+                elif funding_rate > 0.0003:                          funding_score = 5.0
+                elif funding_rate < self._funding_bullish_threshold:  funding_score = -8.0   # crowded short
+                elif funding_rate < -0.0001:                          funding_score = -3.0
+
+        # 7. VWAP signal (0-10 pts)
+        vwap_result  = self._vwap.calculate(df)
+        vwap_score   = 0.0
+        vwap_dev_pct = 0.0
+        VWAP_THRESH  = 0.003   # 0.3% deviation threshold
+
+        if vwap_result is not None:
+            vwap_dev_pct = vwap_result.deviation_pct
+            dev_frac = vwap_result.deviation_pct / 100.0   # convert % to fraction
+
+            if regime == 'RANGING':
+                # Mean-reversion: buy near/below VWAP, sell near/above
+                if is_buy:
+                    if dev_frac < -VWAP_THRESH:   vwap_score = 10.0  # price below VWAP
+                    elif dev_frac < 0:             vwap_score = 5.0
+                    elif dev_frac > VWAP_THRESH:   vwap_score = -5.0  # chasing above VWAP
+                else:
+                    if dev_frac > VWAP_THRESH:     vwap_score = 10.0
+                    elif dev_frac > 0:             vwap_score = 5.0
+                    elif dev_frac < -VWAP_THRESH:  vwap_score = -5.0
+            else:
+                # Trend-following: VWAP as dynamic support/resistance
+                if is_buy and vwap_result.is_above:      vwap_score = 8.0
+                elif is_buy and abs(dev_frac) < 0.001:   vwap_score = 4.0  # at VWAP
+                elif is_buy and vwap_result.is_below:    vwap_score = -3.0
+                elif not is_buy and vwap_result.is_below: vwap_score = 8.0
+                elif not is_buy and abs(dev_frac) < 0.001: vwap_score = 4.0
+                elif not is_buy and vwap_result.is_above: vwap_score = -3.0
+
+        # BB squeeze (contributes to tech_score — already capped at 15)
+        squeeze      = self._bb_squeeze.calculate(df)
+        bb_squeezing = False
+        if squeeze is not None:
+            bb_squeezing = squeeze.is_squeezing
+            if squeeze.just_broke_up and is_buy:
+                tech_score += 5.0   # breakout confirmation
+            elif squeeze.just_broke_down and not is_buy:
+                tech_score += 5.0
+            elif squeeze.is_squeezing:
+                tech_score += 2.0   # coiling — bonus for both directions
+            tech_score = min(tech_score, 15.0)
+
+        # Volume profile (resistance/support proximity modifier on tech_score)
+        vp = self._vol_prof.calculate(df)
+        if vp is not None:
+            if is_buy and vp.nearest_hvn_above is not None:
+                proximity = (vp.nearest_hvn_above - price) / price
+                if proximity < 0.005:      # hitting resistance < 0.5% above
+                    tech_score -= 3.0
+            if not is_buy and vp.nearest_hvn_below is not None:
+                proximity = (price - vp.nearest_hvn_below) / price
+                if proximity < 0.005:      # hitting support < 0.5% below
+                    tech_score -= 3.0
+            # LVN path to TP = fast travel = small bonus
+            if is_buy and vp.nearest_hvn_above is not None:
+                lvn_above = [l for l in vp.lvn_levels if price < l < vp.nearest_hvn_above]
+                if lvn_above:
+                    tech_score += 2.0
+            tech_score = min(tech_score, 15.0)
+
+        # 8. Session time score (part of tech_score budget + hard gate enforced in paper_trading)
+        now_utc  = datetime.now(timezone.utc)
+        utc_hour = now_utc.hour
+        if utc_hour in range(2, 6):      # 02-05 UTC: low volume
+            tech_score = max(tech_score - 8.0, -15.0)
+        elif utc_hour in range(13, 16):  # 13-15 UTC: NY/London overlap
+            tech_score = min(tech_score + 5.0, 15.0)
+
+        # 9. CME gap fill bias (0-8 pts)
+        cme_score = 0.0
+        cme_gap   = self._cme_gap.detect(df)
+        if cme_gap is not None and cme_gap.gap_exists:
+            if cme_gap.gap_direction == 'DOWN' and is_buy:
+                cme_score = 6.0    # gap below — buy to fill upward
+            elif cme_gap.gap_direction == 'UP' and not is_buy:
+                cme_score = 6.0    # gap above — sell to fill downward
+            elif cme_gap.gap_direction == 'UP' and is_buy:
+                cme_score = -4.0   # buying against downward gap fill
+            elif cme_gap.gap_direction == 'DOWN' and not is_buy:
+                cme_score = -4.0   # selling against upward gap fill
 
         # ── Total confidence ───────────────────────────────────────────────────
-        raw = ofi_score + lead_lag_score + regime_score + rsi_score + tech_score + funding_score
-        # Normalise: max possible raw ≈ 30+20+20+15+15+10 = 110
-        confidence = max(0.0, min(100.0, raw / 110.0 * 100.0))
+        # Max raw: OFI(30) + Lead(20) + Regime(20) + RSI(15) + Tech(15) + Fund(10) + VWAP(10) + CME(8) = 128
+        raw = ofi_score + lead_lag_score + regime_score + rsi_score + tech_score + funding_score + vwap_score + cme_score
+        confidence = max(0.0, min(100.0, raw / 128.0 * 100.0))
 
         # ── ML blend (when scorer is trained) ─────────────────────────────────
         if self.ml_scorer is not None:
@@ -397,7 +524,8 @@ class ScientificStrategy:
         logger.info(
             f"[SCI] {symbol} {direction}  conf={confidence:.0f}  "
             f"OFI={ofi_score:.0f} Lead={lead_lag_score:.0f} Regime={regime_score:.0f} "
-            f"RSI={rsi_score:.0f} Tech={tech_score:.0f} Fund={funding_score:.0f}  "
+            f"RSI={rsi_score:.0f} Tech={tech_score:.0f} Fund={funding_score:.0f} "
+            f"VWAP={vwap_score:.0f} CME={cme_score:.0f}  "
             f"size_mult={size_mult:.1f}x"
         )
 
@@ -411,6 +539,8 @@ class ScientificStrategy:
             rsi_score       = rsi_score,
             technical_score = tech_score,
             funding_score   = funding_score,
+            vwap_score      = vwap_score,
+            cme_score       = cme_score,
             ofi             = ofi,
             lead_lag_dir    = lead_dir,
             regime          = regime,
@@ -422,6 +552,8 @@ class ScientificStrategy:
             ema_slow        = ema21_v,
             volume_ratio    = vol_ratio,
             funding_rate    = funding_rate,
+            vwap_dev_pct    = vwap_dev_pct,
+            bb_squeezing    = bb_squeezing,
         )
 
 

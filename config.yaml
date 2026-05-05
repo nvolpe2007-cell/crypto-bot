@@ -1,4 +1,4 @@
-# Crypto Scalping Bot Configuration
+# Crypto Scalping Bot Configuration — BTC-Only
 
 exchange:
   name: kraken
@@ -8,9 +8,7 @@ trading:
   mode: live
   initial_capital: 500    # starting capital — bot reads real balance from Kraken at startup
   pairs:
-    - BTC/USD
-    - ETH/USD
-    - SOL/USD
+    - BTC/USD             # BTC-only: all capital and alpha focused on BTC
   timeframe: 1m
 
 strategy:
@@ -19,16 +17,40 @@ strategy:
   rsi_period: 14
   rsi_overbought: 70
   rsi_oversold: 30
+  bb_period: 20
+  bb_std: 2.0
+  bb_squeeze_threshold: 0.02    # BB bandwidth < 2% of price = squeeze
+  vwap_deviation_threshold: 0.3 # 0.3% from VWAP = value/resistance zone
+  volume_profile_lookback: 200  # candles for volume profile
 
 risk:
   max_position_size: 25   # max USD per trade — conservative for first live run
   stop_loss_pct: 2.0
   take_profit_pct: 3.0
   max_daily_loss: 15      # bot stops for the day if total loss hits this
-  max_open_positions: 3
+  max_open_positions: 1   # BTC-only: one position at a time
+
+trailing_stop:
+  enabled: true
+  activation_pct: 0.8     # trailing activates after 0.8% gain
+  trail_pct: 0.5          # trail 0.5% below high-water mark
+
+session:
+  low_volume_start: 2     # avoid entries 02:00-05:59 UTC
+  low_volume_end: 6
+  high_volume_start: 13   # scale up during NY/London overlap 13:00-15:59 UTC
+  high_volume_end: 16
+  high_volume_size_mult: 1.3
+
+funding:
+  bearish_threshold: 0.0005    # > +0.05% per 8h → bearish bias (crowded longs)
+  bullish_threshold: -0.0002   # < -0.02% per 8h → bullish bias (shorts paying)
+
+cme_gap:
+  enabled: true
+  min_gap_pct: 0.3    # ignore CME gaps smaller than 0.3%
 
 backtest:
-  # Historical period to test
   start_date: "2024-01-01"
   end_date: "2024-12-31"
   initial_balance: 100

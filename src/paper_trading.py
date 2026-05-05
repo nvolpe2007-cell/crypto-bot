@@ -44,8 +44,6 @@ logger = logging.getLogger(__name__)
 # ── Funding rate helper ────────────────────────────────────────────────────────
 _SYMBOL_TO_FUNDING = {
     'BTC/USD': 'BTCUSDT',
-    'ETH/USD': 'ETHUSDT',
-    'SOL/USD': 'SOLUSDT',
 }
 
 def _get_funding_rate(symbol: str) -> Optional[float]:
@@ -229,6 +227,10 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime):
 
 # ── PaperPosition / PaperAccount / PaperTrader ────────────────────────────────
 
+_TRAIL_ACTIVATION_PCT = 0.008   # 0.8% profit activates trailing stop
+_TRAIL_DISTANCE_PCT   = 0.005   # trail 0.5% below/above the high-water mark
+
+
 @dataclass
 class PaperPosition:
     entry_time:      datetime
@@ -238,6 +240,10 @@ class PaperPosition:
     entry_fee:       float = 0.0
     unrealized_pnl:  float = 0.0
     entry_signal:    Optional[ScientificSignal] = None   # full signal context
+    # Trailing stop state
+    trail_high:      float = 0.0            # best price seen since entry (longs)
+    trail_low:       float = float('inf')   # best price seen since entry (shorts)
+    trail_activated: bool  = False          # True once gain threshold reached
 
 
 @dataclass
@@ -488,10 +494,35 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     close_fn = trader.execute_sell
 
                 exit_reason = None
-                if pnl_pct / 100 <= -sl_pct:
-                    exit_reason = 'STOP_LOSS'
-                elif pnl_pct / 100 >= tp_pct:
-                    exit_reason = 'TAKE_PROFIT'
+
+                # ── Trailing stop ratchet ──────────────────────────────────────
+                if pos.side == 'buy':
+                    if price > pos.trail_high:
+                        pos.trail_high = price
+                    profit_pct = (pos.trail_high - pos.entry_price) / pos.entry_price if pos.entry_price else 0.0
+                    if profit_pct >= _TRAIL_ACTIVATION_PCT:
+                        pos.trail_activated = True
+                    if pos.trail_activated:
+                        trail_stop = pos.trail_high * (1 - _TRAIL_DISTANCE_PCT)
+                        if price <= trail_stop:
+                            exit_reason = 'TRAILING_STOP'
+                else:  # short
+                    if price < pos.trail_low:
+                        pos.trail_low = price
+                    profit_pct = (pos.entry_price - pos.trail_low) / pos.entry_price if pos.entry_price else 0.0
+                    if profit_pct >= _TRAIL_ACTIVATION_PCT:
+                        pos.trail_activated = True
+                    if pos.trail_activated:
+                        trail_stop = pos.trail_low * (1 + _TRAIL_DISTANCE_PCT)
+                        if price >= trail_stop:
+                            exit_reason = 'TRAILING_STOP'
+
+                # Fixed SL/TP only when trailing stop hasn't triggered yet
+                if exit_reason is None:
+                    if pnl_pct / 100 <= -sl_pct:
+                        exit_reason = 'STOP_LOSS'
+                    elif pnl_pct / 100 >= tp_pct:
+                        exit_reason = 'TAKE_PROFIT'
 
                 if exit_reason:
                     trade = close_fn(sym, price, now, reason=exit_reason)
@@ -701,15 +732,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # Update indicators dashboard
                 indicators[symbol] = {
-                    'signal':     sig.signal.value,
-                    'confidence': round(sig.confidence, 1),
-                    'rsi':        round(sig.rsi, 2),
-                    'adx':        round(sig.adx, 2),
-                    'atr':        round(sig.atr, 4),
-                    'ofi':        round(sig.ofi, 3) if sig.ofi is not None else None,
-                    'lead_lag':   sig.lead_lag_dir,
-                    'regime':     sig.regime,
-                    'size_mult':  sig.size_mult,
+                    'signal':      sig.signal.value,
+                    'confidence':  round(sig.confidence, 1),
+                    'rsi':         round(sig.rsi, 2),
+                    'adx':         round(sig.adx, 2),
+                    'atr':         round(sig.atr, 4),
+                    'ofi':         round(sig.ofi, 3) if sig.ofi is not None else None,
+                    'lead_lag':    sig.lead_lag_dir,
+                    'regime':      sig.regime,
+                    'size_mult':   sig.size_mult,
+                    'vwap_dev':    round(sig.vwap_dev_pct, 2),
+                    'bb_squeeze':  sig.bb_squeezing,
                     'scores': {
                         'ofi':      round(sig.ofi_score, 1),
                         'lead_lag': round(sig.lead_lag_score, 1),
@@ -717,6 +750,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         'rsi':      round(sig.rsi_score, 1),
                         'tech':     round(sig.technical_score, 1),
                         'funding':  round(sig.funding_score, 1),
+                        'vwap':     round(sig.vwap_score, 1),
+                        'cme':      round(sig.cme_score, 1),
                     }
                 }
 
@@ -725,6 +760,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # ── Entry: minimum confidence gate ─────────────────────────────
                 min_conf = _adapt['min_confidence']
+
+                # ── Session time gate (BTC-specific) ───────────────────────────
+                utc_hour = current_time.hour
+                _low_vol_hours  = set(range(2, 6))    # 02:00-05:59 UTC
+                _high_vol_hours = set(range(13, 16))  # 13:00-15:59 UTC
+
+                if utc_hour in _low_vol_hours and sig.confidence < 85:
+                    logger.debug(f"[SESSION] {symbol} low-volume hours — conf {sig.confidence:.0f} < 85, skipping")
+                    continue
 
                 # ── LONG ENTRY ──────────────────────────────────────────────────
                 if sig.is_buy and pos is None:
@@ -739,6 +783,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
                         continue
+
+                    # High-volume session bonus (NY/London overlap)
+                    if utc_hour in _high_vol_hours:
+                        size_usd = min(size_usd * 1.3, current_equity * 0.15)
 
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
@@ -763,6 +811,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
                         continue
+
+                    # High-volume session bonus
+                    if utc_hour in _high_vol_hours:
+                        size_usd = min(size_usd * 1.3, current_equity * 0.15)
+
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
 
