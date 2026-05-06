@@ -83,11 +83,15 @@ class MeanReversionStrategy:
         rsi = ta.rsi(close, length=self.rsi_period)
         df['rsi'] = rsi
 
-        bb = ta.bbands(close, length=self.bb_period, std=self.bb_std)
+        try:
+            bb = ta.bbands(close, length=self.bb_period, std=self.bb_std)
+        except Exception:
+            bb = None
         if bb is not None:
-            df['bb_upper'] = bb.iloc[:, 0]
+            # pandas-ta bbands column order: BBL (lower), BBM (mid), BBU (upper), ...
+            df['bb_lower'] = bb.iloc[:, 0]
             df['bb_mid']   = bb.iloc[:, 1]
-            df['bb_lower'] = bb.iloc[:, 2]
+            df['bb_upper'] = bb.iloc[:, 2]
         else:
             sma = close.rolling(self.bb_period).mean()
             std = close.rolling(self.bb_period).std()

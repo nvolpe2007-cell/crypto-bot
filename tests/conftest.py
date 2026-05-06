@@ -136,11 +136,29 @@ def _adx(high: pd.Series, low: pd.Series, close: pd.Series,
     })
 
 
+def _bbands(series: pd.Series, length: int = 20, std: float = 2.0, **_) -> pd.DataFrame:
+    sma = series.rolling(length).mean()
+    rolling_std = series.rolling(length).std()
+    upper = sma + std * rolling_std
+    lower = sma - std * rolling_std
+    bandwidth = (upper - lower) / sma * 100
+    percent = (series - lower) / (upper - lower)
+    p = f"{length}_{float(std)}"
+    return pd.DataFrame({
+        f"BBL_{p}": lower,
+        f"BBM_{p}": sma,
+        f"BBU_{p}": upper,
+        f"BBB_{p}": bandwidth,
+        f"BBP_{p}": percent,
+    }, index=series.index)
+
+
 _stub.ema = _ema
 _stub.rsi = _rsi
 _stub.atr = _atr
 _stub.macd = _macd
 _stub.adx = _adx
+_stub.bbands = _bbands
 
 # Install before any src.* module is imported during test collection
 sys.modules["pandas_ta"] = _stub
