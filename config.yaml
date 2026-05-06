@@ -2,10 +2,10 @@
 
 exchange:
   name: kraken
-  sandbox: false
+  sandbox: true
 
 trading:
-  mode: live
+  mode: paper
   initial_capital: 500    # starting capital — bot reads real balance from Kraken at startup
   pairs:
     - BTC/USD
