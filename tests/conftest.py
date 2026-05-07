@@ -201,3 +201,9 @@ import os as _os
 _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
+
+# Pre-import modules that test_live_trading.py would otherwise replace with
+# MagicMock stubs (via _ensure_stub).  Importing here — after all stubs above
+# are installed — caches the real implementations in sys.modules so that
+# _ensure_stub's "not in sys.modules" guard leaves them intact.
+import src.regime_detector as _  # noqa: F401, E402
