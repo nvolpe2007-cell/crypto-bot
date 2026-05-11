@@ -207,3 +207,4 @@ if _project_root not in sys.path:
 # are installed — caches the real implementations in sys.modules so that
 # _ensure_stub's "not in sys.modules" guard leaves them intact.
 import src.regime_detector as _  # noqa: F401, E402
+import src.notifications as _  # noqa: F401, E402
