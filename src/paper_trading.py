@@ -434,7 +434,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     equity_curve:     List[dict]        = []
 
     if notifier:
-        notifier.send_message(
+        await notifier.send_message_async(
             f"<b>PAPER STARTED</b>\n"
             f"{' '.join(s.split('/')[0] for s in symbols)}   {timeframe}\n"
             f"capital ${trader.initial_capital:.2f}\n"
@@ -450,7 +450,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             stats  = journal.stats()
             wr_str = f"  WR {stats['win_rate']}%" if stats.get('total', 0) > 0 else ""
             if notifier:
-                notifier.send_status(
+                await notifier.send_status_async(
                     capital=s['total_equity'], pnl=s['total_pnl'],
                     pnl_pct=s['pnl_pct'], open_positions=s['open_positions'],
                     trades_today=stats.get('total', 0),
@@ -499,8 +499,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         recent_trades.append(_trade_to_dict(trade, sym, exit_reason))
                         summary = trader.get_account_summary()
                         equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
-                                         notifier, journal, ml_scorer)
+                        await _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
+                                               notifier, journal, ml_scorer)
 
     asyncio.create_task(_sltp_watcher())
 
@@ -609,7 +609,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             if daily_loss >= max_daily_loss:
                 logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit")
                 if notifier:
-                    notifier.send_message(
+                    await notifier.send_message_async(
                         f"<b>DAILY LOSS LIMIT</b>\n"
                         f"Lost ${daily_loss:.2f} today (limit ${max_daily_loss:.2f})\n"
                         f"Trading halted"
@@ -746,7 +746,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
                     if position and notifier:
-                        notifier.send_trade_alert(
+                        await notifier.send_trade_alert_async(
                             action="BUY", symbol=symbol, price=current_price,
                             size=size_usd, signal=sig,
                         )
@@ -769,7 +769,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
                     if position and notifier:
-                        notifier.send_trade_alert(
+                        await notifier.send_trade_alert_async(
                             action="SELL", symbol=symbol, price=current_price,
                             size=size_usd, signal=sig,
                         )
@@ -782,8 +782,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
                         summary = trader.get_account_summary()
                         equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                         notifier, journal, ml_scorer)
+                        await _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
+                                               notifier, journal, ml_scorer)
 
                 # ── EXIT SHORT ──────────────────────────────────────────────────
                 elif pos_side == 'short' and (
@@ -794,8 +794,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
                         summary = trader.get_account_summary()
                         equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                         notifier, journal, ml_scorer)
+                        await _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
+                                               notifier, journal, ml_scorer)
 
             # Refresh CVaR weights
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
@@ -874,10 +874,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
 # ── Post-trade handler ─────────────────────────────────────────────────────────
 
-def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
-                     exit_reason: str, total_equity: float,
-                     notifier: Optional[TelegramNotifier], journal: TradeJournal,
-                     ml_scorer: Optional['MLScorer'] = None):
+async def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
+                           exit_reason: str, total_equity: float,
+                           notifier: Optional[TelegramNotifier], journal: TradeJournal,
+                           ml_scorer: Optional['MLScorer'] = None):
     if pos is None:
         return
 
@@ -899,7 +899,7 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
 
     if notifier and sig:
         fr_apy = sig.funding_rate * 3 * 365 * 100 if sig.funding_rate else None
-        notifier.send_trade_analysis(
+        await notifier.send_trade_analysis_async(
             symbol          = symbol,
             side            = pos.side,
             pnl             = trade.pnl,
@@ -924,8 +924,8 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
             adaptations     = adaptations if adaptations else None,
         )
     elif notifier:
-        fn = notifier.send_win if trade.pnl >= 0 else notifier.send_loss
-        fn(symbol, trade.pnl, trade.pnl_pct, trade.exit_price, total_equity, reason=exit_reason)
+        fn = notifier.send_win_async if trade.pnl >= 0 else notifier.send_loss_async
+        await fn(symbol, trade.pnl, trade.pnl_pct, trade.exit_price, total_equity, reason=exit_reason)
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────

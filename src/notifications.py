@@ -4,6 +4,7 @@ Telegram Notifications — plain-English trade alerts.
 
 import logging
 import requests
+import aiohttp
 from typing import Optional
 from dataclasses import dataclass
 
@@ -142,6 +143,7 @@ class TelegramNotifier:
             logger.info(f"Telegram notifications enabled for chat {chat_id}")
 
     def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
+        """Blocking send — kept for sync callers (scripts, tests, __main__)."""
         if not self.enabled:
             logger.debug(f"Notification suppressed: {message[:50]}")
             return False
@@ -152,6 +154,24 @@ class TelegramNotifier:
                 timeout=10,
             )
             response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
+
+    async def send_message_async(self, message: str, parse_mode: str = "HTML") -> bool:
+        """Non-blocking send using aiohttp — use this from async contexts."""
+        if not self.enabled:
+            logger.debug(f"Notification suppressed: {message[:50]}")
+            return False
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message, "parse_mode": parse_mode},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    resp.raise_for_status()
             return True
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
@@ -330,6 +350,149 @@ class TelegramNotifier:
             "Telegram notifications are working.\n"
             "You'll get plain-English alerts for every trade."
         )
+
+    # ── Async wrappers for use inside asyncio event loops ─────────────────────
+
+    async def send_trade_alert_async(self, action: str, symbol: str, price: float,
+                                     size: float, pnl: Optional[float] = None,
+                                     reason: str = "", signal=None) -> bool:
+        is_buy      = action.upper() == "BUY"
+        coin        = _coin(symbol)
+        direction   = "LONG (buying)" if is_buy else "SHORT (selling)"
+        icon        = "🟢" if is_buy else "🔴"
+        conf_label  = _conf_label(signal.confidence) if signal else "—"
+
+        lines = [
+            f"{icon} <b>{coin} — {direction}</b>",
+            f"Entry price:  <b>${price:,.2f}</b>",
+            f"Position:     <b>${size:.2f}</b>",
+            f"Confidence:   <b>{conf_label}</b>  ({signal.confidence:.0f}%)" if signal else f"<i>{reason}</i>",
+        ]
+
+        if signal:
+            sl_pct = signal.stop_loss_pct()
+            tp_pct = signal.take_profit_pct()
+            if is_buy:
+                sl_price = price * (1 - sl_pct / 100)
+                tp_price = price * (1 + tp_pct / 100)
+            else:
+                sl_price = price * (1 + sl_pct / 100)
+                tp_price = price * (1 - tp_pct / 100)
+
+            lines.append(f"Stop loss:    ${sl_price:,.2f}  ({sl_pct:.1f}% risk)")
+            lines.append(f"Target:       ${tp_price:,.2f}  ({tp_pct:.1f}% gain)")
+
+            reasons = _entry_reasons(signal, is_buy)
+            if reasons:
+                lines.append("")
+                lines.append("<b>Why I entered:</b>")
+                for r in reasons:
+                    lines.append(f"  • {r}")
+
+        return await self.send_message_async("\n".join(lines))
+
+    async def send_trade_analysis_async(self, symbol: str, side: str, pnl: float, pnl_pct: float,
+                                         entry_price: float, exit_price: float, total_equity: float,
+                                         exit_reason: str, holding_minutes: float,
+                                         regime: str, regime_conf: float,
+                                         rsi: float, adx: float, volume_ratio: float,
+                                         ofi: Optional[float], funding_apy: Optional[float],
+                                         btc_lead: Optional[str],
+                                         issues: list, positives: list,
+                                         loss_streak: int, win_streak: int,
+                                         adaptations: Optional[list] = None) -> bool:
+        is_win    = pnl >= 0
+        is_buy    = side == 'buy'
+        icon      = "✅" if is_win else "❌"
+        result    = f"+${pnl:.2f}" if is_win else f"-${abs(pnl):.2f}"
+        label     = "WIN" if is_win else "LOSS"
+        coin      = _coin(symbol)
+        direction = "long" if is_buy else "short"
+        held      = f"{holding_minutes:.0f} min" if holding_minutes < 60 else f"{holding_minutes/60:.1f} hrs"
+        exit_desc = _exit_plain(exit_reason)
+
+        lines = [
+            f"{icon} <b>{label}  {result}  ({pnl_pct:+.1f}%)</b>",
+            f"{coin}  {direction}   ${entry_price:,.2f} → ${exit_price:,.2f}",
+            f"Held {held}  —  {exit_desc}",
+            f"Account now:  <b>${total_equity:,.2f}</b>",
+        ]
+
+        if is_win and positives:
+            lines.append("")
+            lines.append("<b>Why it worked:</b>")
+            for p in _translate_issues(positives)[:3]:
+                lines.append(f"  • {p}")
+        elif not is_win and issues:
+            lines.append("")
+            lines.append("<b>What went wrong:</b>")
+            for i in _translate_issues(issues)[:3]:
+                lines.append(f"  • {i}")
+
+        context = []
+        if ofi is not None:
+            ofi_msg = _ofi_plain(ofi, is_buy)
+            if ofi_msg:
+                context.append(ofi_msg)
+        if btc_lead:
+            ll = _lead_lag_plain(btc_lead, is_buy)
+            if ll:
+                context.append(ll)
+        context.append(f"Market was {_regime_plain(regime)} when I entered")
+
+        if context:
+            lines.append("")
+            lines.append("<b>Market context at entry:</b>")
+            for c in context[:3]:
+                lines.append(f"  • {c}")
+
+        if loss_streak >= 3:
+            lines.append(f"\n⚠️ <b>{loss_streak} losses in a row</b> — I've tightened my entry rules until conditions improve")
+        elif win_streak >= 3:
+            lines.append(f"\n🔥 {win_streak} wins in a row — bot is performing well")
+
+        if adaptations:
+            lines.append("")
+            lines.append("<i>Bot self-adjusted: " + "; ".join(adaptations[:2]) + "</i>")
+
+        return await self.send_message_async("\n".join(lines))
+
+    async def send_win_async(self, symbol: str, pnl: float, pnl_pct: float,
+                              exit_price: float, total_equity: float, reason: str = "") -> bool:
+        return await self.send_message_async(
+            f"✅ <b>WIN  +${pnl:.2f}  ({pnl_pct:+.1f}%)</b>\n"
+            f"{_coin(symbol)}   exited at ${exit_price:,.2f}\n"
+            f"Account: <b>${total_equity:,.2f}</b>"
+        )
+
+    async def send_loss_async(self, symbol: str, pnl: float, pnl_pct: float,
+                               exit_price: float, total_equity: float, reason: str = "") -> bool:
+        return await self.send_message_async(
+            f"❌ <b>LOSS  -${abs(pnl):.2f}  ({pnl_pct:+.1f}%)</b>\n"
+            f"{_coin(symbol)}   exited at ${exit_price:,.2f}\n"
+            f"Account: <b>${total_equity:,.2f}</b>"
+        )
+
+    async def send_status_async(self, capital: float, pnl: float, pnl_pct: float,
+                                 open_positions: int, trades_today: int) -> bool:
+        icon   = "📈" if pnl >= 0 else "📉"
+        result = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+        lines = [
+            f"{icon} <b>Hourly Update</b>",
+            f"Account:  <b>${capital:,.2f}</b>",
+            f"P&L:      <b>{result}  ({pnl_pct:+.1f}%)</b>",
+            f"Trades:   {trades_today}",
+        ]
+        if open_positions > 0:
+            lines.append(f"Open:     {open_positions} position{'s' if open_positions > 1 else ''} active")
+        else:
+            lines.append("Open:     no open positions (watching markets)")
+
+        return await self.send_message_async("\n".join(lines))
+
+    async def send_error_async(self, error_message: str) -> bool:
+        return await self.send_message_async(f"⚠️ <b>Bot Error</b>\n{error_message}")
 
 
 # ── Issue translation ──────────────────────────────────────────────────────────

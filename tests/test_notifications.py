@@ -26,7 +26,8 @@ create_notifier_from_env:
 
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+import asyncio
+from unittest.mock import patch, MagicMock, AsyncMock
 from types import SimpleNamespace
 
 from src.notifications import (
@@ -796,3 +797,181 @@ class TestCreateNotifierFromEnv:
             os.environ.pop("TELEGRAM_ENABLED", None)
             notifier = create_notifier_from_env()
         assert not notifier.enabled
+
+
+# ── send_message_async ────────────────────────────────────────────────────────
+
+class TestSendMessageAsync:
+    """Verify the aiohttp-based async send path."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_returns_false_no_http(self):
+        notifier = _disabled()
+        import aiohttp
+        with patch.object(aiohttp, "ClientSession") as mock_session:
+            result = await notifier.send_message_async("hello")
+        assert result is False
+        mock_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enabled_success_returns_true(self):
+        notifier = _enabled()
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        import aiohttp
+        with patch.object(aiohttp, "ClientSession", return_value=mock_session):
+            result = await notifier.send_message_async("hello")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_enabled_http_exception_returns_false(self):
+        notifier = _enabled()
+        mock_session = AsyncMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post.side_effect = Exception("connection refused")
+
+        import aiohttp
+        with patch.object(aiohttp, "ClientSession", return_value=mock_session):
+            result = await notifier.send_message_async("hello")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_raise_for_status_error_returns_false(self):
+        notifier = _enabled()
+        mock_resp = AsyncMock()
+        mock_resp.raise_for_status = MagicMock(side_effect=Exception("403 Forbidden"))
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        import aiohttp
+        with patch.object(aiohttp, "ClientSession", return_value=mock_session):
+            result = await notifier.send_message_async("hello")
+        assert result is False
+
+
+# ── async wrapper methods ─────────────────────────────────────────────────────
+
+class TestAsyncWrappers:
+    """Smoke-test each async wrapper — they all delegate to send_message_async."""
+
+    def _notifier_with_captured_async(self):
+        """Return notifier whose send_message_async is patched to record calls."""
+        notifier = _enabled()
+        calls = []
+
+        async def fake_send(msg, parse_mode="HTML"):
+            calls.append(msg)
+            return True
+
+        notifier.send_message_async = fake_send
+        return notifier, calls
+
+    @pytest.mark.asyncio
+    async def test_send_trade_alert_async_buy(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_trade_alert_async("BUY", "BTC/USD", 50_000.0, 100.0)
+        assert len(calls) == 1
+        assert "long" in calls[0].lower() or "buying" in calls[0].lower()
+        assert "50,000" in calls[0] or "50000" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_send_trade_alert_async_sell(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_trade_alert_async("SELL", "ETH/USD", 3_000.0, 50.0)
+        assert len(calls) == 1
+        assert "short" in calls[0].lower() or "selling" in calls[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_send_trade_alert_async_with_signal(self):
+        notifier, calls = self._notifier_with_captured_async()
+        sig = _make_signal(confidence=85.0)
+        await notifier.send_trade_alert_async("BUY", "BTC/USD", 50_000.0, 100.0, signal=sig)
+        assert "stop" in calls[0].lower() or "Stop" in calls[0]
+        assert "target" in calls[0].lower() or "Target" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_send_win_async(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_win_async("BTC/USD", pnl=5.0, pnl_pct=5.0,
+                                      exit_price=52_500, total_equity=1_005)
+        assert "WIN" in calls[0] or "win" in calls[0].lower()
+        assert "52,500" in calls[0] or "52500" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_send_loss_async(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_loss_async("ETH/USD", pnl=-3.0, pnl_pct=-3.0,
+                                       exit_price=2_900, total_equity=997)
+        assert "LOSS" in calls[0] or "loss" in calls[0].lower()
+
+    @pytest.mark.asyncio
+    async def test_send_status_async_positive_pnl(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_status_async(capital=1_010, pnl=10, pnl_pct=1.0,
+                                          open_positions=0, trades_today=3)
+        assert "\U0001f4c8" in calls[0]  # 📈
+
+    @pytest.mark.asyncio
+    async def test_send_status_async_negative_pnl(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_status_async(capital=990, pnl=-10, pnl_pct=-1.0,
+                                          open_positions=1, trades_today=2)
+        assert "\U0001f4c9" in calls[0]  # 📉
+
+    @pytest.mark.asyncio
+    async def test_send_trade_analysis_async_win(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_trade_analysis_async(
+            symbol="BTC/USD", side="buy", pnl=5.0, pnl_pct=0.05,
+            entry_price=50_000, exit_price=50_500, total_equity=1_005,
+            exit_reason="TAKE_PROFIT", holding_minutes=5,
+            regime="TRENDING_UP", regime_conf=0.8,
+            rsi=55, adx=25, volume_ratio=1.2,
+            ofi=0.30, funding_apy=None, btc_lead="BUY",
+            issues=[], positives=["Target reached as predicted"],
+            loss_streak=0, win_streak=2,
+        )
+        assert "WIN" in calls[0]
+        assert "1,005" in calls[0] or "1005" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_send_trade_analysis_async_loss(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_trade_analysis_async(
+            symbol="SOL/USD", side="buy", pnl=-2.0, pnl_pct=-0.02,
+            entry_price=100, exit_price=98, total_equity=498,
+            exit_reason="STOP_LOSS", holding_minutes=3,
+            regime="VOLATILE", regime_conf=0.5,
+            rsi=72, adx=15, volume_ratio=0.8,
+            ofi=-0.10, funding_apy=None, btc_lead=None,
+            issues=["RSI 72 was overbought at entry"], positives=[],
+            loss_streak=3, win_streak=0,
+        )
+        assert "LOSS" in calls[0]
+        assert "3" in calls[0]  # loss streak warning
+
+    @pytest.mark.asyncio
+    async def test_send_error_async(self):
+        notifier, calls = self._notifier_with_captured_async()
+        await notifier.send_error_async("disk full")
+        assert "disk full" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_disabled_notifier_async_returns_false(self):
+        notifier = _disabled()
+        result = await notifier.send_message_async("test")
+        assert result is False
