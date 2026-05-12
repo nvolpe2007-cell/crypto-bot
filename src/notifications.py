@@ -379,8 +379,11 @@ def _translate_issues(raw_issues: list) -> list:
 
 def create_notifier_from_env() -> TelegramNotifier:
     import os
-    from dotenv import load_dotenv
-    load_dotenv()
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed; env vars from the OS/shell are still readable
 
     token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -395,8 +398,11 @@ def create_notifier_from_env() -> TelegramNotifier:
 
 if __name__ == '__main__':
     import os
-    from dotenv import load_dotenv
-    load_dotenv()
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     token   = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
