@@ -145,10 +145,10 @@ def main():
     else:
         config = {}
 
-    # Add arb bot configs
-    config.setdefault("dex_arb", {})["enabled"] = True
-    config.setdefault("stablecoin_arb", {})["enabled"] = True
-    config.setdefault("funding_arb", {})["enabled"] = True
+    # Arb bots disabled — Binance/Bybit are geo-blocked for US users
+    config.setdefault("dex_arb", {})["enabled"] = False
+    config.setdefault("stablecoin_arb", {})["enabled"] = False
+    config.setdefault("funding_arb", {})["enabled"] = False
 
     runner = MasterBotRunner(config)
 

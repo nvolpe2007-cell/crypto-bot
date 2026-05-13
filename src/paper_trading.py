@@ -12,7 +12,7 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 import logging
@@ -437,9 +437,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _hourly_digest():
         await asyncio.sleep(3600)
         while trader.running:
-            s      = trader.get_account_summary()
-            stats  = journal.stats()
-            wr_str = f"  WR {stats['win_rate']}%" if stats.get('total', 0) > 0 else ""
+            s = trader.get_account_summary()
+            stats = journal.stats()
             if notifier:
                 notifier.send_status(
                     capital=s['total_equity'], pnl=s['total_pnl'],
@@ -449,6 +448,47 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             await asyncio.sleep(3600)
 
     asyncio.create_task(_hourly_digest())
+
+    # ── Daily P&L summary (fires at midnight UTC) ──────────────────────────────
+    day_start_equity = trader.initial_capital
+
+    async def _daily_summary():
+        nonlocal day_start_equity
+        while trader.running:
+            # Sleep until next midnight UTC
+            now = datetime.now(timezone.utc)
+            midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            await asyncio.sleep((midnight - now).total_seconds())
+
+            if not trader.running:
+                break
+
+            s      = trader.get_account_summary()
+            closed = trader.account.closed_trades
+            # Only count today's trades (since last midnight)
+            today  = [t for t in closed if hasattr(t, 'exit_time') and
+                      t.exit_time and
+                      (datetime.now(timezone.utc) - (t.exit_time if t.exit_time.tzinfo
+                       else t.exit_time.replace(tzinfo=timezone.utc))).days == 0]
+            wins   = [t for t in today if t.pnl > 0]
+            losses = [t for t in today if t.pnl <= 0]
+            best   = max((t.pnl for t in today), default=0.0)
+            worst  = min((t.pnl for t in today), default=0.0)
+
+            if notifier:
+                notifier.send_daily_summary(
+                    total_equity=s['total_equity'],
+                    start_equity=day_start_equity,
+                    trades=len(today),
+                    wins=len(wins),
+                    losses=len(losses),
+                    best_trade=best,
+                    worst_trade=worst,
+                )
+            day_start_equity = s['total_equity']   # reset for next day
+
+    asyncio.create_task(_daily_summary())
 
     # ── SL/TP watcher ──────────────────────────────────────────────────────────
     async def _sltp_watcher():

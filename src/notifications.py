@@ -157,12 +157,29 @@ class TelegramNotifier:
                          reason: str = "", signal=None):
         is_buy = action.upper() == "BUY"
         icon   = "🟢" if is_buy else "🔴"
-        side   = "BUY" if is_buy else "SELL"
+        side   = "LONG" if is_buy else "SHORT"
         coin   = _coin(symbol)
-        return self.send_message(
-            f"{icon} <b>{side} {coin}</b>\n"
-            f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>"
-        )
+
+        lines = [f"{icon} <b>{side} {coin}</b>",
+                 f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>"]
+
+        if signal:
+            conf = getattr(signal, 'confidence', None)
+            if conf is not None:
+                lines.append(f"Confidence: <b>{conf:.0f}%</b> ({_conf_label(conf)})")
+            # Stop / target prices
+            if hasattr(signal, 'stop_loss_pct') and callable(signal.stop_loss_pct):
+                sl = signal.stop_loss_pct() / 100
+                tp = signal.take_profit_pct() / 100
+                sl_price = price * (1 - sl) if is_buy else price * (1 + sl)
+                tp_price = price * (1 + tp) if is_buy else price * (1 - tp)
+                lines.append(f"Stop: ${sl_price:,.2f}   Target: ${tp_price:,.2f}")
+            # Key reason
+            reasons = _entry_reasons(signal, is_buy)
+            if reasons:
+                lines.append(f"<i>{reasons[0]}</i>")
+
+        return self.send_message("\n".join(lines))
 
     # ── Signal-only alert (no position opened) ─────────────────────────────────
 
@@ -240,6 +257,29 @@ class TelegramNotifier:
 
         return self.send_message("\n".join(lines))
 
+    # ── Daily summary ──────────────────────────────────────────────────────────
+
+    def send_daily_summary(self, total_equity: float, start_equity: float,
+                           trades: int, wins: int, losses: int,
+                           best_trade: float, worst_trade: float) -> bool:
+        pnl     = total_equity - start_equity
+        pnl_pct = (pnl / start_equity * 100) if start_equity else 0
+        wr      = (wins / trades * 100) if trades else 0
+        icon    = "📈" if pnl >= 0 else "📉"
+        result  = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        from datetime import datetime
+        lines = [
+            f"{icon} <b>Daily Summary — {datetime.utcnow().strftime('%Y-%m-%d')}</b>",
+            f"P&L: <b>{result} ({pnl_pct:+.1f}%)</b>",
+            f"Account: <b>${total_equity:,.2f}</b>",
+            f"Trades: {trades}  ({wins}W / {losses}L)",
+        ]
+        if trades:
+            lines.append(f"Win rate: <b>{wr:.0f}%</b>")
+        if best_trade != 0:
+            lines.append(f"Best: +${best_trade:.2f}   Worst: -${abs(worst_trade):.2f}")
+        return self.send_message("\n".join(lines))
+
     # ── Perp / futures alerts ──────────────────────────────────────────────────
 
     def send_perp_entry(self, symbol: str, side: str, price: float,
@@ -289,27 +329,6 @@ class TelegramNotifier:
             sign = "" if funding_paid >= 0 else "-"
             lines.append(f"Funding paid: {sign}${abs(funding_paid):.4f}")
         lines.append(f"Account: <b>${total_equity:,.2f}</b>")
-        return self.send_message("\n".join(lines))
-
-    def send_funding_rate_alert(self, symbol: str, funding_rate: float,
-                                side: Optional[str] = None) -> bool:
-        """Alert when funding rate becomes extreme (>0.1% per 8h)."""
-        coin = _coin(symbol)
-        apy = funding_rate * 3 * 365 * 100
-        positive = funding_rate >= 0
-        icon = "🔴" if positive else "🟢"  # high positive = longs pay shorts (bad for longs)
-        lines = [
-            f"{icon} <b>Funding Rate Alert — {coin}</b>",
-            f"Rate: {funding_rate*100:+.4f}% / 8h  ({apy:+.1f}% APY)",
-        ]
-        if positive:
-            lines.append("Longs are paying shorts — bearish signal")
-        else:
-            lines.append("Shorts are paying longs — bullish signal")
-        if side:
-            direction = "long" if side.lower() in ('buy', 'long') else "short"
-            cost_sign = "+" if (positive and direction == "short") or (not positive and direction == "long") else "-"
-            lines.append(f"Your {direction} position receives funding" if cost_sign == "+" else f"Your {direction} position pays funding")
         return self.send_message("\n".join(lines))
 
     # ── Error / connection ─────────────────────────────────────────────────────
