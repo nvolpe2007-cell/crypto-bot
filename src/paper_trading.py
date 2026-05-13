@@ -22,6 +22,7 @@ import pandas_ta as _pta
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
+from .microstructure_strategy import MicrostructureStrategy, MicrostructureSignal
 from .exchange import ExchangeConnection
 from .backtester import Trade
 from .notifications import TelegramNotifier
@@ -161,14 +162,6 @@ def _diagnose(side: str, pnl: float, exit_reason: str, holding_min: float,
         positives.append(f"Regime {sig.regime} aligned with trade direction")
     elif sig.regime in ('VOLATILE', 'CRASH'):
         issues.append(f"Regime {sig.regime} — unpredictable conditions")
-
-    # Funding
-    if sig.funding_rate is not None:
-        annual = sig.funding_rate * 3 * 365 * 100
-        if side == 'buy' and sig.funding_rate > 0.001:
-            issues.append(f"Funding {annual:.0f}% APY — market over-leveraged long (bearish pressure)")
-        elif side == 'buy' and sig.funding_rate < -0.001:
-            positives.append(f"Funding {annual:.0f}% APY — shorts paying longs (bullish pressure)")
 
     # Confidence
     if sig.confidence >= 90:
@@ -405,7 +398,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     _load_adaptations()
 
     # ── Subsystems ─────────────────────────────────────────────────────────────
-    strategy        = ScientificStrategy()
+    strategy        = MicrostructureStrategy()
     regime_detector = RegimeDetector()
     ofi_calc        = OrderFlowImbalance(exchange, symbols)
     lead_lag        = LeadLagDetector(lead_symbol='BTC/USD')
@@ -435,11 +428,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     if notifier:
         notifier.send_message(
-            f"<b>PAPER STARTED</b>\n"
-            f"{' '.join(s.split('/')[0] for s in symbols)}   {timeframe}\n"
-            f"capital ${trader.initial_capital:.2f}\n"
-            f"strategy: OFI + Lead-Lag primary\n"
-            f"min confidence: {_adapt['min_confidence']:.0f}%"
+            f"<b>Bot started</b>\n"
+            f"Trading: {', '.join(s.split('/')[0] for s in symbols)}\n"
+            f"Account: <b>${trader.initial_capital:.2f}</b>"
         )
 
     # ── Hourly digest ──────────────────────────────────────────────────────────
@@ -558,6 +549,12 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         public_ws.candle_queue.get(), timeout=90
                     )
                     refresh_syms = [candle.symbol] if candle.symbol in symbols else symbols
+                    # Feed closed candle into microstructure CVD tracker
+                    if candle.symbol in symbols:
+                        try:
+                            strategy.update_candle(candle.symbol, candle)
+                        except Exception:
+                            pass
                 else:
                     await asyncio.sleep(60)
                     refresh_syms = symbols
@@ -571,6 +568,25 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             result = regime_detector.detect(ohlcv_cache[sym])
                             if result:
                                 regime_cache[sym] = result.to_dict()
+                            # Feed latest candle into CVD tracker (fallback when WS unavailable)
+                            if not public_ws:
+                                df_feed = ohlcv_cache[sym]
+                                if len(df_feed) >= 1:
+                                    last_row = df_feed.iloc[-1]
+                                    candle_dict = {
+                                        'open':      float(last_row['open']),
+                                        'high':      float(last_row['high']),
+                                        'low':       float(last_row['low']),
+                                        'close':     float(last_row['close']),
+                                        'volume':    float(last_row['volume']),
+                                        'timestamp': float(last_row.name.timestamp())
+                                                     if hasattr(last_row.name, 'timestamp')
+                                                     else time.time(),
+                                    }
+                                    try:
+                                        strategy.update_candle(sym, candle_dict)
+                                    except Exception:
+                                        pass
                             # Track returns for CVaR
                             df_tmp = ohlcv_cache[sym]
                             if len(df_tmp) >= 2:
@@ -610,9 +626,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit")
                 if notifier:
                     notifier.send_message(
-                        f"<b>DAILY LOSS LIMIT</b>\n"
-                        f"Lost ${daily_loss:.2f} today (limit ${max_daily_loss:.2f})\n"
-                        f"Trading halted"
+                        f"🛑 <b>Daily loss limit hit</b>\n"
+                        f"Lost ${daily_loss:.2f} today — bot stopped for the day"
                     )
                 trader.running = False
                 break
@@ -645,8 +660,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 # Inject live price into cached df (synthetic current candle)
                 df = _inject_live_price(ohlcv_cache[symbol], current_price)
 
-                # Feed lead-lag
+                # Feed lead-lag (legacy)
                 lead_lag.update_price(symbol, current_price)
+
+                # Feed microstructure strategy with live price
+                strategy.update_price(symbol, current_price)
 
                 # Regime from cache (updated by candle refresher)
                 cached_regime = regime_cache.get(symbol, {})
@@ -656,7 +674,69 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 # Funding rate
                 funding_rate = _get_funding_rate(symbol)
 
-                # ── Scientific strategy evaluation ─────────────────────────────
+                # ── Microstructure OFI v2 book update ─────────────────────────
+                # Fetch order book and feed it into OFI v2 + kill filters
+                try:
+                    ob = await ofi_calc._exchange.exchange.fetch_order_book(symbol, limit=20)
+                    if ob:
+                        bids_raw = ob.get('bids', [])
+                        asks_raw = ob.get('asks', [])
+                        strategy.update_book(symbol, bids_raw, asks_raw, time.time())
+                        # Update volume SMA for whale filter
+                        vol_sma20 = float(df['volume'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
+                        strategy.update_volume_sma(symbol, vol_sma20)
+                except Exception:
+                    pass   # non-critical: OFI v2 falls back gracefully
+
+                # ── Microstructure exit checks for open positions ─────────────
+                pos_check = trader.account.positions.get(symbol)
+                if pos_check is not None:
+                    ofi_state_check = strategy.ofi_states.get(symbol)
+                    curr_ofi_norm   = ofi_state_check.ofi_norm if ofi_state_check else 0.0
+                    entry_dt = pos_check.entry_time if isinstance(pos_check.entry_time, datetime) else datetime.now(timezone.utc)
+                    time_open_secs  = (datetime.now(timezone.utc) - entry_dt).total_seconds()
+
+                    exit_reason, exit_type = strategy.check_exit(
+                        symbol, pos_check, current_price, curr_ofi_norm, time_open_secs
+                    )
+
+                    if exit_reason is not None:
+                        if exit_type == 'PARTIAL':
+                            # T1 partial: close 50% of position
+                            partial_size = pos_check.size * 0.5
+                            if pos_check.side == 'buy':
+                                exec_price = current_price * (1 - trader.slippage_pct)
+                                pnl_partial = (exec_price - pos_check.entry_price) * partial_size
+                                pos_check.size -= partial_size
+                                trader.account.cash += exec_price * partial_size - exec_price * partial_size * trader.fee_pct
+                                trader.account.total_pnl += pnl_partial
+                            else:
+                                exec_price = current_price * (1 + trader.slippage_pct)
+                                pnl_partial = (pos_check.entry_price - exec_price) * partial_size
+                                pos_check.size -= partial_size
+                                trader.account.cash += pos_check.entry_price * partial_size + pnl_partial
+                                trader.account.total_pnl += pnl_partial
+                            logger.info(f"[MICRO T1] {symbol} partial exit @ ${current_price:,.2f}  pnl=${pnl_partial:+.4f}")
+                            if notifier:
+                                notifier.send_message(
+                                    f"📊 <b>Half closed</b> — {symbol.split('/')[0]}\n"
+                                    f"Locked in partial profit @ ${current_price:,.2f}"
+                                )
+                        else:
+                            # Full exit
+                            if pos_check.side == 'buy':
+                                trade = trader.execute_sell(symbol, current_price, datetime.now(timezone.utc), reason=exit_reason)
+                            else:
+                                trade = trader.execute_cover(symbol, current_price, datetime.now(timezone.utc), reason=exit_reason)
+                            if trade:
+                                recent_trades.append(_trade_to_dict(trade, symbol, exit_reason))
+                                summary = trader.get_account_summary()
+                                equity_curve.append({'t': _ts(datetime.now(timezone.utc)), 'v': round(summary['total_equity'], 2)})
+                                _on_trade_closed(symbol, pos_check, trade, exit_reason,
+                                                 summary['total_equity'], notifier, journal, ml_scorer)
+                        continue   # skip entry logic this tick after an exit
+
+                # ── Strategy evaluation ────────────────────────────────────────
                 sig = strategy.evaluate(df, symbol, ofi_calc, lead_lag,
                                         regime_name, regime_conf, funding_rate)
 

@@ -33,6 +33,10 @@ class Trade:
     pnl: float = 0.0
     pnl_pct: float = 0.0
     fees: float = 0.0
+    # Post-mortem — populated at close so the journal can diagnose losses.
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
+    time_in_trade_sec: float = 0.0
 
 
 @dataclass
@@ -218,9 +222,11 @@ class Backtester:
         max_drawdown = drawdown.min()
         max_drawdown_pct = abs(max_drawdown)
 
-        # Sharpe ratio (assuming 1-minute bars, annualized)
+        # Sharpe ratio — crypto trades 24/7/365 (not 252 trading days).
+        # Assumes 1-minute bars; if you change timeframe, update bars_per_year.
         returns = equity_values.pct_change().dropna()
-        sharpe = (returns.mean() / returns.std()) * np.sqrt(252 * 24 * 60) if returns.std() > 0 else 0
+        bars_per_year = 365 * 24 * 60
+        sharpe = (returns.mean() / returns.std()) * np.sqrt(bars_per_year) if returns.std() > 0 else 0
 
         logger.info(f"Backtest complete: {len(trades)} trades, Return: {total_return_pct:.2f}%, Win rate: {win_rate:.1f}%")
 

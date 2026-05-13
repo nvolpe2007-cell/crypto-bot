@@ -26,6 +26,8 @@ from .market_sentiment import SentimentMonitor
 from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
 from .crypto_vol import CryptoVolMonitor
 from .state import read_state, write_state
+from .strategy_advisor import StrategyAdvisor
+from .trade_journal import TradeJournal
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'arbitrage'))
 from funding_scanner import FundingScanner
@@ -143,9 +145,12 @@ class ScalpingBot:
         sentiment = SentimentMonitor(notifier=notifier)
         public_ws = KrakenPublicWS(self.symbols, ohlc_interval=1)
         vol_mon   = CryptoVolMonitor()
+        journal   = TradeJournal()
+        advisor   = StrategyAdvisor(notifier, journal)
         asyncio.create_task(sentiment.start())
         asyncio.create_task(public_ws.start())
         asyncio.create_task(vol_mon.start())
+        asyncio.create_task(advisor.start())
         logger.info("WebSocket streams starting (public ticker + OHLC + IV monitor)")
 
         try:
@@ -183,10 +188,13 @@ class ScalpingBot:
         public_ws  = KrakenPublicWS(self.symbols, ohlc_interval=1)
         private_ws = KrakenPrivateWS(api_key, api_secret)
         vol_mon    = CryptoVolMonitor()
+        journal    = TradeJournal()
+        advisor    = StrategyAdvisor(notifier, journal)
         asyncio.create_task(sentiment.start())
         asyncio.create_task(public_ws.start())
         asyncio.create_task(private_ws.start())
         asyncio.create_task(vol_mon.start())
+        asyncio.create_task(advisor.start())
         logger.info("[LIVE] WebSocket streams starting")
 
         risk_cfg = self.config.get('risk', {})
@@ -217,8 +225,7 @@ class ScalpingBot:
 
 async def _run_funding_scanner():
     """Run funding rate scanner and merge results into shared state."""
-    notifier = create_notifier_from_env()
-    scanner = FundingScanner(notifier=notifier)
+    scanner = FundingScanner(notifier=None)
 
     async def _merge_state():
         while True:

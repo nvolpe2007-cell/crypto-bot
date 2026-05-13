@@ -69,13 +69,7 @@ class FundingScanner:
         results.sort(key=lambda x: abs(x.apy), reverse=True)
         self.opportunities = results[:20]
 
-        # Telegram alerts for exceptional rates
-        for opp in self.opportunities:
-            if abs(opp.apy) >= MIN_ALERT_APY:
-                last = self._alerted.get(opp.symbol, 0)
-                if abs(opp.apy) > last + 5:   # only alert if 5% higher than last alert
-                    self._alerted[opp.symbol] = abs(opp.apy)
-                    await self._send_alert(opp)
+        # Funding alerts disabled — data still written to state for strategy use
 
         logger.info(f"Funding scan: {len(self.opportunities)} opportunities found")
 
@@ -153,21 +147,7 @@ class FundingScanner:
         return results
 
     async def _send_alert(self, opp: FundingOpportunity):
-        if not self.notifier:
-            return
-        direction = "+" if opp.apy > 0 else "-"
-        msg = (
-            f"<b>FUNDING RATE ALERT</b>\n\n"
-            f"Exchange: <code>{opp.exchange}</code>\n"
-            f"Symbol:   <code>{opp.symbol}</code>\n"
-            f"8h Rate:  <code>{direction}{abs(opp.rate_8h):.4f}%</code>\n"
-            f"APY:      <code>{direction}{abs(opp.apy):.1f}%</code>\n"
-            f"Action:   <b>{opp.action}</b>"
-        )
-        try:
-            self.notifier.send_message(msg)
-        except Exception as e:
-            logger.error(f"Telegram alert failed: {e}")
+        pass  # alerts disabled — data written to state.json for strategy use only
 
     def get_state(self) -> List[dict]:
         return [o.to_dict() for o in self.opportunities]

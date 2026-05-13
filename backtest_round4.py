@@ -32,7 +32,8 @@ def backtest_advanced(df: pd.DataFrame, signals: pd.Series,
                       atr_sl_mult: float = 1.5,
                       atr_tp_mult: float = 3.0,
                       use_trailing: bool = False,
-                      trail_atr_mult: float = 1.0) -> Result:
+                      trail_atr_mult: float = 1.0,
+                      timeframe: str = '1h') -> Result:
 
     atr = ta.atr(df['high'], df['low'], df['close'], length=14)
     equity = capital
@@ -111,8 +112,15 @@ def backtest_advanced(df: pd.DataFrame, signals: pd.Series,
     running_max = eq.expanding().max()
     drawdown = (eq - running_max) / running_max * 100
     max_dd = abs(drawdown.min())
+    bars_per_year = {
+        '1m': 365 * 24 * 60, '3m': 365 * 24 * 20, '5m': 365 * 24 * 12,
+        '15m': 365 * 24 * 4, '30m': 365 * 24 * 2,
+        '1h': 365 * 24, '2h': 365 * 12, '4h': 365 * 6,
+        '6h': 365 * 4, '8h': 365 * 3, '12h': 365 * 2,
+        '1d': 365, '3d': 365 / 3, '1w': 52,
+    }.get(timeframe, 365 * 24)
     returns = eq.pct_change().dropna()
-    sharpe  = (returns.mean() / returns.std()) * np.sqrt(365 * 24) if returns.std() > 0 else 0
+    sharpe  = (returns.mean() / returns.std()) * np.sqrt(bars_per_year) if returns.std() > 0 else 0
 
     return Result(name, symbol, len(trades), round(win_rate, 1),
                   round(total_return, 2), round(profit_factor, 2),

@@ -184,6 +184,121 @@ class ExchangeConnection:
         )
 
 
+class KrakenFuturesConnection:
+    """
+    Async wrapper around Kraken Futures (perpetual swaps) via ccxt.krakenfutures.
+
+    Requires separate API keys from futures.kraken.com — not the same keys as
+    spot Kraken. Set KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET in .env.
+
+    Unified CCXT symbols for perps:
+        BTC/USD:USD   ETH/USD:USD   SOL/USD:USD
+    """
+
+    # Map spot symbol → perp unified symbol
+    SPOT_TO_PERP = {
+        'BTC/USD': 'BTC/USD:USD',
+        'ETH/USD': 'ETH/USD:USD',
+        'SOL/USD': 'SOL/USD:USD',
+    }
+
+    def __init__(self, api_key: str = None, secret: str = None, sandbox: bool = True):
+        self.sandbox = sandbox
+        self.exchange = ccxt.krakenfutures({
+            'apiKey': api_key or '',
+            'secret': secret or '',
+            'enableRateLimit': True,
+        })
+        if sandbox:
+            self.exchange.set_sandbox_mode(True)
+        logger.info(f"Kraken Futures initialized (sandbox={sandbox})")
+
+    def perp_symbol(self, spot_symbol: str) -> str:
+        """Convert spot symbol to Kraken Futures perp symbol."""
+        return self.SPOT_TO_PERP.get(spot_symbol, spot_symbol)
+
+    async def connect(self):
+        await self.exchange.load_markets()
+        logger.info("Kraken Futures connection established")
+
+    async def disconnect(self):
+        await self.exchange.close()
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m',
+                          limit: int = 1000, since: Optional[int] = None,
+                          retries: int = 3) -> List:
+        perp = self.perp_symbol(symbol)
+        for attempt in range(1, retries + 1):
+            try:
+                ohlcv = await self.exchange.fetch_ohlcv(perp, timeframe=timeframe,
+                                                        limit=limit, since=since)
+                logger.debug(f"Fetched {len(ohlcv)} candles for {perp}")
+                return ohlcv
+            except Exception as e:
+                logger.warning(f"OHLCV fetch attempt {attempt}/{retries} failed for {perp}: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(2 ** attempt)
+        logger.error(f"All {retries} OHLCV fetch attempts failed for {perp}")
+        return []
+
+    async def get_ticker(self, symbol: str) -> Dict:
+        return await self.exchange.fetch_ticker(self.perp_symbol(symbol))
+
+    async def fetch_funding_rate(self, symbol: str) -> Optional[float]:
+        """Current funding rate as a fraction (e.g. 0.0001 = 0.01% per 8h)."""
+        try:
+            data = await self.exchange.fetch_funding_rate(self.perp_symbol(symbol))
+            return data.get('fundingRate')
+        except Exception as e:
+            logger.warning(f"Funding rate fetch failed for {symbol}: {e}")
+            return None
+
+    async def fetch_funding_rate_history(self, symbol: str, limit: int = 3) -> List[Dict]:
+        """Recent funding rate history."""
+        try:
+            history = await self.exchange.fetch_funding_rate_history(
+                self.perp_symbol(symbol), limit=limit)
+            return history
+        except Exception as e:
+            logger.warning(f"Funding history fetch failed for {symbol}: {e}")
+            return []
+
+    async def get_balance(self) -> Dict:
+        return await self.exchange.fetch_balance()
+
+    async def create_order(self, symbol: str, order_type: str, side: str,
+                           amount: float, price: Optional[float] = None,
+                           leverage: int = 1) -> Dict:
+        perp = self.perp_symbol(symbol)
+        params = {}
+        if leverage > 1:
+            params['leverage'] = leverage
+        logger.info(f"Placing {order_type} {side} order: {amount} {perp} @ {price or 'market'} (lev={leverage}x)")
+        return await self.exchange.create_order(perp, order_type, side, amount, price, params)
+
+    async def cancel_order(self, order_id: str, symbol: str) -> Dict:
+        return await self.exchange.cancel_order(order_id, self.perp_symbol(symbol))
+
+    async def get_open_positions(self) -> List:
+        """Get all open perp positions."""
+        try:
+            return await self.exchange.fetch_positions()
+        except Exception as e:
+            logger.warning(f"Fetch positions failed: {e}")
+            return []
+
+    @classmethod
+    def from_env(cls) -> 'KrakenFuturesConnection':
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        return cls(
+            api_key=os.getenv('KRAKEN_FUTURES_API_KEY', ''),
+            secret=os.getenv('KRAKEN_FUTURES_API_SECRET', ''),
+            sandbox=os.getenv('KRAKEN_FUTURES_SANDBOX', 'true').lower() == 'true',
+        )
+
+
 async def test_connection():
     """Test exchange connection"""
     exchange = ExchangeConnection(sandbox=False)  # Public data doesn't need auth

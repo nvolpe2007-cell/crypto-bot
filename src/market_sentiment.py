@@ -65,12 +65,10 @@ class SentimentSnapshot:
         }
 
     def telegram_summary(self) -> str:
-        block_note = "  LONGS BLOCKED" if not self.allows_long else ""
-        alt_note   = "  altcoin pressure" if self.altcoin_pressure else ""
+        block = "  ⛔ no longs right now" if not self.allows_long else ""
         return (
-            f"<b>MARKET  F&amp;G {self.fear_greed_score}  {self.fear_greed_label}{block_note}</b>\n"
-            f"BTC dom {self.btc_dominance:.1f}%   mkt {self.market_cap_change_24h:+.1f}%{alt_note}\n"
-            f"mempool {self.mempool_tx_count:,}   tx24h {self.tx_count_24h:,}"
+            f"<b>Bot started</b>{block}\n"
+            f"Market mood: <b>{self.fear_greed_label}</b> ({self.fear_greed_score}/100)"
         )
 
 
@@ -214,17 +212,17 @@ class SentimentMonitor:
             return
         if prev >= 25 > curr:
             self._notifier.send_message(
-                f"<b>EXTREME FEAR  {curr}</b>\nlongs blocked"
+                "⛔ <b>Extreme Fear</b> — bot pausing longs until mood improves"
             )
         elif prev < 25 <= curr:
             self._notifier.send_message(
-                f"<b>FEAR CLEARED  {curr}</b>\nlongs open"
+                "✅ <b>Fear cleared</b> — longs back open"
             )
         elif prev <= 75 < curr:
             self._notifier.send_message(
-                f"<b>EXTREME GREED  {curr}</b>\nmarket overextended — be cautious"
+                "⚠️ <b>Market is very greedy</b> — bot will be more cautious"
             )
         elif prev > 75 >= curr:
             self._notifier.send_message(
-                f"<b>GREED CLEARING  {curr}</b>\nmarket cooling off"
+                "📉 <b>Greed fading</b> — market cooling down"
             )

@@ -3,17 +3,28 @@ Shared state manager — bot writes, dashboard reads
 """
 
 import json
+import math
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Any, Dict
 
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'state.json')
 
 
+def _clean(obj):
+    """Replace NaN/Inf with None so the JSON file is always valid."""
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+
 def write_state(data: Dict[str, Any]):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    # Preserve fields written by other components
     try:
         existing = read_state()
         for key in ('funding_opportunities', 'sentiment'):
@@ -24,7 +35,7 @@ def write_state(data: Dict[str, Any]):
     data['last_update'] = datetime.utcnow().isoformat()
     tmp = STATE_FILE + '.tmp'
     with open(tmp, 'w') as f:
-        json.dump(data, f, default=str)
+        json.dump(_clean(data), f, default=str)
     os.replace(tmp, STATE_FILE)
 
 

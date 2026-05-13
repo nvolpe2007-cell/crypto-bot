@@ -49,6 +49,16 @@ class TradeRecord:
     funding_rate:      float = 0.0
     direction:         str   = 'buy'
 
+    # Post-mortem fields — recorded at exit so the ML/learner can diagnose *why* a trade lost,
+    # not just whether the entry conditions looked good. Optional with safe defaults.
+    mfe_pct:            float = 0.0   # max favorable excursion (best % move in our favor)
+    mae_pct:            float = 0.0   # max adverse excursion (worst % move against us)
+    time_in_trade_sec:  float = 0.0
+    regime_at_exit:     str   = ''
+    rsi_at_exit:        float = 0.0
+    adx_at_exit:        float = 0.0
+    exit_price:         float = 0.0
+
     def to_dict(self):
         return asdict(self)
 
@@ -87,6 +97,9 @@ class TradeJournal:
         'confidence': 0.0, 'ofi_score': 0.0, 'lead_lag_score': 0.0,
         'regime_score': 0.0, 'regime_confidence': 0.5,
         'funding_rate': 0.0, 'direction': 'buy',
+        'mfe_pct': 0.0, 'mae_pct': 0.0, 'time_in_trade_sec': 0.0,
+        'regime_at_exit': '', 'rsi_at_exit': 0.0, 'adx_at_exit': 0.0,
+        'exit_price': 0.0,
     }
 
     def _load(self):

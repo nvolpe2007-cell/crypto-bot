@@ -239,7 +239,8 @@ async def main():
                 try:
                     sigs = fn(df.copy(), btc.copy())
                     res  = backtest_advanced(df, sigs, symbol, strat_name,
-                                             atr_sl_mult=1.5, atr_tp_mult=2.5)
+                                             atr_sl_mult=1.5, atr_tp_mult=2.5,
+                                             timeframe='1d')
                     results.append(res)
                     all_results.append((label, res))
                 except Exception as e:

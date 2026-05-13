@@ -111,13 +111,6 @@ def _entry_reasons(sig, is_buy: bool) -> list:
     if adx_msg and aligned:
         reasons.append(adx_msg)
 
-    if sig.funding_rate is not None:
-        annual = sig.funding_rate * 3 * 365 * 100
-        if is_buy and sig.funding_rate < -0.001:
-            reasons.append(f"Shorts are paying longs — bullish funding ({annual:+.0f}% APY)")
-        elif not is_buy and sig.funding_rate > 0.001:
-            reasons.append(f"Market is over-leveraged long — shorts get paid ({annual:+.0f}% APY)")
-
     return reasons[:4]  # cap at 4 reasons to keep messages short
 
 
@@ -162,43 +155,14 @@ class TelegramNotifier:
     def send_trade_alert(self, action: str, symbol: str, price: float,
                          size: float, pnl: Optional[float] = None,
                          reason: str = "", signal=None):
-        """
-        Entry notification.  Pass signal=ScientificSignal for rich output.
-        """
-        is_buy      = action.upper() == "BUY"
-        coin        = _coin(symbol)
-        direction   = "LONG (buying)" if is_buy else "SHORT (selling)"
-        icon        = "🟢" if is_buy else "🔴"
-        conf_label  = _conf_label(signal.confidence) if signal else "—"
-
-        lines = [
-            f"{icon} <b>{coin} — {direction}</b>",
-            f"Entry price:  <b>${price:,.2f}</b>",
-            f"Position:     <b>${size:.2f}</b>",
-            f"Confidence:   <b>{conf_label}</b>  ({signal.confidence:.0f}%)" if signal else f"<i>{reason}</i>",
-        ]
-
-        if signal:
-            sl_pct = signal.stop_loss_pct()
-            tp_pct = signal.take_profit_pct()
-            if is_buy:
-                sl_price = price * (1 - sl_pct / 100)
-                tp_price = price * (1 + tp_pct / 100)
-            else:
-                sl_price = price * (1 + sl_pct / 100)
-                tp_price = price * (1 - tp_pct / 100)
-
-            lines.append(f"Stop loss:    ${sl_price:,.2f}  ({sl_pct:.1f}% risk)")
-            lines.append(f"Target:       ${tp_price:,.2f}  ({tp_pct:.1f}% gain)")
-
-            reasons = _entry_reasons(signal, is_buy)
-            if reasons:
-                lines.append("")
-                lines.append("<b>Why I entered:</b>")
-                for r in reasons:
-                    lines.append(f"  • {r}")
-
-        return self.send_message("\n".join(lines))
+        is_buy = action.upper() == "BUY"
+        icon   = "🟢" if is_buy else "🔴"
+        side   = "BUY" if is_buy else "SELL"
+        coin   = _coin(symbol)
+        return self.send_message(
+            f"{icon} <b>{side} {coin}</b>\n"
+            f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>"
+        )
 
     # ── Signal-only alert (no position opened) ─────────────────────────────────
 
@@ -221,72 +185,31 @@ class TelegramNotifier:
                              issues: list, positives: list,
                              loss_streak: int, win_streak: int,
                              adaptations: Optional[list] = None) -> bool:
+        is_win = pnl >= 0
+        icon   = "✅" if is_win else "❌"
+        label  = "WIN" if is_win else "LOSS"
+        result = f"+${pnl:.2f}" if is_win else f"-${abs(pnl):.2f}"
+        coin   = _coin(symbol)
 
-        is_win    = pnl >= 0
-        is_buy    = side == 'buy'
-        icon      = "✅" if is_win else "❌"
-        result    = f"+${pnl:.2f}" if is_win else f"-${abs(pnl):.2f}"
-        label     = "WIN" if is_win else "LOSS"
-        coin      = _coin(symbol)
-        direction = "long" if is_buy else "short"
-        held      = f"{holding_minutes:.0f} min" if holding_minutes < 60 else f"{holding_minutes/60:.1f} hrs"
-        exit_desc = _exit_plain(exit_reason)
+        msg = (
+            f"{icon} <b>{label}  {result}</b>\n"
+            f"{coin}   ${entry_price:,.2f} → ${exit_price:,.2f}\n"
+            f"Account: <b>${total_equity:,.2f}</b>"
+        )
 
-        lines = [
-            f"{icon} <b>{label}  {result}  ({pnl_pct:+.1f}%)</b>",
-            f"{coin}  {direction}   ${entry_price:,.2f} → ${exit_price:,.2f}",
-            f"Held {held}  —  {exit_desc}",
-            f"Account now:  <b>${total_equity:,.2f}</b>",
-        ]
-
-        # Plain-English explanation
-        if is_win and positives:
-            lines.append("")
-            lines.append("<b>Why it worked:</b>")
-            for p in _translate_issues(positives)[:3]:
-                lines.append(f"  • {p}")
-        elif not is_win and issues:
-            lines.append("")
-            lines.append("<b>What went wrong:</b>")
-            for i in _translate_issues(issues)[:3]:
-                lines.append(f"  • {i}")
-
-        # Market snapshot at entry (simplified)
-        context = []
-        if ofi is not None:
-            ofi_msg = _ofi_plain(ofi, is_buy)
-            if ofi_msg:
-                context.append(ofi_msg)
-        if btc_lead:
-            ll = _lead_lag_plain(btc_lead, is_buy)
-            if ll:
-                context.append(ll)
-        context.append(f"Market was {_regime_plain(regime)} when I entered")
-
-        if context:
-            lines.append("")
-            lines.append("<b>Market context at entry:</b>")
-            for c in context[:3]:
-                lines.append(f"  • {c}")
-
-        # Streak / adaptation notices
         if loss_streak >= 3:
-            lines.append(f"\n⚠️ <b>{loss_streak} losses in a row</b> — I've tightened my entry rules until conditions improve")
+            msg += f"\n⚠️ {loss_streak} losses in a row"
         elif win_streak >= 3:
-            lines.append(f"\n🔥 {win_streak} wins in a row — bot is performing well")
+            msg += f"\n🔥 {win_streak} wins in a row"
 
-        if adaptations:
-            lines.append("")
-            lines.append("<i>Bot self-adjusted: " + "; ".join(adaptations[:2]) + "</i>")
-
-        return self.send_message("\n".join(lines))
+        return self.send_message(msg)
 
     # ── Simple win/loss (fallback when no signal available) ───────────────────
 
     def send_win(self, symbol: str, pnl: float, pnl_pct: float,
                  exit_price: float, total_equity: float, reason: str = ""):
         return self.send_message(
-            f"✅ <b>WIN  +${pnl:.2f}  ({pnl_pct:+.1f}%)</b>\n"
+            f"✅ <b>WIN  +${pnl:.2f}</b>\n"
             f"{_coin(symbol)}   exited at ${exit_price:,.2f}\n"
             f"Account: <b>${total_equity:,.2f}</b>"
         )
@@ -294,7 +217,7 @@ class TelegramNotifier:
     def send_loss(self, symbol: str, pnl: float, pnl_pct: float,
                   exit_price: float, total_equity: float, reason: str = ""):
         return self.send_message(
-            f"❌ <b>LOSS  -${abs(pnl):.2f}  ({pnl_pct:+.1f}%)</b>\n"
+            f"❌ <b>LOSS  -${abs(pnl):.2f}</b>\n"
             f"{_coin(symbol)}   exited at ${exit_price:,.2f}\n"
             f"Account: <b>${total_equity:,.2f}</b>"
         )
@@ -305,18 +228,88 @@ class TelegramNotifier:
                     open_positions: int, trades_today: int):
         icon   = "📈" if pnl >= 0 else "📉"
         result = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        open_str = f"{open_positions} trade open" if open_positions == 1 else \
+                   f"{open_positions} trades open" if open_positions > 1 else "no open trades"
 
         lines = [
-            f"{icon} <b>Hourly Update</b>",
-            f"Account:  <b>${capital:,.2f}</b>",
-            f"P&L:      <b>{result}  ({pnl_pct:+.1f}%)</b>",
-            f"Trades:   {trades_today}",
+            f"{icon} <b>Update</b>",
+            f"Account: <b>${capital:,.2f}</b>",
+            f"P&L:     <b>{result}</b>",
+            f"Trades today: {trades_today}   {open_str}",
         ]
-        if open_positions > 0:
-            lines.append(f"Open:     {open_positions} position{'s' if open_positions > 1 else ''} active")
-        else:
-            lines.append("Open:     no open positions (watching markets)")
 
+        return self.send_message("\n".join(lines))
+
+    # ── Perp / futures alerts ──────────────────────────────────────────────────
+
+    def send_perp_entry(self, symbol: str, side: str, price: float,
+                        size_usd: float, leverage: int = 1,
+                        funding_rate: Optional[float] = None,
+                        stop_price: Optional[float] = None,
+                        target_price: Optional[float] = None) -> bool:
+        """Alert when a perp position is opened."""
+        coin = _coin(symbol)
+        is_long = side.lower() in ('buy', 'long')
+        direction = "LONG" if is_long else "SHORT"
+        icon = "🟢" if is_long else "🔴"
+
+        lines = [
+            f"{icon} <b>PERP {direction} — {coin}</b>",
+            f"Entry: <b>${price:,.2f}</b>",
+            f"Size: <b>${size_usd:.2f}</b>" + (f" ({leverage}x)" if leverage > 1 else ""),
+        ]
+        if funding_rate is not None:
+            apy = funding_rate * 3 * 365 * 100  # 3 payments/day × 365
+            sign = "+" if funding_rate >= 0 else ""
+            lines.append(f"Funding: {sign}{funding_rate*100:.4f}% / 8h  ({sign}{apy:.1f}% APY)")
+        if stop_price:
+            lines.append(f"Stop: ${stop_price:,.2f}")
+        if target_price:
+            lines.append(f"Target: ${target_price:,.2f}")
+        return self.send_message("\n".join(lines))
+
+    def send_perp_exit(self, symbol: str, side: str, entry_price: float,
+                       exit_price: float, pnl: float, pnl_pct: float,
+                       total_equity: float, exit_reason: str = "",
+                       funding_paid: Optional[float] = None) -> bool:
+        """Alert when a perp position is closed."""
+        coin = _coin(symbol)
+        is_win = pnl >= 0
+        icon = "✅" if is_win else "❌"
+        label = "WIN" if is_win else "LOSS"
+        result = f"+${pnl:.2f}" if is_win else f"-${abs(pnl):.2f}"
+
+        lines = [
+            f"{icon} <b>PERP {label}  {result} ({pnl_pct:+.1f}%)</b>",
+            f"{coin}  ${entry_price:,.2f} → ${exit_price:,.2f}",
+        ]
+        if exit_reason:
+            lines.append(_exit_plain(exit_reason))
+        if funding_paid is not None:
+            sign = "" if funding_paid >= 0 else "-"
+            lines.append(f"Funding paid: {sign}${abs(funding_paid):.4f}")
+        lines.append(f"Account: <b>${total_equity:,.2f}</b>")
+        return self.send_message("\n".join(lines))
+
+    def send_funding_rate_alert(self, symbol: str, funding_rate: float,
+                                side: Optional[str] = None) -> bool:
+        """Alert when funding rate becomes extreme (>0.1% per 8h)."""
+        coin = _coin(symbol)
+        apy = funding_rate * 3 * 365 * 100
+        positive = funding_rate >= 0
+        icon = "🔴" if positive else "🟢"  # high positive = longs pay shorts (bad for longs)
+        lines = [
+            f"{icon} <b>Funding Rate Alert — {coin}</b>",
+            f"Rate: {funding_rate*100:+.4f}% / 8h  ({apy:+.1f}% APY)",
+        ]
+        if positive:
+            lines.append("Longs are paying shorts — bearish signal")
+        else:
+            lines.append("Shorts are paying longs — bullish signal")
+        if side:
+            direction = "long" if side.lower() in ('buy', 'long') else "short"
+            cost_sign = "+" if (positive and direction == "short") or (not positive and direction == "long") else "-"
+            lines.append(f"Your {direction} position receives funding" if cost_sign == "+" else f"Your {direction} position pays funding")
         return self.send_message("\n".join(lines))
 
     # ── Error / connection ─────────────────────────────────────────────────────
@@ -332,47 +325,8 @@ class TelegramNotifier:
         )
 
 
-# ── Issue translation ──────────────────────────────────────────────────────────
-
 def _translate_issues(raw_issues: list) -> list:
-    """Convert internal diagnostic strings to plain English."""
-    out = []
-    for msg in raw_issues:
-        msg_l = msg.lower()
-        if 'ofi' in msg_l and 'confirmed' in msg_l:
-            out.append("Order books backed the trade direction")
-        elif 'ofi' in msg_l and ('against' in msg_l or 'warned' in msg_l or 'weak' in msg_l):
-            out.append("Order books were not supporting the direction at entry")
-        elif 'overbought' in msg_l:
-            out.append("Price was already overbought when I entered long — bad timing")
-        elif 'oversold' in msg_l and 'risky short' in msg_l:
-            out.append("Price was already oversold when I shorted — risky entry")
-        elif 'oversold' in msg_l and 'room to run' in msg_l:
-            out.append("Plenty of upside room — RSI had space to recover")
-        elif 'btc lead confirmed' in msg_l:
-            out.append("Bitcoin's move confirmed the direction for this trade")
-        elif 'btc lead' in msg_l and 'opposing' in msg_l:
-            out.append("Bitcoin was moving the other way — went against BTC momentum")
-        elif 'regime' in msg_l and 'aligned' in msg_l:
-            out.append("The broader trend matched the trade direction")
-        elif 'volatile' in msg_l or 'crash' in msg_l:
-            out.append("Market conditions were chaotic — unpredictable")
-        elif 'stopped out' in msg_l or 'false breakout' in msg_l:
-            out.append("Price immediately reversed after entry — false breakout")
-        elif 'target reached' in msg_l:
-            out.append("Price hit the exact target as planned")
-        elif 'high conviction' in msg_l or 'confidence' in msg_l and '%' in msg_l:
-            if 'low' in msg_l:
-                out.append("Signal wasn't strong enough — should have waited")
-            else:
-                out.append("High-conviction entry — strong signal alignment")
-        elif 'funding' in msg_l and 'bearish' in msg_l:
-            out.append("Market was over-leveraged long — funding rate was warning of a drop")
-        elif 'funding' in msg_l and 'bullish' in msg_l:
-            out.append("Shorts were paying longs — funding favored this trade")
-        else:
-            out.append(msg)  # pass through if no translation matched
-    return out
+    return raw_issues
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────

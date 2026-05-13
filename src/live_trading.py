@@ -337,14 +337,10 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     session_start_pnl = trader.account.total_pnl
 
     if notifier:
-        pos_str = f"{len(trader.positions)} open position(s)" if trader.positions else "no open positions"
         notifier.send_message(
-            f"<b>LIVE TRADING STARTED</b>\n"
+            f"<b>Bot started — LIVE</b>\n"
             f"Balance: <b>${real_balance:.2f}</b>\n"
-            f"Pairs: {', '.join(s.split('/')[0] for s in symbols)}\n"
-            f"Min confidence: {LIVE_MIN_CONFIDENCE:.0f}%\n"
-            f"Max daily loss: ${max_daily_loss:.2f}\n"
-            f"Startup: {pos_str}"
+            f"Trading: {', '.join(s.split('/')[0] for s in symbols)}"
         )
 
     # ── Background: OFI prefetch ───────────────────────────────────────────────

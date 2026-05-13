@@ -27,6 +27,18 @@ risk:
   max_daily_loss: 15      # bot stops for the day if total loss hits this
   max_open_positions: 3
 
+futures:
+  enabled: false          # set true to enable perp trading alongside spot
+  sandbox: true           # uses Kraken Futures demo (demo.kraken-futures.com)
+  pairs:
+    - BTC/USD             # internally mapped to BTC/USD:USD on krakenfutures
+    - ETH/USD
+    - SOL/USD
+  leverage: 1             # 1x = no liquidation risk, same exposure as spot
+  max_position_size: 25   # max USD per perp trade
+  # Keys: set KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET in .env
+  # Get them from: https://futures.kraken.com → Settings → API
+
 backtest:
   # Historical period to test
   start_date: "2024-01-01"

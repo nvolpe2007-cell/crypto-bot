@@ -420,7 +420,8 @@ def backtest(df: pd.DataFrame, signals: pd.Series,
              fee_pct: float = 0.0026,
              slippage_pct: float = 0.001,
              atr_sl_mult: float = 1.5,
-             atr_tp_mult: float = 3.0) -> Result:
+             atr_tp_mult: float = 3.0,
+             timeframe: str = '1h') -> Result:
 
     atr = ta.atr(df['high'], df['low'], df['close'], length=14)
     equity = capital
@@ -489,8 +490,18 @@ def backtest(df: pd.DataFrame, signals: pd.Series,
     drawdown     = (eq - running_max) / running_max * 100
     max_dd       = abs(drawdown.min())
 
+    # Bars per year by timeframe — used to annualize the per-bar Sharpe.
+    # Previous code hardcoded √(365*24) which silently 5x-inflated Sharpe on daily bars.
+    bars_per_year = {
+        '1m': 365 * 24 * 60, '3m': 365 * 24 * 20, '5m': 365 * 24 * 12,
+        '15m': 365 * 24 * 4, '30m': 365 * 24 * 2,
+        '1h': 365 * 24, '2h': 365 * 12, '4h': 365 * 6,
+        '6h': 365 * 4, '8h': 365 * 3, '12h': 365 * 2,
+        '1d': 365, '3d': 365 / 3, '1w': 52,
+    }.get(timeframe, 365 * 24)
+
     returns = eq.pct_change().dropna()
-    sharpe  = (returns.mean() / returns.std()) * np.sqrt(365 * 24) if returns.std() > 0 else 0
+    sharpe  = (returns.mean() / returns.std()) * np.sqrt(bars_per_year) if returns.std() > 0 else 0
 
     return Result(name, symbol, len(trades), round(win_rate, 1),
                   round(total_return, 2), round(profit_factor, 2),
@@ -583,7 +594,7 @@ async def main():
             print(f"  [{done}/{total}] {name} on {symbol}...")
             try:
                 signals = strat_fn(df.copy())
-                result  = backtest(df, signals, symbol, name)
+                result  = backtest(df, signals, symbol, name, timeframe=TIMEFRAME)
                 results.append(result)
             except Exception as e:
                 print(f"    ERROR: {e}")

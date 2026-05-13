@@ -78,7 +78,11 @@ async def _fetch_ws_token(api_key: str, api_secret: str) -> Optional[str]:
     url_path = "/0/private/GetWebSocketsToken"
     data = {}
     nonce, sign = _kraken_sign(api_secret, url_path, data)
-    headers = {"API-Key": api_key, "API-Sign": sign}
+    headers = {
+        "API-Key": api_key,
+        "API-Sign": sign,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
