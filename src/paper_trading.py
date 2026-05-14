@@ -1,4 +1,4 @@
-"""
+""" 
 Paper Trading Engine
 Uses ScientificStrategy (OFI + BTC Lead-Lag primary) with confidence-scaled sizing.
 All other strategies (EMA, BB, regime, funding) contribute to the confidence score.
@@ -57,8 +57,8 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
         for o in opps:
             if o.get('symbol') == usdt:
                 return o.get('rate_8h', 0) / 100
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[FUNDING] state read failed for {symbol}: {e}")
     return None
 
 
@@ -79,8 +79,8 @@ def _load_adaptations():
             with open(_ADAPT_FILE) as f:
                 _adapt.update(json.load(f))
             logger.info(f"[ADAPT] Loaded: min_conf={_adapt['min_confidence']:.0f}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[ADAPT] Failed to load adaptations, using defaults: {e}")
 
 def _save_adaptations():
     try:
@@ -537,12 +537,21 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
+        consecutive_failures = 0
         while trader.running:
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
-                except Exception:
-                    pass
+                    consecutive_failures = 0
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
+                    if consecutive_failures == 10 and notifier:
+                        notifier.send_message(
+                            f"⚠️ <b>OFI subsystem degraded</b>\n"
+                            f"Failed {consecutive_failures} times in a row — "
+                            f"trading without live order flow data"
+                        )
                 await asyncio.sleep(2)
             await asyncio.sleep(20)   # full cycle every ~26s
 
@@ -550,12 +559,21 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
+        consecutive_failures = 0
         while trader.running:
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
-                except Exception:
-                    pass
+                    consecutive_failures = 0
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
+                    if consecutive_failures == 10 and notifier:
+                        notifier.send_message(
+                            f"⚠️ <b>HTF filter degraded</b>\n"
+                            f"Failed {consecutive_failures} times in a row — "
+                            f"multi-timeframe alignment unavailable"
+                        )
                 await asyncio.sleep(3)
             await asyncio.sleep(45)   # full cycle every ~54s
 
@@ -593,8 +611,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if candle.symbol in symbols:
                         try:
                             strategy.update_candle(candle.symbol, candle)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[WS] candle update failed for {candle.symbol}: {e}")
                 else:
                     await asyncio.sleep(60)
                     refresh_syms = symbols
@@ -625,8 +643,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                     }
                                     try:
                                         strategy.update_candle(sym, candle_dict)
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        logger.debug(f"[CACHE] candle update failed for {sym}: {e}")
                             # Track returns for CVaR
                             df_tmp = ohlcv_cache[sym]
                             if len(df_tmp) >= 2:
@@ -644,8 +662,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[CACHE] fallback refresh failed for {sym}: {e}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -725,8 +743,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         # Update volume SMA for whale filter
                         vol_sma20 = float(df['volume'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
                         strategy.update_volume_sma(symbol, vol_sma20)
-                except Exception:
-                    pass   # non-critical: OFI v2 falls back gracefully
+                except Exception as e:
+                    logger.debug(f"[OFI] order book fetch failed for {symbol}: {e}")
 
                 # ── Microstructure exit checks for open positions ─────────────
                 pos_check = trader.account.positions.get(symbol)
