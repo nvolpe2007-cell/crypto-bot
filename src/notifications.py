@@ -111,6 +111,13 @@ def _entry_reasons(sig, is_buy: bool) -> list:
     if adx_msg and aligned:
         reasons.append(adx_msg)
 
+    fr = getattr(sig, 'funding_rate', None)
+    if fr is not None and abs(fr) > 0.001:
+        if fr < 0 and is_buy:
+            reasons.append("Funding rate: shorts paying longs — supports this long")
+        elif fr > 0 and not is_buy:
+            reasons.append("Funding rate: over-leveraged longs paying shorts — supports short")
+
     return reasons[:4]  # cap at 4 reasons to keep messages short
 
 
@@ -219,6 +226,16 @@ class TelegramNotifier:
         elif win_streak >= 3:
             msg += f"\n🔥 {win_streak} wins in a row"
 
+        if adaptations:
+            msg += f"\n🔄 Bot self-adjusted: {adaptations[0]}"
+
+        if is_win and positives:
+            translated = _translate_issues(positives)
+            msg += f"\n✓ What worked: {translated[0]}"
+        elif not is_win and issues:
+            translated = _translate_issues(issues)
+            msg += f"\n✗ What went wrong: {translated[0]}"
+
         return self.send_message(msg)
 
     # ── Simple win/loss (fallback when no signal available) ───────────────────
@@ -246,7 +263,7 @@ class TelegramNotifier:
         icon   = "📈" if pnl >= 0 else "📉"
         result = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         open_str = f"{open_positions} trade open" if open_positions == 1 else \
-                   f"{open_positions} trades open" if open_positions > 1 else "no open trades"
+                   f"{open_positions} trades open" if open_positions > 1 else "no open positions"
 
         lines = [
             f"{icon} <b>Update</b>",
@@ -345,7 +362,66 @@ class TelegramNotifier:
 
 
 def _translate_issues(raw_issues: list) -> list:
-    return raw_issues
+    """Convert technical diagnostic strings to plain English for Telegram."""
+    result = []
+    for msg in raw_issues:
+        lower = msg.lower()
+
+        # OFI patterns
+        if lower.startswith('ofi') and 'confirmed direction' in lower:
+            result.append("Order book flow confirmed the trade direction")
+        elif lower.startswith('ofi') and 'was against direction' in lower:
+            result.append("Order book was not supporting this trade direction")
+        elif lower.startswith('ofi') and 'was weak' in lower:
+            result.append("Order book showed no clear conviction — not supporting either direction")
+
+        # RSI patterns
+        elif 'rsi' in lower and 'overbought' in lower:
+            result.append("RSI was in overbought territory at entry — risky long")
+        elif 'rsi' in lower and 'oversold' in lower and 'short' in lower:
+            result.append("RSI was in oversold territory at entry — risky short")
+        elif 'rsi' in lower and ('had room to run' in lower or 'confirmed bearish' in lower):
+            result.append(msg)
+
+        # BTC lead-lag patterns
+        elif lower.startswith('btc lead confirmed'):
+            result.append("Bitcoin moved in the same direction first — altcoins typically follow")
+        elif lower.startswith('btc lead was') and 'opposing' in lower:
+            result.append("Bitcoin moved against this trade direction — higher reversal risk")
+
+        # Regime patterns
+        elif 'regime' in lower and 'aligned with trade direction' in lower:
+            result.append("Market trend was aligned with the trade direction")
+        elif 'regime' in lower and 'unpredictable conditions' in lower:
+            result.append("Market conditions were chaotic and unpredictable at entry")
+
+        # Confidence patterns
+        elif 'high conviction entry' in lower:
+            result.append("High conviction entry with strong signal quality")
+        elif 'low confidence entry' in lower:
+            result.append("Signal wasn't strong enough — should have waited for a cleaner setup")
+
+        # Exit patterns
+        elif 'stopped out' in lower and 'rejection' in lower:
+            result.append("Price reversed immediately at entry — possible false breakout")
+        elif 'target reached' in lower:
+            result.append("Target reached as planned — trade worked as expected")
+
+        # Holding time / other breakout note
+        elif 'false breakout' in lower:
+            result.append(msg)
+
+        # Funding patterns
+        elif lower.startswith('funding') and 'over-leveraged' in lower:
+            result.append(f"Market is over-leveraged long — {msg}")
+        elif lower.startswith('funding') and 'shorts paying' in lower:
+            result.append(f"Funding rate bullish — {msg}")
+
+        # Default: pass through unchanged
+        else:
+            result.append(msg)
+
+    return result
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────
