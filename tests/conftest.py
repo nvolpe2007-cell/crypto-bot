@@ -208,3 +208,5 @@ if _project_root not in sys.path:
 # _ensure_stub's "not in sys.modules" guard leaves them intact.
 import src.regime_detector as _  # noqa: F401, E402
 import src.notifications as _  # noqa: F401, E402
+import src.order_flow as _  # noqa: F401, E402
+import src.multi_timeframe as _  # noqa: F401, E402

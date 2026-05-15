@@ -73,7 +73,14 @@ class OrderFlowImbalance:
         return self._cache.get(symbol)
 
     def get_smoothed(self, symbol: str) -> Optional[float]:
-        """Exponentially-weighted average of recent OFI readings."""
+        """Exponentially-weighted average of recent OFI readings.
+
+        Returns None when the last successful fetch is older than _STALE_SECS,
+        matching the staleness semantics of get().  Without this guard the
+        history deque would serve arbitrarily old values after a disconnect.
+        """
+        if time.time() - self._fetched.get(symbol, 0) > _STALE_SECS:
+            return None
         hist = self._history.get(symbol)
         if not hist or len(hist) < 2:
             return self.get(symbol)
