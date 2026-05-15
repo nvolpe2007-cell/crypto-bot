@@ -10,6 +10,7 @@ Works on CEX (Kraken, Coinbase) and DEX (Curve)
 import asyncio
 import aiohttp
 import logging
+from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -44,15 +45,18 @@ class StablecoinArbBot:
     def __init__(
         self,
         exchanges: List[str] = None,
-        min_profit_pct: float = 0.1,  # 0.1% minimum
+        min_profit_pct: float = 0.1,  # 0.1% minimum after fees
         trade_size_usd: float = 500,
+        fee_pct: float = 0.0026,      # per-leg taker fee (0.26% = Kraken default)
     ):
         self.exchanges = exchanges or ["kraken", "coinbase", "binance"]
         self.min_profit_pct = min_profit_pct
         self.trade_size_usd = trade_size_usd
+        self.fee_pct = fee_pct
 
         self.session: Optional[aiohttp.ClientSession] = None
-        self.opportunities: List[TriangleOpportunity] = []
+        # Bounded deque prevents unbounded memory growth (bot scans every second)
+        self.opportunities: deque = deque(maxlen=500)
         self.running = False
 
         # Stablecoin pairs to monitor
@@ -96,18 +100,19 @@ class StablecoinArbBot:
 
             start_amount = self.trade_size_usd
             amount = start_amount
+            fee_mul = 1.0 - self.fee_pct  # multiplier applied after each leg
 
-            # Step 1: USDC → USDT
+            # Step 1: USDC → USDT (deduct taker fee)
             usdc_usdt = prices.get("USDC_USDT", 1.0)
-            amount = amount * usdc_usdt  # Buy USDT with USDC
+            amount = amount * usdc_usdt * fee_mul
 
-            # Step 2: USDT → DAI
+            # Step 2: USDT → DAI (deduct taker fee)
             usdt_dai = prices.get("USDT_DAI", 1.0)
-            amount = amount * usdt_dai  # Buy DAI with USDT
+            amount = amount * usdt_dai * fee_mul
 
-            # Step 3: DAI → USDC
+            # Step 3: DAI → USDC (deduct taker fee)
             dai_usdc = prices.get("DAI_USDC", 1.0)
-            amount = amount * dai_usdc  # Buy USDC with DAI
+            amount = amount * dai_usdc * fee_mul
 
             end_amount = amount
             profit_pct = (end_amount - start_amount) / start_amount * 100
@@ -220,11 +225,19 @@ class StablecoinArbBot:
 
         return prices
 
-    def get_best_opportunity(self) -> Optional[TriangleOpportunity]:
-        """Get the best current opportunity"""
+    def get_best_opportunity(self, max_age_seconds: float = 10.0) -> Optional[TriangleOpportunity]:
+        """Return the most profitable opportunity seen within max_age_seconds.
+
+        Stale entries are ignored so callers always get a live signal.
+        """
         if not self.opportunities:
             return None
-        return max(self.opportunities, key=lambda x: x.profit_usd)
+        now = datetime.now()
+        recent = [o for o in self.opportunities
+                  if (now - o.timestamp).total_seconds() <= max_age_seconds]
+        if not recent:
+            return None
+        return max(recent, key=lambda x: x.profit_usd)
 
 
 async def main():
