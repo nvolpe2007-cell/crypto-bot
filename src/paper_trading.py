@@ -1551,8 +1551,8 @@ def _save_open_positions(trader):
                 'total_pnl': trader.account.total_pnl,
                 'positions': out,
             }, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"[POSITIONS] Failed to save open positions to {_POSITIONS_FILE}: {e}")
 
 
 def _load_open_positions(trader):
@@ -1578,14 +1578,16 @@ def _load_open_positions(trader):
                 )
                 trader.account.positions[p['symbol']] = pos
                 restored += 1
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[POSITIONS] Could not restore position {p.get('symbol', '?')}: {e}")
                 continue
         # Restore cash if it matches better than what we'd otherwise start with
         if 'cash' in state and state['cash'] < trader.account.cash:
             trader.account.cash = float(state['cash'])
             trader.account.total_pnl = float(state.get('total_pnl', 0.0))
         return restored
-    except Exception:
+    except Exception as e:
+        logger.error(f"[POSITIONS] Failed to load open positions from {_POSITIONS_FILE}: {e}")
         return 0
 
 

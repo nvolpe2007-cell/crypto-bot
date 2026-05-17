@@ -119,15 +119,20 @@ class TestBuySignalEmission:
         assert det.get_signal(ETH) == 'BUY'
         assert det.get_signal(SOL) == 'BUY'
 
-    def test_nominal_threshold_move_no_signal_due_to_floating_point(self, det, clock):
+    def test_exact_threshold_triggers_signal(self, det, clock):
         """
-        BASE * (1 + THRESH) produces a price where the calculated move is
-        microscopically below THRESH due to IEEE 754 rounding, so no signal
-        fires.  Reliable signal emission requires a margin above THRESH.
+        The threshold check is `abs(move) < threshold` (strict less-than), so a
+        move that equals THRESH exactly IS sufficient to emit a signal.
+
+        On CPython 3.11+ / x86-64, BASE * (1 + THRESH) evaluates to exactly
+        BASE + BASE*THRESH with no rounding loss for these particular values
+        (50000 * 1.002 == 50100.0 exactly), so move == THRESH and the signal
+        fires.  To reliably suppress the signal, use a price below the threshold
+        (see test_move_just_below_threshold_no_signal).
         """
         _prime(det, clock)
-        det.update_price(BTC, BASE * (1 + THRESH))   # FP: measured move < threshold
-        assert det.get_signal(ETH) is None
+        det.update_price(BTC, BASE * (1 + THRESH))
+        assert det.get_signal(ETH) == 'BUY'
 
     def test_move_above_threshold_with_margin_emits_signal(self, det, clock):
         """A move 10% above threshold reliably clears the FP rounding margin."""
