@@ -105,8 +105,8 @@ class RegimeDetector:
     def __init__(self,
                  adx_trend_threshold: float = 22.0,
                  adx_ranging_threshold: float = 18.0,
-                 rsi_std_volatile: float = 8.0,    # lower for 1m (RSI swings less per bar)
-                 atr_pct_volatile: float = 0.08,   # lower for 1m (ATR is tiny relative to price)
+                 rsi_std_volatile: float = 15.0,   # 1m crypto RSI swings widely; 8 was always VOLATILE
+                 atr_pct_volatile: float = 0.25,   # 1m BTC ATR ~0.1%/bar; 0.08 was always VOLATILE
                  crash_rsi_threshold: float = 32.0,
                  crash_ema_gap_pct: float = -4.0,
                  lookback: int = 20):

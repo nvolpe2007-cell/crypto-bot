@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_MOVE_THRESHOLD  = 0.0030   # 0.30% BTC move triggers signal
+_MOVE_THRESHOLD  = 0.0020   # 0.20% BTC move triggers signal (0.30% was too rare on 1m)
 _SIGNAL_DECAY_S  = 180       # signal valid for 3 minutes
 _WINDOW_S        = 60        # measure BTC move over last 60 seconds
 _REVERSAL_THRESH = 0.0015    # 0.15% reversal cancels the signal

@@ -66,7 +66,7 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
 _ADAPT_FILE = 'logs/strategy_adaptations.json'
 
 _adapt: Dict = {
-    'min_confidence':     38.0,   # starts permissive, tightens adaptively after losses
+    'min_confidence':     55.0,   # require multi-signal confirmation; adapts after streaks
     'loss_streak':        0,
     'win_streak':         0,
     'total_trades':       0,
@@ -181,13 +181,54 @@ def _diagnose(side: str, pnl: float, exit_reason: str, holding_min: float,
     return issues, positives
 
 
-def _record_to_journal(journal, trade, symbol, reason, sig, regime):
+def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
     now = datetime.now(timezone.utc)
+    entry_dt = trade.entry_time if isinstance(trade.entry_time, datetime) else now
+    exit_dt  = trade.exit_time  if isinstance(trade.exit_time, datetime)  else now
+    hold_sec = (exit_dt - entry_dt).total_seconds()
+
+    # MFE / MAE from the position's peak tracking
+    mfe_pct = mae_pct = 0.0
+    entry_price_actual = trade.entry_price
+    if pos is not None and pos.entry_price > 0:
+        if pos.side == 'buy':
+            mfe_pct = (pos.peak_favorable_price - pos.entry_price) / pos.entry_price * 100
+            mae_pct = (pos.peak_adverse_price   - pos.entry_price) / pos.entry_price * 100
+        else:   # short
+            mfe_pct = (pos.entry_price - pos.peak_favorable_price) / pos.entry_price * 100
+            mae_pct = (pos.entry_price - pos.peak_adverse_price)   / pos.entry_price * 100
+        entry_price_actual = pos.entry_price
+
+    # Direction: use position side when we have it; signal can be the exit signal flip
+    direction = pos.side if pos else ('buy' if sig and sig.signal == Signal.BUY else 'short')
+    if direction == 'sell': direction = 'short'
+
+    # SL/TP from signal
+    sl_price = tp_price = 0.0
+    if sig is not None and hasattr(sig, 'close') and sig.close:
+        if direction == 'buy':
+            sl_price = sig.close * (1 - sig.stop_loss_pct() / 100)   if hasattr(sig, 'stop_loss_pct')   else 0.0
+            tp_price = sig.close * (1 + sig.take_profit_pct() / 100) if hasattr(sig, 'take_profit_pct') else 0.0
+        else:
+            sl_price = sig.close * (1 + sig.stop_loss_pct() / 100)   if hasattr(sig, 'stop_loss_pct')   else 0.0
+            tp_price = sig.close * (1 - sig.take_profit_pct() / 100) if hasattr(sig, 'take_profit_pct') else 0.0
+
+    # Risk / fee metrics
+    fees_paid = getattr(trade, 'fees', 0.0) or 0.0
+    fees_pct_of_pnl = (fees_paid / abs(trade.pnl) * 100) if trade.pnl else 0.0
+
+    # R-multiple: pnl / (planned risk on stop)
+    r_multiple = 0.0
+    if sig and hasattr(sig, 'stop_loss_pct') and sig.stop_loss_pct() > 0 and pos:
+        planned_risk = pos.size_usd_target * (sig.stop_loss_pct() / 100)
+        if planned_risk > 0:
+            r_multiple = trade.pnl / planned_risk
+
     record = TradeRecord(
         trade_id    = f"{symbol}_{int(now.timestamp())}",
         symbol      = symbol,
-        opened_at   = trade.entry_time.isoformat() if hasattr(trade.entry_time, 'isoformat') else str(trade.entry_time),
-        closed_at   = now.isoformat(),
+        opened_at   = entry_dt.isoformat() if hasattr(entry_dt, 'isoformat') else str(entry_dt),
+        closed_at   = exit_dt.isoformat()  if hasattr(exit_dt,  'isoformat') else str(exit_dt),
         rsi          = sig.rsi if sig else 50.0,
         adx          = sig.adx if sig else 20.0,
         volume_ratio = sig.volume_ratio if sig else 1.0,
@@ -195,17 +236,15 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime):
         atr_pct      = (sig.atr / sig.close * 100) if sig and sig.atr and sig.close else 1.0,
         ema100_gap   = 0.0,
         ema200_gap   = 0.0,
-        hour_utc     = now.hour,
-        day_of_week  = now.weekday(),
+        hour_utc     = entry_dt.hour,
+        day_of_week  = entry_dt.weekday(),
         pnl          = round(trade.pnl, 4),
         pnl_pct      = round(trade.pnl_pct, 2),
         won          = trade.pnl > 0,
         reason       = reason,
         # Extended ML features from signal context
         ofi               = float(sig.ofi or 0.0) if sig else 0.0,
-        # Normalized 0-1: positive score means lead-lag confirmed direction
         lead_lag_strength = max(0.0, sig.lead_lag_score) / 20.0 if sig else 0.0,
-        # True when BTC lead direction matched the entry direction
         lead_lag_aligned  = (sig.lead_lag_dir == ('BUY' if (sig and sig.signal == Signal.BUY) else 'SELL')) if sig and sig.lead_lag_dir else False,
         confidence        = float(sig.confidence) if sig else 0.0,
         ofi_score         = float(sig.ofi_score) if sig else 0.0,
@@ -213,8 +252,38 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime):
         regime_score      = float(sig.regime_score) if sig else 0.0,
         regime_confidence = 0.5,
         funding_rate      = float(sig.funding_rate or 0.0) if sig else 0.0,
-        # Entry direction — derived from signal, not the close-trade action
-        direction         = 'buy' if sig and sig.signal == Signal.BUY else 'short',
+        direction         = direction,
+        # Post-mortem (excursion + exit context)
+        mfe_pct            = round(mfe_pct, 3),
+        mae_pct            = round(mae_pct, 3),
+        time_in_trade_sec  = round(hold_sec, 1),
+        regime_at_exit     = regime,
+        rsi_at_exit        = sig.rsi if sig else 0.0,
+        adx_at_exit        = sig.adx if sig else 0.0,
+        exit_price         = round(trade.exit_price, 6),
+        # Entry pathway + pricing
+        entry_path         = getattr(pos, 'entry_path', 'main') if pos else 'main',
+        entry_price        = round(entry_price_actual, 6),
+        position_size_usd  = round(getattr(pos, 'size_usd_target', 0.0), 4) if pos else 0.0,
+        stop_loss_price    = round(sl_price, 6),
+        take_profit_price  = round(tp_price, 6),
+        fees_paid          = round(fees_paid, 4),
+        slippage_cost      = 0.0,   # captured via entry vs sig.close drift if needed later
+        spread_at_entry    = round(getattr(pos, 'spread_at_entry', 0.0), 6) if pos else 0.0,
+        # Sub-scores
+        rsi_score          = float(getattr(sig, 'rsi_score', 0.0))       if sig else 0.0,
+        technical_score    = float(getattr(sig, 'technical_score', 0.0)) if sig else 0.0,
+        funding_score      = float(getattr(sig, 'funding_score', 0.0))   if sig else 0.0,
+        # Indicator snapshot
+        ema_fast           = float(getattr(sig, 'ema_fast', 0.0)) if sig else 0.0,
+        ema_slow           = float(getattr(sig, 'ema_slow', 0.0)) if sig else 0.0,
+        atr_at_entry       = float(getattr(sig, 'atr', 0.0))      if sig else 0.0,
+        # Market context
+        sentiment_fng      = getattr(pos, 'sentiment_fng', None) if pos else None,
+        sentiment_btc_dom  = getattr(pos, 'sentiment_btc_dom', None) if pos else None,
+        # Realized metrics
+        r_multiple         = round(r_multiple, 3),
+        fees_pct_of_pnl    = round(fees_pct_of_pnl, 2),
     )
     journal.add(record)
     return record
@@ -231,6 +300,16 @@ class PaperPosition:
     entry_fee:       float = 0.0
     unrealized_pnl:  float = 0.0
     entry_signal:    Optional[ScientificSignal] = None   # full signal context
+    # Excursion tracking (updated each tick)
+    peak_favorable_price: float = 0.0    # best price for the position
+    peak_adverse_price:   float = 0.0    # worst price for the position
+    # Entry pathway: 'main' / 'mr' / 'mr-extreme' / 'fast-track'
+    entry_path:      str = 'main'
+    # Pre-trade context snapshot
+    size_usd_target: float = 0.0
+    spread_at_entry: float = 0.0
+    sentiment_fng:   Optional[int]   = None
+    sentiment_btc_dom: Optional[float] = None
 
 
 @dataclass
@@ -253,16 +332,32 @@ class PaperTrader:
         self.account          = PaperAccount(initial_capital=initial_capital, cash=initial_capital)
         self.position_size    = position_size
         self.fee_pct          = fee_pct / 100
-        self.slippage_pct     = slippage_pct / 100
+        self.slippage_pct     = slippage_pct / 100   # floor / fallback
         self.stop_loss_pct    = stop_loss_pct / 100
         self.take_profit_pct  = take_profit_pct / 100
         self.running          = False
         self._started_at: Optional[str] = None
+        # Live spread cache populated by paper_trading main loop; used for realistic slippage
+        self.live_spreads: Dict[str, float] = {}   # symbol → current spread in price units
+
+    def _slippage_pct_for(self, symbol: str, price: float) -> float:
+        """
+        Realistic slippage = max(floor, 0.5 × spread_pct).
+        On a market order you cross half the spread on entry, half on exit; thin pairs / wide spreads
+        give more slippage. Falls back to flat self.slippage_pct when no spread data.
+        """
+        spread = self.live_spreads.get(symbol, 0.0)
+        if spread > 0 and price > 0:
+            spread_pct = spread / price
+            # Cap slippage to avoid pathological book reads (max 0.5%)
+            return max(self.slippage_pct, min(0.005, spread_pct * 0.5))
+        return self.slippage_pct
 
     def execute_buy(self, symbol: str, price: float, timestamp: datetime,
                     size_usd: float, signal: Optional[ScientificSignal] = None) -> Optional[PaperPosition]:
         size       = size_usd / price
-        exec_price = price * (1 + self.slippage_pct)
+        slip       = self._slippage_pct_for(symbol, price)
+        exec_price = price * (1 + slip)
         fee        = exec_price * size * self.fee_pct
         total_cost = exec_price * size + fee
 
@@ -276,7 +371,10 @@ class PaperTrader:
 
         self.account.cash -= total_cost
         pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
-                            size=size, side='buy', entry_fee=fee, entry_signal=signal)
+                            size=size, side='buy', entry_fee=fee, entry_signal=signal,
+                            peak_favorable_price=exec_price,
+                            peak_adverse_price=exec_price,
+                            size_usd_target=size_usd)
         self.account.positions[symbol] = pos
         logger.info(f"[BUY]  {symbol} @ ${exec_price:,.2f}  ${size_usd:.2f}  conf={signal.confidence:.0f}%" if signal else f"[BUY]  {symbol} @ ${exec_price:,.2f}")
         return pos
@@ -286,7 +384,8 @@ class PaperTrader:
         if symbol not in self.account.positions:
             return None
         pos        = self.account.positions[symbol]
-        exec_price = price * (1 - self.slippage_pct)
+        slip       = self._slippage_pct_for(symbol, price)
+        exec_price = price * (1 - slip)
         exit_fee   = exec_price * pos.size * self.fee_pct
         total_fees = exit_fee + pos.entry_fee
         pnl        = (exec_price - pos.entry_price) * pos.size - total_fees
@@ -305,7 +404,8 @@ class PaperTrader:
     def execute_short(self, symbol: str, price: float, timestamp: datetime,
                       size_usd: float, signal: Optional[ScientificSignal] = None) -> Optional[PaperPosition]:
         size       = size_usd / price
-        exec_price = price * (1 - self.slippage_pct)
+        slip       = self._slippage_pct_for(symbol, price)
+        exec_price = price * (1 - slip)
         fee        = exec_price * size * self.fee_pct
         margin     = exec_price * size + fee
         if margin > self.account.cash:
@@ -316,7 +416,10 @@ class PaperTrader:
             return None
         self.account.cash -= margin
         pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
-                            size=size, side='short', entry_fee=fee, entry_signal=signal)
+                            size=size, side='short', entry_fee=fee, entry_signal=signal,
+                            peak_favorable_price=exec_price,
+                            peak_adverse_price=exec_price,
+                            size_usd_target=size_usd)
         self.account.positions[symbol] = pos
         logger.info(f"[SHORT] {symbol} @ ${exec_price:,.2f}  ${size_usd:.2f}  conf={signal.confidence:.0f}%" if signal else f"[SHORT] {symbol} @ ${exec_price:,.2f}")
         return pos
@@ -328,7 +431,8 @@ class PaperTrader:
         pos = self.account.positions[symbol]
         if pos.side != 'short':
             return self.execute_sell(symbol, price, timestamp, reason)
-        exec_price  = price * (1 + self.slippage_pct)
+        slip        = self._slippage_pct_for(symbol, price)
+        exec_price  = price * (1 + slip)
         exit_fee    = exec_price * pos.size * self.fee_pct
         total_fees  = exit_fee + pos.entry_fee
         pnl         = (pos.entry_price - exec_price) * pos.size - total_fees
@@ -350,6 +454,13 @@ class PaperTrader:
             if sym in prices:
                 p = prices[sym]
                 pos.unrealized_pnl = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
+                # Track excursions (favorable = direction we want, adverse = against us)
+                if pos.side == 'buy':
+                    if p > pos.peak_favorable_price: pos.peak_favorable_price = p
+                    if p < pos.peak_adverse_price:   pos.peak_adverse_price   = p
+                else:   # short
+                    if p < pos.peak_favorable_price: pos.peak_favorable_price = p
+                    if p > pos.peak_adverse_price:   pos.peak_adverse_price   = p
 
     def get_account_summary(self) -> Dict:
         pos_val  = sum(p.entry_price * p.size + p.unrealized_pnl for p in self.account.positions.values())
@@ -396,6 +507,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     logger.info(f"Starting paper trading session for {symbols}")
 
     _load_adaptations()
+    restored = _load_open_positions(trader)
+    if restored:
+        logger.info(f"[RESUME] Restored {restored} open position(s) from disk")
 
     # ── Subsystems ─────────────────────────────────────────────────────────────
     strategy        = MicrostructureStrategy()
@@ -532,6 +646,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
                         _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
                                          notifier, journal, ml_scorer)
+                        _record_exit(sym, exit_reason)
 
     asyncio.create_task(_sltp_watcher())
 
@@ -584,6 +699,63 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     last_eval_time:    Dict[str, float]        = {}   # throttle per symbol
     EVAL_INTERVAL = 2.0   # seconds between strategy evaluations per symbol
 
+    # ── Risk-control state ───────────────────────────────────────────────────────
+    # Cooldowns prevent re-entering the same losing setup. Bar-dedup prevents
+    # multiple entries per bar from intra-bar signal flicker (live-price injection
+    # mutates the in-progress candle every tick, so EMA cross can briefly fire).
+    last_exit_time:     Dict[str, float] = {}   # unix-ts of last exit per symbol
+    last_exit_reason:   Dict[str, str]   = {}   # exit type → drives cooldown length
+    last_entry_bar:     Dict[str, float] = {}   # bar-ts of last entry attempt
+    last_ws_price_time: Dict[str, float] = {}   # when WS price last refreshed
+    last_heartbeat:     float            = 0.0  # for periodic status log
+
+    # Tunables
+    COOLDOWN_AFTER_STOP_SEC   = 300.0   # 5 min after STOP_LOSS / SL / signal_stop
+    COOLDOWN_AFTER_SIGNAL_SEC = 60.0    # 1 min after signal-driven exits
+    MAX_OPEN_POSITIONS        = 2        # cap simultaneous positions
+    WS_PRICE_STALENESS_SEC    = 12.0    # skip entry if WS price older than this
+    CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
+    HEARTBEAT_INTERVAL_SEC    = 60.0
+
+    def _cooldown_for(reason: str) -> float:
+        r = (reason or '').upper()
+        if 'STOP' in r:           return COOLDOWN_AFTER_STOP_SEC
+        return COOLDOWN_AFTER_SIGNAL_SEC
+
+    def _has_correlated_position(sym: str, side: str) -> bool:
+        for group in CORRELATED_GROUPS:
+            if sym not in group:
+                continue
+            for other_sym, other_pos in trader.account.positions.items():
+                if other_sym == sym or other_sym not in group:
+                    continue
+                if other_pos.side == side:
+                    return True
+        return False
+
+    def _record_exit(sym: str, reason: str):
+        last_exit_time[sym]   = time.time()
+        last_exit_reason[sym] = reason or ''
+
+    def _kill_filter_skip(sym: str, df: pd.DataFrame) -> Optional[str]:
+        """Quick pre-entry check for funding-extreme + whale-print only.
+        WS-stale, daily-loss, max-positions, correlation are handled elsewhere.
+        Returns reason string if should skip, else None."""
+        # Funding rate extreme — when paying >0.1% per 8h, longs are very expensive
+        fr = _get_funding_rate(sym)
+        if fr is not None and abs(fr) > 0.001:
+            return f"FUNDING_EXTREME ({fr:.4f}/8h)"
+        # Whale print — current candle volume > 10× SMA20 suggests a market mover
+        try:
+            if len(df) >= 21:
+                cur_vol = float(df['volume'].iloc[-1])
+                sma20   = float(df['volume'].rolling(20).mean().iloc[-2])  # exclude current
+                if sma20 > 0 and cur_vol > sma20 * 10.0:
+                    return f"WHALE_PRINT ({cur_vol/sma20:.1f}× SMA20)"
+        except Exception:
+            pass
+        return None
+
     async def _seed_cache():
         """Populate cache before the tick loop starts."""
         for sym in symbols:
@@ -626,6 +798,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             result = regime_detector.detect(ohlcv_cache[sym])
                             if result:
                                 regime_cache[sym] = result.to_dict()
+                                logger.debug(f"[REGIME] {sym}: {result.regime} conf={result.confidence:.2f} adx={result.adx:.1f}")
+                            else:
+                                logger.debug(f"[REGIME] {sym}: detect() returned None (bars={len(ohlcv_cache[sym])})")
                             # Feed latest candle into CVD tracker (fallback when WS unavailable)
                             if not public_ws:
                                 df_feed = ohlcv_cache[sym]
@@ -708,7 +883,12 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     continue
 
                 # Live price from WebSocket; fall back to last candle close
-                current_price = ws_prices.get(symbol) or prices.get(symbol)
+                ws_price = ws_prices.get(symbol)
+                if ws_price:
+                    current_price = ws_price
+                    last_ws_price_time[symbol] = now_ts
+                else:
+                    current_price = prices.get(symbol)
                 if not current_price:
                     continue
 
@@ -743,6 +923,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         # Update volume SMA for whale filter
                         vol_sma20 = float(df['volume'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
                         strategy.update_volume_sma(symbol, vol_sma20)
+                        # Feed live spread into trader for realistic slippage
+                        if bids_raw and asks_raw and len(bids_raw[0]) >= 1 and len(asks_raw[0]) >= 1:
+                            try:
+                                best_bid = float(bids_raw[0][0])
+                                best_ask = float(asks_raw[0][0])
+                                if best_ask > best_bid > 0:
+                                    trader.live_spreads[symbol] = best_ask - best_bid
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.debug(f"[OFI] order book fetch failed for {symbol}: {e}")
 
@@ -792,6 +981,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 equity_curve.append({'t': _ts(datetime.now(timezone.utc)), 'v': round(summary['total_equity'], 2)})
                                 _on_trade_closed(symbol, pos_check, trade, exit_reason,
                                                  summary['total_equity'], notifier, journal, ml_scorer)
+                                _record_exit(symbol, exit_reason)
                         continue   # skip entry logic this tick after an exit
 
                 # ── Strategy evaluation ────────────────────────────────────────
@@ -801,6 +991,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 if sig is None:
                     continue
 
+                # Track which pathway produced this signal — set by each branch below
+                _entry_path_tag = 'main'
+
                 # ── Multi-timeframe alignment adjustment ───────────────────────
                 if sig.signal != Signal.HOLD:
                     mtf_adj = htf_filter.alignment_score(symbol, is_buy=sig.is_buy)
@@ -808,19 +1001,33 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         sig.confidence = max(0.0, min(100.0, sig.confidence + mtf_adj))
                         sig.size_mult  = _get_size_mult(sig.confidence)
 
-                # ── Mean-reversion fallback for RANGING regime ─────────────────
-                if sig.signal == Signal.HOLD and regime_name == 'RANGING':
+                # ── Mean-reversion: fires in non-trending regimes OR on extreme RSI ─
+                # MR is a separate edge (tight stops, BB+RSI mean reversion).
+                # Conditions: main signal HOLD AND (non-trending regime OR extreme RSI),
+                # so we capture short scalp opportunities without fighting trends.
+                _mr_ok_regime = regime_name in ('RANGING', 'VOLATILE', 'UNKNOWN')
+                if sig.signal == Signal.HOLD and _mr_ok_regime:
                     mr_sig = mr_strategy.get_latest_signal(df)
-                    if mr_sig and mr_sig.signal != Signal.HOLD:
-                        mr_conf = 65.0
+                    # Allow MR if it has any signal in non-trending regime,
+                    # OR if RSI is at an extreme (≤27 or ≥73) even outside RANGING
+                    _rsi_extreme = mr_sig and (
+                        (mr_sig.is_buy  and mr_sig.rsi <= 27) or
+                        (mr_sig.is_sell and mr_sig.rsi >= 73)
+                    )
+                    if mr_sig and mr_sig.signal != Signal.HOLD and (
+                        regime_name == 'RANGING' or _rsi_extreme
+                    ):
+                        # Higher confidence for the extreme-RSI variant (higher edge)
+                        mr_conf = 70.0 if _rsi_extreme else 62.0
+                        regime_score_mr = 12.0 if regime_name == 'RANGING' else 8.0
                         sig = ScientificSignal(
                             signal          = mr_sig.signal,
                             confidence      = mr_conf,
                             size_mult       = _get_size_mult(mr_conf),
                             ofi_score       = 0.0,
                             lead_lag_score  = 0.0,
-                            regime_score    = 12.0,   # RANGING regime score
-                            rsi_score       = 15.0 if (mr_sig.is_buy and mr_sig.rsi < 35) or (mr_sig.is_sell and mr_sig.rsi > 65) else 8.0,
+                            regime_score    = regime_score_mr,
+                            rsi_score       = 15.0 if _rsi_extreme else 8.0,
                             technical_score = 8.0,
                             funding_score   = 0.0,
                             ofi             = ofi_calc.get_smoothed(symbol),
@@ -835,7 +1042,51 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             volume_ratio    = 1.0,
                             funding_rate    = funding_rate,
                         )
-                        logger.info(f"[MR] {symbol} RANGING fallback: {mr_sig.signal.value} conf={mr_conf:.0f}")
+                        _entry_path_tag = 'mr-extreme' if _rsi_extreme else 'mr'
+                        tag = "RSI-extreme" if _rsi_extreme else regime_name
+                        logger.info(f"[MR] {symbol} {tag}: {mr_sig.signal.value} conf={mr_conf:.0f} rsi={mr_sig.rsi:.1f}")
+
+                # ── OFI + Lead-Lag fast-track: documented short-term edge ──────
+                # When OFI is strongly directional AND BTC just led same direction,
+                # this is a high-edge setup that bypasses the conf=55 gate but
+                # still requires conf ≥ 50 and matching directional signals.
+                if sig.signal == Signal.HOLD:
+                    ofi_now = ofi_calc.get_smoothed(symbol) if ofi_calc else None
+                    lead_dir_now = lead_lag.get_signal(symbol)
+                    lead_strength_now = lead_lag.get_strength(symbol)
+                    if (ofi_now is not None and abs(ofi_now) >= 0.30
+                        and lead_dir_now is not None
+                        and lead_strength_now > 0.4):
+                        ofi_dir = 'BUY' if ofi_now > 0 else 'SELL'
+                        if ofi_dir == lead_dir_now and regime_name != 'CRASH':
+                            ft_signal = Signal.BUY if ofi_dir == 'BUY' else Signal.SELL
+                            # Don't short into a strong uptrend
+                            if not (ft_signal == Signal.SELL and regime_name == 'TRENDING_UP'):
+                                ft_conf = 55.0 + min(15.0, (abs(ofi_now) - 0.30) * 50)  # 55-70 range
+                                sig = ScientificSignal(
+                                    signal          = ft_signal,
+                                    confidence      = ft_conf,
+                                    size_mult       = _get_size_mult(ft_conf),
+                                    ofi_score       = 20.0,
+                                    lead_lag_score  = 15.0,
+                                    regime_score    = 10.0,
+                                    rsi_score       = 5.0,
+                                    technical_score = 5.0,
+                                    funding_score   = 0.0,
+                                    ofi             = ofi_now,
+                                    lead_lag_dir    = lead_dir_now,
+                                    regime          = regime_name,
+                                    rsi             = 50.0,
+                                    adx             = 20.0,
+                                    atr             = float(df['close'].iloc[-1]) * 0.005,
+                                    close           = float(df['close'].iloc[-1]),
+                                    ema_fast        = float(df['close'].iloc[-1]),
+                                    ema_slow        = float(df['close'].iloc[-1]),
+                                    volume_ratio    = 1.0,
+                                    funding_rate    = funding_rate,
+                                )
+                                _entry_path_tag = 'fast-track'
+                                logger.info(f"[FAST-TRACK] {symbol} OFI={ofi_now:+.2f} Lead={lead_dir_now} → {ft_signal.value} conf={ft_conf:.0f}")
 
                 # Update indicators dashboard
                 indicators[symbol] = {
@@ -869,9 +1120,45 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if sig.confidence < min_conf:
                         logger.debug(f"[SKIP BUY] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
                         continue
+                    # Cooldown after a recent exit on this symbol
+                    cd = _cooldown_for(last_exit_reason.get(symbol, ''))
+                    since_exit = now_ts - last_exit_time.get(symbol, 0)
+                    if since_exit < cd:
+                        logger.debug(f"[SKIP BUY] {symbol} — cooldown ({since_exit:.0f}s < {cd:.0f}s after {last_exit_reason.get(symbol,'')})")
+                        continue
+                    # Per-bar entry dedup — prevents intra-bar signal flicker re-entries
+                    try:
+                        bar_ts = float(df.index[-1].timestamp())
+                    except Exception:
+                        bar_ts = now_ts
+                    if last_entry_bar.get(symbol) == bar_ts:
+                        logger.debug(f"[SKIP BUY] {symbol} — already evaluated this bar")
+                        continue
+                    # WS price staleness
+                    ws_age = now_ts - last_ws_price_time.get(symbol, 0)
+                    if last_ws_price_time.get(symbol, 0) > 0 and ws_age > WS_PRICE_STALENESS_SEC:
+                        logger.info(f"[SKIP BUY] {symbol} — WS price stale ({ws_age:.0f}s)")
+                        continue
+                    # Max concurrent positions
+                    if len(trader.account.positions) >= MAX_OPEN_POSITIONS:
+                        logger.debug(f"[SKIP BUY] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
+                        continue
+                    # Anti-correlation: don't double-up on correlated crypto longs
+                    if _has_correlated_position(symbol, 'buy'):
+                        logger.info(f"[SKIP BUY] {symbol} — correlated long already open")
+                        continue
+                    # Skip if OFI data is available but actively opposes direction
+                    if sig.ofi is not None and sig.ofi_score < 0:
+                        logger.info(f"[SKIP BUY] {symbol} — OFI={sig.ofi:.2f} opposes long (score={sig.ofi_score:.0f})")
+                        continue
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         logger.info(f"[SKIP BUY] {symbol} — sentiment blocked (F&G extreme fear)")
                         continue
+                    kf_reason = _kill_filter_skip(symbol, df)
+                    if kf_reason:
+                        logger.info(f"[SKIP BUY] {symbol} — {kf_reason}")
+                        continue
+                    last_entry_bar[symbol] = bar_ts
 
                     # Position size from confidence + equity
                     size_usd = compute_position_size(sig.confidence, current_equity)
@@ -883,20 +1170,60 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
-                    if position and notifier:
-                        notifier.send_trade_alert(
-                            action="BUY", symbol=symbol, price=current_price,
-                            size=size_usd, signal=sig,
-                        )
+                    if position:
+                        # Tag entry pathway and snapshot market context for the journal
+                        position.entry_path = _entry_path_tag
+                        _annotate_position_context(position, symbol, sentiment_monitor, strategy)
+                        if notifier:
+                            notifier.send_trade_alert(
+                                action="BUY", symbol=symbol, price=current_price,
+                                size=size_usd, signal=sig,
+                            )
 
                 # ── SHORT ENTRY ─────────────────────────────────────────────────
                 elif sig.is_sell and pos is None:
                     if sig.confidence < min_conf:
                         logger.debug(f"[SKIP SELL] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
                         continue
+                    # Cooldown after a recent exit
+                    cd = _cooldown_for(last_exit_reason.get(symbol, ''))
+                    since_exit = now_ts - last_exit_time.get(symbol, 0)
+                    if since_exit < cd:
+                        logger.debug(f"[SKIP SELL] {symbol} — cooldown ({since_exit:.0f}s < {cd:.0f}s)")
+                        continue
+                    # Per-bar entry dedup
+                    try:
+                        bar_ts = float(df.index[-1].timestamp())
+                    except Exception:
+                        bar_ts = now_ts
+                    if last_entry_bar.get(symbol) == bar_ts:
+                        logger.debug(f"[SKIP SELL] {symbol} — already evaluated this bar")
+                        continue
+                    # WS price staleness
+                    ws_age = now_ts - last_ws_price_time.get(symbol, 0)
+                    if last_ws_price_time.get(symbol, 0) > 0 and ws_age > WS_PRICE_STALENESS_SEC:
+                        logger.info(f"[SKIP SELL] {symbol} — WS price stale ({ws_age:.0f}s)")
+                        continue
+                    # Max concurrent positions
+                    if len(trader.account.positions) >= MAX_OPEN_POSITIONS:
+                        logger.debug(f"[SKIP SELL] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
+                        continue
+                    # Anti-correlation: don't double-up on correlated shorts
+                    if _has_correlated_position(symbol, 'short'):
+                        logger.info(f"[SKIP SELL] {symbol} — correlated short already open")
+                        continue
+                    # Skip if OFI data is available but actively opposes direction
+                    if sig.ofi is not None and sig.ofi_score < 0:
+                        logger.info(f"[SKIP SELL] {symbol} — OFI={sig.ofi:.2f} opposes short (score={sig.ofi_score:.0f})")
+                        continue
                     if regime_name == 'TRENDING_UP':
                         logger.info(f"[SKIP SHORT] {symbol} — TRENDING_UP blocks shorts")
                         continue
+                    kf_reason = _kill_filter_skip(symbol, df)
+                    if kf_reason:
+                        logger.info(f"[SKIP SELL] {symbol} — {kf_reason}")
+                        continue
+                    last_entry_bar[symbol] = bar_ts
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
@@ -906,11 +1233,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
-                    if position and notifier:
-                        notifier.send_trade_alert(
-                            action="SELL", symbol=symbol, price=current_price,
-                            size=size_usd, signal=sig,
-                        )
+                    if position:
+                        position.entry_path = _entry_path_tag
+                        _annotate_position_context(position, symbol, sentiment_monitor, strategy)
+                        if notifier:
+                            notifier.send_trade_alert(
+                                action="SELL", symbol=symbol, price=current_price,
+                                size=size_usd, signal=sig,
+                            )
 
                 # ── EXIT LONG ───────────────────────────────────────────────────
                 elif sig.signal == Signal.SELL and pos_side == 'buy':
@@ -922,6 +1252,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                         _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
                                          notifier, journal, ml_scorer)
+                        _record_exit(symbol, "SIGNAL")
 
                 # ── EXIT SHORT ──────────────────────────────────────────────────
                 elif pos_side == 'short' and (
@@ -934,6 +1265,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                         _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
                                          notifier, journal, ml_scorer)
+                        _record_exit(symbol, "SIGNAL")
 
             # Refresh CVaR weights
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
@@ -944,8 +1276,25 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 for sym, p in public_ws.get_prices().items():
                     if sym in symbols:
                         prices[sym] = p
+                        last_ws_price_time[sym] = time.time()
                         lead_lag.update_price(sym, p)
             trader.update_unrealized_pnl(prices)
+
+            # Heartbeat — log alive status once a minute so we know it's running
+            now_hb = time.time()
+            if now_hb - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                last_heartbeat = now_hb
+                s_hb = trader.get_account_summary()
+                wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
+                open_syms = ','.join(trader.account.positions.keys()) or 'none'
+                logger.info(
+                    f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
+                    f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
+                    f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
+                    f"open={open_syms} min_conf={_adapt['min_confidence']:.0f}"
+                )
+                # Persist open positions so a crash/restart can resume
+                _save_open_positions(trader)
 
             # State for dashboard
             summary = trader.get_account_summary()
@@ -1026,7 +1375,7 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
 
     issues, positives = _diagnose(pos.side, trade.pnl, exit_reason, holding_min, sig) if sig else ([], [])
 
-    _record_to_journal(journal, trade, symbol, exit_reason, sig, sig.regime if sig else 'UNKNOWN')
+    _record_to_journal(journal, trade, symbol, exit_reason, sig, sig.regime if sig else 'UNKNOWN', pos=pos)
 
     # Retrain ML model if enough new data has accumulated
     if ml_scorer is not None and ml_scorer.should_retrain():
@@ -1067,6 +1416,92 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
+
+_POSITIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'open_positions.json')
+
+
+def _save_open_positions(trader):
+    """Dump open positions to disk so a restart can resume them."""
+    try:
+        os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
+        out = []
+        for sym, pos in trader.account.positions.items():
+            out.append({
+                'symbol':           sym,
+                'side':             pos.side,
+                'entry_time':       pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                'entry_price':      pos.entry_price,
+                'size':             pos.size,
+                'entry_fee':        pos.entry_fee,
+                'peak_favorable':   pos.peak_favorable_price,
+                'peak_adverse':     pos.peak_adverse_price,
+                'entry_path':       pos.entry_path,
+                'size_usd_target':  pos.size_usd_target,
+            })
+        with open(_POSITIONS_FILE, 'w') as f:
+            json.dump({
+                'saved_at': datetime.now(timezone.utc).isoformat(),
+                'cash':     trader.account.cash,
+                'total_pnl': trader.account.total_pnl,
+                'positions': out,
+            }, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_open_positions(trader):
+    """Restore positions from disk on startup. Returns number restored."""
+    if not os.path.exists(_POSITIONS_FILE):
+        return 0
+    try:
+        with open(_POSITIONS_FILE) as f:
+            state = json.load(f)
+        restored = 0
+        for p in state.get('positions', []):
+            try:
+                pos = PaperPosition(
+                    entry_time      = datetime.fromisoformat(p['entry_time']),
+                    entry_price     = float(p['entry_price']),
+                    size            = float(p['size']),
+                    side            = p['side'],
+                    entry_fee       = float(p.get('entry_fee', 0.0)),
+                    peak_favorable_price = float(p.get('peak_favorable', p['entry_price'])),
+                    peak_adverse_price   = float(p.get('peak_adverse',   p['entry_price'])),
+                    entry_path      = p.get('entry_path', 'main'),
+                    size_usd_target = float(p.get('size_usd_target', 0.0)),
+                )
+                trader.account.positions[p['symbol']] = pos
+                restored += 1
+            except Exception:
+                continue
+        # Restore cash if it matches better than what we'd otherwise start with
+        if 'cash' in state and state['cash'] < trader.account.cash:
+            trader.account.cash = float(state['cash'])
+            trader.account.total_pnl = float(state.get('total_pnl', 0.0))
+        return restored
+    except Exception:
+        return 0
+
+
+def _annotate_position_context(position, symbol, sentiment_monitor, strategy):
+    """Snapshot market context onto a freshly-opened position for the journal."""
+    try:
+        # Spread from microstructure strategy's order book state
+        if hasattr(strategy, 'ofi_states') and symbol in strategy.ofi_states:
+            state = strategy.ofi_states.get(symbol)
+            if state and hasattr(state, 'spread'):
+                position.spread_at_entry = float(state.spread or 0.0)
+    except Exception:
+        pass
+    try:
+        if sentiment_monitor:
+            snap = sentiment_monitor.get_snapshot()
+            if snap:
+                position.sentiment_fng     = getattr(snap, 'fear_greed', None)
+                position.sentiment_btc_dom = getattr(snap, 'btc_dominance', None)
+    except Exception:
+        pass
+
 
 def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
     """Replace the last candle's close (and adjust high/low) with the live WebSocket price."""

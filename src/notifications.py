@@ -167,24 +167,26 @@ class TelegramNotifier:
         side   = "LONG" if is_buy else "SHORT"
         coin   = _coin(symbol)
 
-        lines = [f"{icon} <b>{side} {coin}</b>",
-                 f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>"]
+        lines = [
+            f"{icon} <b>TAKING TRADE: {side} {coin}</b>",
+            f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>",
+        ]
 
         if signal:
             conf = getattr(signal, 'confidence', None)
             if conf is not None:
                 lines.append(f"Confidence: <b>{conf:.0f}%</b> ({_conf_label(conf)})")
-            # Stop / target prices
             if hasattr(signal, 'stop_loss_pct') and callable(signal.stop_loss_pct):
                 sl = signal.stop_loss_pct() / 100
                 tp = signal.take_profit_pct() / 100
                 sl_price = price * (1 - sl) if is_buy else price * (1 + sl)
                 tp_price = price * (1 + tp) if is_buy else price * (1 - tp)
                 lines.append(f"Stop: ${sl_price:,.2f}   Target: ${tp_price:,.2f}")
-            # Key reason
             reasons = _entry_reasons(signal, is_buy)
             if reasons:
-                lines.append(f"<i>{reasons[0]}</i>")
+                lines.append("\n<b>Why:</b>")
+                for r in reasons:
+                    lines.append(f"  • {r}")
 
         return self.send_message("\n".join(lines))
 
@@ -214,29 +216,37 @@ class TelegramNotifier:
         label  = "WIN" if is_win else "LOSS"
         result = f"+${pnl:.2f}" if is_win else f"-${abs(pnl):.2f}"
         coin   = _coin(symbol)
+        held   = f"{holding_minutes:.0f} min" if holding_minutes < 60 else f"{holding_minutes/60:.1f}h"
 
-        msg = (
-            f"{icon} <b>{label}  {result}</b>\n"
-            f"{coin}   ${entry_price:,.2f} → ${exit_price:,.2f}\n"
-            f"Account: <b>${total_equity:,.2f}</b>"
-        )
+        lines = [
+            f"{icon} <b>{label}  {result}</b>",
+            f"{coin}   ${entry_price:,.2f} → ${exit_price:,.2f}",
+            f"{_exit_plain(exit_reason)}   held {held}",
+            f"Account: <b>${total_equity:,.2f}</b>",
+        ]
 
         if loss_streak >= 3:
-            msg += f"\n⚠️ {loss_streak} losses in a row"
+            lines.append(f"\n⚠️ {loss_streak} losses in a row")
         elif win_streak >= 3:
-            msg += f"\n🔥 {win_streak} wins in a row"
+            lines.append(f"\n🔥 {win_streak} wins in a row")
 
+        # What went wrong / what worked
+        if not is_win and issues:
+            lines.append("\n<b>What went wrong:</b>")
+            for issue in issues[:4]:
+                lines.append(f"  • {issue}")
+        elif is_win and positives:
+            lines.append("\n<b>What worked:</b>")
+            for p in positives[:3]:
+                lines.append(f"  • {p}")
+
+        # Learner adaptations
         if adaptations:
-            msg += f"\n🔄 Bot self-adjusted: {adaptations[0]}"
+            lines.append("\n<b>Learner adapts:</b>")
+            for a in adaptations:
+                lines.append(f"  • {a}")
 
-        if is_win and positives:
-            translated = _translate_issues(positives)
-            msg += f"\n✓ What worked: {translated[0]}"
-        elif not is_win and issues:
-            translated = _translate_issues(issues)
-            msg += f"\n✗ What went wrong: {translated[0]}"
-
-        return self.send_message(msg)
+        return self.send_message("\n".join(lines))
 
     # ── Simple win/loss (fallback when no signal available) ───────────────────
 

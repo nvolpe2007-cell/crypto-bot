@@ -1,12 +1,9 @@
 # deploy.ps1 - Upload and set up crypto bot on VPS
-# Usage: .\deploy\deploy.ps1 -IP "1.2.3.4" -Password "yourpassword"
+# Usage: .\deploy\deploy.ps1 -IP "1.2.3.4"
 
 param(
     [Parameter(Mandatory=$true)]
-    [string]$IP,
-
-    [Parameter(Mandatory=$true)]
-    [string]$Password
+    [string]$IP
 )
 
 $BOT_DIR = "D:\crypto-bot"
@@ -19,12 +16,12 @@ Write-Host "`n=== Deploying Crypto Bot to $IP ===" -ForegroundColor Cyan
 $sshCmd = "ssh"
 $scpCmd = "scp"
 
-# Upload files (excludes logs, data, __pycache__)
-Write-Host "`n[1/3] Uploading files..." -ForegroundColor Yellow
-$excludeFile = "$env:TEMP\rsync-exclude.txt"
-@("logs/", "data/", "__pycache__/", "*.pyc", ".git/") | Set-Content $excludeFile
+# Ensure remote directory exists before upload
+Write-Host "`n[0/3] Creating remote directory..." -ForegroundColor Yellow
+ssh -o StrictHostKeyChecking=no $REMOTE "mkdir -p $REMOTE_PATH"
 
-# Use scp to upload
+# Upload files
+Write-Host "`n[1/3] Uploading files..." -ForegroundColor Yellow
 scp -o StrictHostKeyChecking=no -r `
     "$BOT_DIR\src" `
     "$BOT_DIR\arbitrage" `
