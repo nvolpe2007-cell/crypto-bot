@@ -4,6 +4,7 @@ Coordinates data fetching, strategy signals, and trade execution
 """
 
 import asyncio
+import signal
 import yaml
 import os
 import logging
@@ -28,6 +29,7 @@ from .crypto_vol import CryptoVolMonitor
 from .state import read_state, write_state
 from .strategy_advisor import StrategyAdvisor
 from .trade_journal import TradeJournal
+from .task_supervisor import supervised
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'arbitrage'))
 from funding_scanner import FundingScanner
@@ -147,10 +149,10 @@ class ScalpingBot:
         vol_mon   = CryptoVolMonitor()
         journal   = TradeJournal()
         advisor   = StrategyAdvisor(notifier, journal)
-        asyncio.create_task(sentiment.start())
-        asyncio.create_task(public_ws.start())
-        asyncio.create_task(vol_mon.start())
-        asyncio.create_task(advisor.start())
+        asyncio.create_task(supervised('sentiment',   sentiment.start, notifier=notifier))
+        asyncio.create_task(supervised('public_ws',   public_ws.start, notifier=notifier))
+        asyncio.create_task(supervised('vol_monitor', vol_mon.start,   notifier=notifier))
+        asyncio.create_task(supervised('advisor',     advisor.start,   notifier=notifier))
         logger.info("WebSocket streams starting (public ticker + OHLC + IV monitor)")
 
         try:
@@ -190,11 +192,11 @@ class ScalpingBot:
         vol_mon    = CryptoVolMonitor()
         journal    = TradeJournal()
         advisor    = StrategyAdvisor(notifier, journal)
-        asyncio.create_task(sentiment.start())
-        asyncio.create_task(public_ws.start())
-        asyncio.create_task(private_ws.start())
-        asyncio.create_task(vol_mon.start())
-        asyncio.create_task(advisor.start())
+        asyncio.create_task(supervised('sentiment',   sentiment.start,   notifier=notifier))
+        asyncio.create_task(supervised('public_ws',   public_ws.start,   notifier=notifier))
+        asyncio.create_task(supervised('private_ws',  private_ws.start,  notifier=notifier))
+        asyncio.create_task(supervised('vol_monitor', vol_mon.start,     notifier=notifier))
+        asyncio.create_task(supervised('advisor',     advisor.start,     notifier=notifier))
         logger.info("[LIVE] WebSocket streams starting")
 
         risk_cfg = self.config.get('risk', {})
@@ -234,8 +236,8 @@ async def _run_funding_scanner():
                 state = read_state()
                 state['funding_opportunities'] = scanner.get_state()
                 write_state(state)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("[FundingScanner] State merge failed: %s", exc)
 
     await asyncio.gather(scanner.start(), _merge_state())
 
@@ -244,11 +246,30 @@ async def main():
     """Main entry point"""
     config = load_config()
     bot = ScalpingBot(config)
-    await asyncio.gather(
+
+    loop = asyncio.get_running_loop()
+    gather_task = asyncio.gather(
         bot.start(),
         run_dashboard(),
         _run_funding_scanner(),
     )
+
+    def _handle_shutdown():
+        logger.info("Shutdown signal received — cancelling bot tasks")
+        gather_task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_shutdown)
+        except (NotImplementedError, AttributeError):
+            # Windows does not support add_signal_handler; KeyboardInterrupt
+            # from SIGINT is caught by asyncio.run() instead.
+            pass
+
+    try:
+        await gather_task
+    except asyncio.CancelledError:
+        logger.info("Bot shutdown complete")
 
 
 if __name__ == '__main__':
