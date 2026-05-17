@@ -717,6 +717,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
     HEARTBEAT_INTERVAL_SEC    = 60.0
 
+    # Daily summary scheduler — fires once when UTC date rolls over
+    session_start_utc_date    = datetime.now(timezone.utc).date()
+    last_daily_summary_date   = session_start_utc_date   # don't fire one immediately on startup
+
     def _cooldown_for(reason: str) -> float:
         r = (reason or '').upper()
         if 'STOP' in r:           return COOLDOWN_AFTER_STOP_SEC
@@ -845,6 +849,28 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 logger.error(f"[CACHE] refresher error: {e}")
 
     asyncio.create_task(_candle_refresher())
+
+    # ── Startup notification (so we know systemd restarts after a crash) ──────
+    if notifier:
+        try:
+            stats_pre = journal.stats()
+            wr_pre = stats_pre.get('win_rate', 0.0)
+            total_pre = stats_pre.get('total', 0)
+            open_at_start = len(trader.account.positions)
+            startup_lines = [
+                f"🟢 <b>Bot online</b>",
+                f"Mode: <b>{mode}</b>   Pairs: {', '.join(symbols)}",
+                f"Equity: <b>${trader.get_account_summary()['total_equity']:.2f}</b>",
+                f"Min conf: <b>{_adapt['min_confidence']:.0f}</b>   Max positions: <b>{MAX_OPEN_POSITIONS}</b>",
+                f"Journal: {total_pre} prior trades, WR {wr_pre:.0f}%",
+            ]
+            if restored:
+                startup_lines.append(f"⚠️ Resumed {restored} open position(s) from disk")
+            elif open_at_start:
+                startup_lines.append(f"Open: {open_at_start} position(s)")
+            notifier.send_message("\n".join(startup_lines))
+        except Exception as e:
+            logger.error(f"[STARTUP] notify failed: {e}")
 
     # ── Main tick loop — evaluates every EVAL_INTERVAL seconds ─────────────────
     while trader.running:
@@ -1177,7 +1203,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         if notifier:
                             notifier.send_trade_alert(
                                 action="BUY", symbol=symbol, price=current_price,
-                                size=size_usd, signal=sig,
+                                size=size_usd, signal=sig, entry_path=_entry_path_tag,
                             )
 
                 # ── SHORT ENTRY ─────────────────────────────────────────────────
@@ -1239,7 +1265,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         if notifier:
                             notifier.send_trade_alert(
                                 action="SELL", symbol=symbol, price=current_price,
-                                size=size_usd, signal=sig,
+                                size=size_usd, signal=sig, entry_path=_entry_path_tag,
                             )
 
                 # ── EXIT LONG ───────────────────────────────────────────────────
@@ -1295,6 +1321,55 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 )
                 # Persist open positions so a crash/restart can resume
                 _save_open_positions(trader)
+
+            # Daily summary — fires once when UTC date rolls over
+            today_utc = datetime.now(timezone.utc).date()
+            if today_utc != last_daily_summary_date and notifier:
+                try:
+                    yesterday = last_daily_summary_date
+                    # Trades that closed on the previous UTC day
+                    day_trades = [
+                        r for r in journal.records
+                        if r.closed_at[:10] == yesterday.isoformat()
+                    ]
+                    n = len(day_trades)
+                    wins = sum(1 for r in day_trades if r.won)
+                    losses = n - wins
+                    best  = max((r.pnl for r in day_trades), default=0.0)
+                    worst = min((r.pnl for r in day_trades), default=0.0)
+
+                    # Build path + regime breakdowns
+                    def _group(items, key_fn):
+                        out = {}
+                        for r in items:
+                            k = key_fn(r)
+                            g = out.setdefault(k, {'n': 0, 'wins': 0, 'pnl': 0.0})
+                            g['n'] += 1
+                            if r.won: g['wins'] += 1
+                            g['pnl'] += r.pnl
+                        return {
+                            k: {'n': v['n'],
+                                'win_rate': (v['wins']/v['n']*100) if v['n'] else 0.0,
+                                'total_pnl': v['pnl']}
+                            for k, v in out.items()
+                        }
+
+                    path_stats   = _group(day_trades, lambda r: r.entry_path) if n else None
+                    regime_stats = _group(day_trades, lambda r: r.regime)     if n else None
+
+                    s_sum = trader.get_account_summary()
+                    notifier.send_daily_summary(
+                        total_equity   = s_sum['total_equity'],
+                        start_equity   = session_start_equity,
+                        trades         = n, wins = wins, losses = losses,
+                        best_trade     = best, worst_trade = worst,
+                        path_stats     = path_stats,
+                        regime_stats   = regime_stats,
+                        open_positions = len(trader.account.positions),
+                    )
+                except Exception as e:
+                    logger.error(f"[DAILY] summary send failed: {e}")
+                last_daily_summary_date = today_utc
 
             # State for dashboard
             summary = trader.get_account_summary()
@@ -1358,6 +1433,24 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     logger.info("Paper trading session ended")
     learner.log_summary()
 
+    # Shutdown notification — best-effort (systemd may have already SIGKILL'd us)
+    if notifier:
+        try:
+            _save_open_positions(trader)   # persist before we go down
+            s_end = trader.get_account_summary()
+            session_pnl = s_end['total_equity'] - session_start_equity
+            sign = '+' if session_pnl >= 0 else ''
+            open_n = len(trader.account.positions)
+            notifier.send_message(
+                f"🔴 <b>Bot shutting down</b>\n"
+                f"Session P&L: <b>{sign}${session_pnl:.2f}</b>\n"
+                f"Equity: <b>${s_end['total_equity']:.2f}</b>\n"
+                f"Trades: {s_end['closed_trades']} ({s_end['winning_trades']}W/{s_end['losing_trades']}L)"
+                + (f"\n⚠️ {open_n} position(s) still open — will resume on restart" if open_n else "")
+            )
+        except Exception as e:
+            logger.error(f"[SHUTDOWN] notify failed: {e}")
+
 
 # ── Post-trade handler ─────────────────────────────────────────────────────────
 
@@ -1384,6 +1477,16 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
 
     adaptations = _update_streaks_and_adapt(trade.pnl > 0, notifier)
 
+    # Compute MFE/MAE from the position's tracked peaks
+    mfe_pct = mae_pct = 0.0
+    if pos.entry_price > 0:
+        if pos.side == 'buy':
+            mfe_pct = (pos.peak_favorable_price - pos.entry_price) / pos.entry_price * 100
+            mae_pct = (pos.peak_adverse_price   - pos.entry_price) / pos.entry_price * 100
+        else:
+            mfe_pct = (pos.entry_price - pos.peak_favorable_price) / pos.entry_price * 100
+            mae_pct = (pos.entry_price - pos.peak_adverse_price)   / pos.entry_price * 100
+
     if notifier and sig:
         fr_apy = sig.funding_rate * 3 * 365 * 100 if sig.funding_rate else None
         notifier.send_trade_analysis(
@@ -1409,6 +1512,9 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
             loss_streak     = _adapt['loss_streak'],
             win_streak      = _adapt['win_streak'],
             adaptations     = adaptations if adaptations else None,
+            entry_path      = getattr(pos, 'entry_path', 'main'),
+            mfe_pct         = mfe_pct,
+            mae_pct         = mae_pct,
         )
     elif notifier:
         fn = notifier.send_win if trade.pnl >= 0 else notifier.send_loss

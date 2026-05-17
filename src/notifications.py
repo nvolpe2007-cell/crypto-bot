@@ -161,14 +161,23 @@ class TelegramNotifier:
 
     def send_trade_alert(self, action: str, symbol: str, price: float,
                          size: float, pnl: Optional[float] = None,
-                         reason: str = "", signal=None):
+                         reason: str = "", signal=None, entry_path: str = "main"):
         is_buy = action.upper() == "BUY"
         icon   = "🟢" if is_buy else "🔴"
         side   = "LONG" if is_buy else "SHORT"
         coin   = _coin(symbol)
 
+        # Short label for which strategy pathway fired this trade
+        _PATH_LABELS = {
+            'main':       '⚙️ main',
+            'mr':         '🔄 MR',
+            'mr-extreme': '🔄 MR-extreme',
+            'fast-track': '⚡ fast-track',
+        }
+        path_label = _PATH_LABELS.get(entry_path, entry_path)
+
         lines = [
-            f"{icon} <b>TAKING TRADE: {side} {coin}</b>",
+            f"{icon} <b>TAKING TRADE: {side} {coin}</b>  <i>[{path_label}]</i>",
             f"Price: <b>${price:,.2f}</b>   Size: <b>${size:.2f}</b>",
         ]
 
@@ -210,7 +219,10 @@ class TelegramNotifier:
                              btc_lead: Optional[str],
                              issues: list, positives: list,
                              loss_streak: int, win_streak: int,
-                             adaptations: Optional[list] = None) -> bool:
+                             adaptations: Optional[list] = None,
+                             entry_path: str = "main",
+                             mfe_pct: float = 0.0,
+                             mae_pct: float = 0.0) -> bool:
         is_win = pnl >= 0
         icon   = "✅" if is_win else "❌"
         label  = "WIN" if is_win else "LOSS"
@@ -218,12 +230,23 @@ class TelegramNotifier:
         coin   = _coin(symbol)
         held   = f"{holding_minutes:.0f} min" if holding_minutes < 60 else f"{holding_minutes/60:.1f}h"
 
+        _PATH_LABELS = {
+            'main':       'main',
+            'mr':         'MR',
+            'mr-extreme': 'MR-extreme',
+            'fast-track': 'fast-track',
+        }
+
         lines = [
-            f"{icon} <b>{label}  {result}</b>",
-            f"{coin}   ${entry_price:,.2f} → ${exit_price:,.2f}",
+            f"{icon} <b>{label}  {result}</b>  <i>[{_PATH_LABELS.get(entry_path, entry_path)}]</i>",
+            f"{coin}   ${entry_price:,.2f} → ${exit_price:,.2f}  ({pnl_pct:+.2f}%)",
             f"{_exit_plain(exit_reason)}   held {held}",
             f"Account: <b>${total_equity:,.2f}</b>",
         ]
+
+        # Excursion: how much we left on the table / how close we came to stopping
+        if mfe_pct or mae_pct:
+            lines.append(f"Best: <b>{mfe_pct:+.2f}%</b>   Worst: <b>{mae_pct:+.2f}%</b>")
 
         if loss_streak >= 3:
             lines.append(f"\n⚠️ {loss_streak} losses in a row")
@@ -288,23 +311,43 @@ class TelegramNotifier:
 
     def send_daily_summary(self, total_equity: float, start_equity: float,
                            trades: int, wins: int, losses: int,
-                           best_trade: float, worst_trade: float) -> bool:
+                           best_trade: float, worst_trade: float,
+                           path_stats: Optional[dict] = None,
+                           regime_stats: Optional[dict] = None,
+                           open_positions: int = 0) -> bool:
         pnl     = total_equity - start_equity
         pnl_pct = (pnl / start_equity * 100) if start_equity else 0
         wr      = (wins / trades * 100) if trades else 0
         icon    = "📈" if pnl >= 0 else "📉"
         result  = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        from datetime import datetime
+        from datetime import datetime, timezone
         lines = [
-            f"{icon} <b>Daily Summary — {datetime.utcnow().strftime('%Y-%m-%d')}</b>",
+            f"{icon} <b>Daily Summary — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}</b>",
             f"P&L: <b>{result} ({pnl_pct:+.1f}%)</b>",
             f"Account: <b>${total_equity:,.2f}</b>",
             f"Trades: {trades}  ({wins}W / {losses}L)",
         ]
         if trades:
             lines.append(f"Win rate: <b>{wr:.0f}%</b>")
-        if best_trade != 0:
+        if best_trade != 0 or worst_trade != 0:
             lines.append(f"Best: +${best_trade:.2f}   Worst: -${abs(worst_trade):.2f}")
+        if open_positions:
+            lines.append(f"Open positions: {open_positions}")
+
+        # By entry path — which strategy paid off today
+        if path_stats:
+            lines.append("\n<b>By entry path:</b>")
+            for path, v in sorted(path_stats.items(), key=lambda kv: -kv[1].get('n', 0)):
+                if v.get('n', 0) > 0:
+                    lines.append(f"  {path:<11} {v['n']}× WR={v['win_rate']:.0f}%  ${v['total_pnl']:+.2f}")
+
+        # By regime
+        if regime_stats:
+            lines.append("\n<b>By regime:</b>")
+            for regime, v in sorted(regime_stats.items(), key=lambda kv: -kv[1].get('n', 0)):
+                if v.get('n', 0) > 0:
+                    lines.append(f"  {regime:<14} {v['n']}× WR={v['win_rate']:.0f}%  ${v['total_pnl']:+.2f}")
+
         return self.send_message("\n".join(lines))
 
     # ── Perp / futures alerts ──────────────────────────────────────────────────
