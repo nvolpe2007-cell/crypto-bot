@@ -12,8 +12,9 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Deque
 from dataclasses import dataclass, field
 import logging
 
@@ -535,7 +536,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     journal         = TradeJournal()
     learner         = Learner(journal)
     portfolio_opt   = PortfolioOptimizer()
-    symbol_returns: Dict[str, List[float]] = {s: [] for s in symbols}
+    symbol_returns: Dict[str, Deque[float]] = {s: deque(maxlen=500) for s in symbols}
     regime_cache:   Dict[str, dict] = {}
 
     # ML + multi-timeframe + mean reversion
@@ -562,8 +563,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     iteration = 0
     prices:   Dict[str, float] = {}
     indicators:       Dict[str, dict]   = {}
-    recent_trades:    List[dict]        = []
-    equity_curve:     List[dict]        = []
+    recent_trades:    Deque[dict]        = deque(maxlen=50)
+    equity_curve:     Deque[dict]        = deque(maxlen=200)
 
     if notifier:
         notifier.send_message(
@@ -864,8 +865,6 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 ret = float(df_tmp['close'].pct_change().iloc[-1])
                                 if not pd.isna(ret):
                                     symbol_returns[sym].append(ret)
-                                    if len(symbol_returns[sym]) > 500:
-                                        symbol_returns[sym].pop(0)
                     except Exception as e:
                         logger.debug(f"[CACHE] refresh failed for {sym}: {e}")
             except asyncio.TimeoutError:
@@ -1553,8 +1552,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 'positions':     positions_data,
                 'prices':        {k: round(v, 2) for k, v in prices.items()},
                 'indicators':    indicators,
-                'recent_trades': recent_trades[-50:],
-                'equity_curve':  equity_curve[-200:],
+                'recent_trades': list(recent_trades),
+                'equity_curve':  list(equity_curve),
                 'sentiment':     sentiment_data,
                 'regime':        regime_cache.get(symbols[0]) if regime_cache else None,
                 'regime_all':    regime_cache,
