@@ -78,22 +78,28 @@ def update_trailing_stop(pos, current_price: float) -> Optional[str]:
         if not pos.peak_favorable_price or current_price < pos.peak_favorable_price:
             pos.peak_favorable_price = current_price
 
-    # Trail only arms after price has moved trigger_pct in our favor
-    if fav_pct < trigger_pct:
-        return None
+    # Arm / update the trailing stop once price has moved trigger_pct in our
+    # favour.  If the trail was already armed on a prior tick, skip re-arming
+    # but still fall through to the crossing check below — a retracement that
+    # pushes fav_pct back below trigger_pct must not prevent the stop from
+    # firing when the price crosses it.
+    if fav_pct >= trigger_pct:
+        if is_long:
+            new_stop = pos.peak_favorable_price * (1 - trail_pct)
+            if not pos.trail_stop_price or new_stop > pos.trail_stop_price:
+                pos.trail_stop_price = new_stop
+        else:
+            new_stop = pos.peak_favorable_price * (1 + trail_pct)
+            if not pos.trail_stop_price or new_stop < pos.trail_stop_price:
+                pos.trail_stop_price = new_stop
+    elif not pos.trail_stop_price:
+        return None  # trail not yet armed and trigger not reached
 
-    # Compute current trailing stop
+    # Check whether price has crossed the (possibly pre-existing) stop level
     if is_long:
-        new_stop = pos.peak_favorable_price * (1 - trail_pct)
-        # Stops only move up (never against you)
-        if not pos.trail_stop_price or new_stop > pos.trail_stop_price:
-            pos.trail_stop_price = new_stop
         if current_price <= pos.trail_stop_price:
             return "TRAIL_STOP"
     else:
-        new_stop = pos.peak_favorable_price * (1 + trail_pct)
-        if not pos.trail_stop_price or new_stop < pos.trail_stop_price:
-            pos.trail_stop_price = new_stop
         if current_price >= pos.trail_stop_price:
             return "TRAIL_STOP"
 
