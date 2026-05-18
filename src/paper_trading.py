@@ -39,6 +39,10 @@ from .state import write_state, read_state
 from .ml_scorer import MLScorer
 from .multi_timeframe import MultiTimeframeFilter
 from .mean_reversion_strategy import MeanReversionStrategy, MRSignal
+from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED
+from .macro_data import MacroDataProvider, alt_beta
+from .daily_circuit import DailyCircuitBreaker
+from .trailing_stop import update_trailing_stop
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +288,9 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
         # Realized metrics
         r_multiple         = round(r_multiple, 3),
         fees_pct_of_pnl    = round(fees_pct_of_pnl, 2),
+        # Probability gate
+        prob_win           = round(float(getattr(pos, 'prob_win', 0.0)), 4) if pos else 0.0,
+        edges_used         = ",".join(getattr(pos, 'edges_used', []) or []) if pos else '',
     )
     journal.add(record)
     return record
@@ -310,6 +317,15 @@ class PaperPosition:
     spread_at_entry: float = 0.0
     sentiment_fng:   Optional[int]   = None
     sentiment_btc_dom: Optional[float] = None
+    # Probability gate output
+    prob_win:        float = 0.0
+    edges_used:      List[str] = field(default_factory=list)
+    # Conviction tier + trailing stop state (set on entry, updated each tick)
+    tier:                str   = 'scalp'
+    intended_hold_min:   int   = 0
+    trail_style:         str   = 'atr_stop'
+    trail_stop_price:    float = 0.0
+    target_usd_at_entry: float = 0.0
 
 
 @dataclass
@@ -526,6 +542,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     ml_scorer   = MLScorer(journal)
     htf_filter  = MultiTimeframeFilter(exchange)
     mr_strategy = MeanReversionStrategy()
+    prob_gate   = ProbabilityGate() if PROB_GATE_ENABLED else None
+    macro_provider = MacroDataProvider()
+    macro_provider.start()
+    circuit_breaker = DailyCircuitBreaker()
+    cb_status = circuit_breaker.status()
+    logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
+                f"(max {cb_status['max_losses']} losses, halted={cb_status['halted']})")
+    if prob_gate:
+        logger.info(f"[PROB-GATE] Enabled (min_p={prob_gate.min_p:.2f}, kelly_ref={prob_gate.kelly_ref:.3f})")
     strategy.ml_scorer = ml_scorer
     # Attempt initial load/train if journal already has data
     if ml_scorer.should_retrain():
@@ -633,9 +658,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     close_fn = trader.execute_sell
 
                 exit_reason = None
-                if pnl_pct / 100 <= -sl_pct:
+                # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
+                trail_reason = update_trailing_stop(pos, price)
+                if trail_reason:
+                    exit_reason = trail_reason
+                elif pnl_pct / 100 <= -sl_pct:
                     exit_reason = 'STOP_LOSS'
-                elif pnl_pct / 100 >= tp_pct:
+                elif pnl_pct / 100 >= tp_pct and getattr(pos, 'trail_style', 'atr_stop') == 'atr_stop':
+                    # Only honor fixed TP for scalps; swing/position let winners run
                     exit_reason = 'TAKE_PROFIT'
 
                 if exit_reason:
@@ -647,6 +677,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
                                          notifier, journal, ml_scorer)
                         _record_exit(sym, exit_reason)
+                        just_halted, halt_msg = circuit_breaker.record_outcome(
+                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
+                        if just_halted and notifier:
+                            notifier.send_message(halt_msg)
 
     asyncio.create_task(_sltp_watcher())
 
@@ -1008,6 +1042,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 _on_trade_closed(symbol, pos_check, trade, exit_reason,
                                                  summary['total_equity'], notifier, journal, ml_scorer)
                                 _record_exit(symbol, exit_reason)
+                                just_halted, halt_msg = circuit_breaker.record_outcome(
+                                    won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
+                                if just_halted and notifier:
+                                    notifier.send_message(halt_msg)
                         continue   # skip entry logic this tick after an exit
 
                 # ── Strategy evaluation ────────────────────────────────────────
@@ -1146,6 +1184,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if sig.confidence < min_conf:
                         logger.debug(f"[SKIP BUY] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
                         continue
+                    # Daily loss circuit breaker
+                    ok, cb_reason = circuit_breaker.can_enter()
+                    if not ok:
+                        logger.info(f"[SKIP BUY] {symbol} — {cb_reason}")
+                        continue
                     # Cooldown after a recent exit on this symbol
                     cd = _cooldown_for(last_exit_reason.get(symbol, ''))
                     since_exit = now_ts - last_exit_time.get(symbol, 0)
@@ -1170,9 +1213,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.debug(f"[SKIP BUY] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
                         continue
                     # Anti-correlation: don't double-up on correlated crypto longs
-                    if _has_correlated_position(symbol, 'buy'):
-                        logger.info(f"[SKIP BUY] {symbol} — correlated long already open")
-                        continue
+                    # (Override for macro-driven same-direction trades — checked after gate.)
+                    _corr_blocked_long = _has_correlated_position(symbol, 'buy')
                     # Skip if OFI data is available but actively opposes direction
                     if sig.ofi is not None and sig.ofi_score < 0:
                         logger.info(f"[SKIP BUY] {symbol} — OFI={sig.ofi:.2f} opposes long (score={sig.ofi_score:.0f})")
@@ -1186,7 +1228,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         continue
                     last_entry_bar[symbol] = bar_ts
 
-                    # Position size from confidence + equity
+                    # Position size from confidence + equity (fallback if gate disabled)
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
                         continue
@@ -1194,13 +1236,65 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
 
+                    # ── Probability gate (tier-based sizing overrides confidence sizing) ─
+                    reasoning = None
+                    if prob_gate:
+                        reasoning = prob_gate.evaluate(
+                            sig, is_buy=True, entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=True),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        logger.info(
+                            f"[PROB-GATE] {symbol} LONG  P={reasoning.combined_p:.2f} "
+                            f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
+                            f"macro={reasoning.is_macro_driven}"
+                        )
+                        if reasoning.rejected:
+                            logger.info(f"[SKIP BUY] {symbol} — prob gate: {reasoning.rejection_reason}")
+                            if notifier:
+                                notifier.send_trade_reasoning(
+                                    symbol, "LONG", current_price, reasoning, size_usd, _entry_path_tag
+                                )
+                            continue
+                        # Tier-based sizing: target USD from the conviction tier,
+                        # scaled by Kelly. Capped by available equity.
+                        size_usd = reasoning.target_usd * reasoning.size_scale
+                        if reasoning.is_macro_driven and not symbol.startswith("BTC"):
+                            size_usd *= alt_beta(symbol)
+                            logger.info(f"[MACRO-CONTAGION] {symbol} size × β={alt_beta(symbol):.2f}")
+                        size_usd = min(size_usd, current_equity * 0.95)  # never exceed cash
+                        logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
+                                    f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
+                        if size_usd < 1.50:
+                            logger.info(f"[SKIP BUY] {symbol} — tier-scaled size below floor")
+                            continue
+                    # Apply correlation block — but allow macro-driven same-direction trades
+                    if _corr_blocked_long and not (reasoning and reasoning.is_macro_driven):
+                        logger.info(f"[SKIP BUY] {symbol} — correlated long already open")
+                        continue
+                    elif _corr_blocked_long and reasoning and reasoning.is_macro_driven:
+                        logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven long, allowing concurrent")
+
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
                     if position:
                         # Tag entry pathway and snapshot market context for the journal
                         position.entry_path = _entry_path_tag
+                        if reasoning:
+                            position.prob_win = reasoning.combined_p
+                            position.edges_used = [e.name for e in reasoning.present_edges]
+                            position.tier = reasoning.tier
+                            position.intended_hold_min = reasoning.hold_minutes
+                            position.trail_style = reasoning.trail_style
+                            position.target_usd_at_entry = reasoning.target_usd
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
+                            if reasoning:
+                                notifier.send_trade_reasoning(
+                                    symbol, "LONG", current_price, reasoning, size_usd, _entry_path_tag
+                                )
                             notifier.send_trade_alert(
                                 action="BUY", symbol=symbol, price=current_price,
                                 size=size_usd, signal=sig, entry_path=_entry_path_tag,
@@ -1210,6 +1304,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 elif sig.is_sell and pos is None:
                     if sig.confidence < min_conf:
                         logger.debug(f"[SKIP SELL] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
+                        continue
+                    # Daily loss circuit breaker
+                    ok, cb_reason = circuit_breaker.can_enter()
+                    if not ok:
+                        logger.info(f"[SKIP SELL] {symbol} — {cb_reason}")
                         continue
                     # Cooldown after a recent exit
                     cd = _cooldown_for(last_exit_reason.get(symbol, ''))
@@ -1235,9 +1334,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.debug(f"[SKIP SELL] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
                         continue
                     # Anti-correlation: don't double-up on correlated shorts
-                    if _has_correlated_position(symbol, 'short'):
-                        logger.info(f"[SKIP SELL] {symbol} — correlated short already open")
-                        continue
+                    # (Override for macro-driven same-direction trades — checked after gate.)
+                    _corr_blocked_short = _has_correlated_position(symbol, 'short')
                     # Skip if OFI data is available but actively opposes direction
                     if sig.ofi is not None and sig.ofi_score < 0:
                         logger.info(f"[SKIP SELL] {symbol} — OFI={sig.ofi:.2f} opposes short (score={sig.ofi_score:.0f})")
@@ -1257,12 +1355,61 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
 
+                    # ── Probability gate ─────────────────────────────────────────
+                    reasoning = None
+                    if prob_gate:
+                        reasoning = prob_gate.evaluate(
+                            sig, is_buy=False, entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=False),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        logger.info(
+                            f"[PROB-GATE] {symbol} SHORT P={reasoning.combined_p:.2f} "
+                            f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
+                            f"macro={reasoning.is_macro_driven}"
+                        )
+                        if reasoning.rejected:
+                            logger.info(f"[SKIP SELL] {symbol} — prob gate: {reasoning.rejection_reason}")
+                            if notifier:
+                                notifier.send_trade_reasoning(
+                                    symbol, "SHORT", current_price, reasoning, size_usd, _entry_path_tag
+                                )
+                            continue
+                        size_usd = reasoning.target_usd * reasoning.size_scale
+                        if reasoning.is_macro_driven and not symbol.startswith("BTC"):
+                            size_usd *= alt_beta(symbol)
+                            logger.info(f"[MACRO-CONTAGION] {symbol} size × β={alt_beta(symbol):.2f}")
+                        size_usd = min(size_usd, current_equity * 0.95)
+                        logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
+                                    f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
+                        if size_usd < 1.50:
+                            logger.info(f"[SKIP SELL] {symbol} — tier-scaled size below floor")
+                            continue
+                    if _corr_blocked_short and not (reasoning and reasoning.is_macro_driven):
+                        logger.info(f"[SKIP SELL] {symbol} — correlated short already open")
+                        continue
+                    elif _corr_blocked_short and reasoning and reasoning.is_macro_driven:
+                        logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven short, allowing concurrent")
+
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
                     if position:
                         position.entry_path = _entry_path_tag
+                        if reasoning:
+                            position.prob_win = reasoning.combined_p
+                            position.edges_used = [e.name for e in reasoning.present_edges]
+                            position.tier = reasoning.tier
+                            position.intended_hold_min = reasoning.hold_minutes
+                            position.trail_style = reasoning.trail_style
+                            position.target_usd_at_entry = reasoning.target_usd
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
+                            if reasoning:
+                                notifier.send_trade_reasoning(
+                                    symbol, "SHORT", current_price, reasoning, size_usd, _entry_path_tag
+                                )
                             notifier.send_trade_alert(
                                 action="SELL", symbol=symbol, price=current_price,
                                 size=size_usd, signal=sig, entry_path=_entry_path_tag,
@@ -1279,6 +1426,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
                                          notifier, journal, ml_scorer)
                         _record_exit(symbol, "SIGNAL")
+                        just_halted, halt_msg = circuit_breaker.record_outcome(
+                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
+                        if just_halted and notifier:
+                            notifier.send_message(halt_msg)
 
                 # ── EXIT SHORT ──────────────────────────────────────────────────
                 elif pos_side == 'short' and (
@@ -1292,6 +1443,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
                                          notifier, journal, ml_scorer)
                         _record_exit(symbol, "SIGNAL")
+                        just_halted, halt_msg = circuit_breaker.record_outcome(
+                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
+                        if just_halted and notifier:
+                            notifier.send_message(halt_msg)
 
             # Refresh CVaR weights
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):

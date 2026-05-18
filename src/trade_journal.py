@@ -89,6 +89,10 @@ class TradeRecord:
     r_multiple:         float = 0.0   # pnl / planned_risk
     fees_pct_of_pnl:    float = 0.0   # fee drag
 
+    # Probability gate output (stacked-edge reasoning)
+    prob_win:           float = 0.0   # P(win) at entry
+    edges_used:         str   = ''    # comma-joined edge names that were present
+
     def to_dict(self):
         return asdict(self)
 

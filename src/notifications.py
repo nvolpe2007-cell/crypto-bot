@@ -157,6 +157,45 @@ class TelegramNotifier:
             logger.error(f"Failed to send Telegram message: {e}")
             return False
 
+    # ── Pre-trade reasoning (probability gate output) ──────────────────────────
+
+    def send_trade_reasoning(self, symbol: str, side: str, price: float,
+                              reasoning, size: float, entry_path: str = "main"):
+        """
+        Pre-trade Telegram message showing the full probability stack.
+        `reasoning` is a probability_gate.TradeReasoning.
+        """
+        is_buy = side.upper() == "LONG"
+        icon   = "🟢" if is_buy else "🔴"
+        coin   = _coin(symbol)
+
+        if reasoning.rejected:
+            header = f"🚫 <b>SKIPPED: {side} {coin}</b>"
+        else:
+            header = f"{icon} <b>EVALUATING: {side} {coin}</b>"
+
+        lines = [
+            header,
+            f"Price <b>${price:,.2f}</b>  ·  Path <i>{entry_path}</i>",
+            "",
+            f"<b>P(win) = {reasoning.combined_p:.0%}</b>"
+            f"   (Kelly f*={reasoning.kelly_fraction:.2f}, qtr={reasoning.quarter_kelly:.3f})",
+            f"Size scale: <b>{reasoning.size_scale:.2f}x</b>"
+            f" → ${size:.2f}",
+            "",
+            "<b>Edges stacked:</b>",
+        ]
+
+        for edge in reasoning.edges:
+            mark = "✓" if edge.present else "·"
+            p_str = f"p={edge.p_win:.2f}" if edge.present else "—"
+            lines.append(f"  {mark} <b>{edge.name}</b> {p_str}  {edge.note}")
+
+        if reasoning.rejected and reasoning.rejection_reason:
+            lines += ["", f"<b>Reject:</b> {reasoning.rejection_reason}"]
+
+        return self.send_message("\n".join(lines))
+
     # ── Trade entry ────────────────────────────────────────────────────────────
 
     def send_trade_alert(self, action: str, symbol: str, price: float,
