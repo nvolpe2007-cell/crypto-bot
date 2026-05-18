@@ -213,7 +213,8 @@ class Backtester:
 
         gross_profit = sum(t.pnl for t in winning)
         gross_loss = abs(sum(t.pnl for t in losing))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
+        profit_factor = (gross_profit / gross_loss if gross_loss > 0
+                         else float('inf') if gross_profit > 0 else 0.0)
 
         # Drawdown
         equity_values = equity_curve['equity'] if isinstance(equity_curve, pd.DataFrame) else equity_curve
