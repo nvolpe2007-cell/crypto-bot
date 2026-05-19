@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 logs/
 data/
 __pycache__/
@@ -7,3 +9,7 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/agents/

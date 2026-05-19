@@ -44,6 +44,11 @@ from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED
 from .macro_data import MacroDataProvider, alt_beta
 from .daily_circuit import DailyCircuitBreaker
 from .trailing_stop import update_trailing_stop
+from .entry_checklist import (
+    CheckContext,
+    build_long_checklist,
+    build_short_checklist,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +549,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     htf_filter  = MultiTimeframeFilter(exchange)
     mr_strategy = MeanReversionStrategy()
     prob_gate   = ProbabilityGate() if PROB_GATE_ENABLED else None
+    long_checklist  = build_long_checklist()
+    short_checklist = build_short_checklist()
     macro_provider = MacroDataProvider()
     macro_provider.start()
     circuit_breaker = DailyCircuitBreaker()
@@ -743,6 +750,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     last_entry_bar:     Dict[str, float] = {}   # bar-ts of last entry attempt
     last_ws_price_time: Dict[str, float] = {}   # when WS price last refreshed
     last_heartbeat:     float            = 0.0  # for periodic status log
+    # Backtests showed 25/33 signal-flip exits hit a 4% win rate — a single
+    # opposing bar is mostly noise. Require N consecutive flips before exiting.
+    opposing_streak:    Dict[str, int]   = {}
+    SIGNAL_EXIT_STREAK: int              = 2
 
     # Tunables
     COOLDOWN_AFTER_STOP_SEC   = 300.0   # 5 min after STOP_LOSS / SL / signal_stop
@@ -1180,51 +1191,37 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # ── LONG ENTRY ──────────────────────────────────────────────────
                 if sig.is_buy and pos is None:
-                    if sig.confidence < min_conf:
-                        logger.debug(f"[SKIP BUY] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
-                        continue
-                    # Daily loss circuit breaker
-                    ok, cb_reason = circuit_breaker.can_enter()
-                    if not ok:
-                        logger.info(f"[SKIP BUY] {symbol} — {cb_reason}")
-                        continue
-                    # Cooldown after a recent exit on this symbol
-                    cd = _cooldown_for(last_exit_reason.get(symbol, ''))
-                    since_exit = now_ts - last_exit_time.get(symbol, 0)
-                    if since_exit < cd:
-                        logger.debug(f"[SKIP BUY] {symbol} — cooldown ({since_exit:.0f}s < {cd:.0f}s after {last_exit_reason.get(symbol,'')})")
-                        continue
-                    # Per-bar entry dedup — prevents intra-bar signal flicker re-entries
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
                         bar_ts = now_ts
-                    if last_entry_bar.get(symbol) == bar_ts:
-                        logger.debug(f"[SKIP BUY] {symbol} — already evaluated this bar")
+                    cb_ok, cb_reason = circuit_breaker.can_enter()
+                    long_ctx = CheckContext(
+                        symbol=symbol, side='buy', sig=sig,
+                        regime_name=regime_name, min_confidence=min_conf,
+                        now_ts=now_ts, bar_ts=bar_ts,
+                        last_exit_reason=last_exit_reason.get(symbol, ''),
+                        last_exit_time=last_exit_time.get(symbol, 0),
+                        last_entry_bar_ts=last_entry_bar.get(symbol),
+                        cooldown_for=_cooldown_for,
+                        last_ws_price_time=last_ws_price_time.get(symbol, 0),
+                        ws_staleness_sec=WS_PRICE_STALENESS_SEC,
+                        open_positions_count=len(trader.account.positions),
+                        max_open_positions=MAX_OPEN_POSITIONS,
+                        sentiment_allows=(sentiment_monitor.allows_long(symbol)
+                                          if sentiment_monitor else True),
+                        kill_filter_reason=_kill_filter_skip(symbol, df),
+                        circuit_breaker_reason=None if cb_ok else cb_reason,
+                    )
+                    cl_result = long_checklist.run(long_ctx)
+                    if not cl_result.passed:
+                        logger.info(f"[SKIP BUY] {symbol} — {cl_result.reason_summary()}")
+                        logger.debug(f"[CHECKLIST BUY] {symbol} {cl_result.trace()}")
                         continue
-                    # WS price staleness
-                    ws_age = now_ts - last_ws_price_time.get(symbol, 0)
-                    if last_ws_price_time.get(symbol, 0) > 0 and ws_age > WS_PRICE_STALENESS_SEC:
-                        logger.info(f"[SKIP BUY] {symbol} — WS price stale ({ws_age:.0f}s)")
-                        continue
-                    # Max concurrent positions
-                    if len(trader.account.positions) >= MAX_OPEN_POSITIONS:
-                        logger.debug(f"[SKIP BUY] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
-                        continue
-                    # Anti-correlation: don't double-up on correlated crypto longs
-                    # (Override for macro-driven same-direction trades — checked after gate.)
+                    logger.info(f"[CHECKLIST BUY] {symbol} score={cl_result.score:.2f} "
+                                f"{cl_result.short_trace()}")
+                    # Anti-correlation: handled after the prob-gate (macro override below)
                     _corr_blocked_long = _has_correlated_position(symbol, 'buy')
-                    # Skip if OFI data is available but actively opposes direction
-                    if sig.ofi is not None and sig.ofi_score < 0:
-                        logger.info(f"[SKIP BUY] {symbol} — OFI={sig.ofi:.2f} opposes long (score={sig.ofi_score:.0f})")
-                        continue
-                    if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
-                        logger.info(f"[SKIP BUY] {symbol} — sentiment blocked (F&G extreme fear)")
-                        continue
-                    kf_reason = _kill_filter_skip(symbol, df)
-                    if kf_reason:
-                        logger.info(f"[SKIP BUY] {symbol} — {kf_reason}")
-                        continue
                     last_entry_bar[symbol] = bar_ts
 
                     # Position size from confidence + equity (fallback if gate disabled)
@@ -1234,6 +1231,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
+
+                    # When prob gate is off, checklist soft-score modulates size.
+                    # Prob gate's tier sizing fully replaces this below if enabled.
+                    if not prob_gate:
+                        size_usd *= cl_result.score
 
                     # ── Probability gate (tier-based sizing overrides confidence sizing) ─
                     reasoning = None
@@ -1301,51 +1303,35 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # ── SHORT ENTRY ─────────────────────────────────────────────────
                 elif sig.is_sell and pos is None:
-                    if sig.confidence < min_conf:
-                        logger.debug(f"[SKIP SELL] {symbol} conf={sig.confidence:.0f} < {min_conf:.0f}")
-                        continue
-                    # Daily loss circuit breaker
-                    ok, cb_reason = circuit_breaker.can_enter()
-                    if not ok:
-                        logger.info(f"[SKIP SELL] {symbol} — {cb_reason}")
-                        continue
-                    # Cooldown after a recent exit
-                    cd = _cooldown_for(last_exit_reason.get(symbol, ''))
-                    since_exit = now_ts - last_exit_time.get(symbol, 0)
-                    if since_exit < cd:
-                        logger.debug(f"[SKIP SELL] {symbol} — cooldown ({since_exit:.0f}s < {cd:.0f}s)")
-                        continue
-                    # Per-bar entry dedup
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
                         bar_ts = now_ts
-                    if last_entry_bar.get(symbol) == bar_ts:
-                        logger.debug(f"[SKIP SELL] {symbol} — already evaluated this bar")
+                    cb_ok, cb_reason = circuit_breaker.can_enter()
+                    short_ctx = CheckContext(
+                        symbol=symbol, side='sell', sig=sig,
+                        regime_name=regime_name, min_confidence=min_conf,
+                        now_ts=now_ts, bar_ts=bar_ts,
+                        last_exit_reason=last_exit_reason.get(symbol, ''),
+                        last_exit_time=last_exit_time.get(symbol, 0),
+                        last_entry_bar_ts=last_entry_bar.get(symbol),
+                        cooldown_for=_cooldown_for,
+                        last_ws_price_time=last_ws_price_time.get(symbol, 0),
+                        ws_staleness_sec=WS_PRICE_STALENESS_SEC,
+                        open_positions_count=len(trader.account.positions),
+                        max_open_positions=MAX_OPEN_POSITIONS,
+                        sentiment_allows=True,   # no sentiment gate for shorts
+                        kill_filter_reason=_kill_filter_skip(symbol, df),
+                        circuit_breaker_reason=None if cb_ok else cb_reason,
+                    )
+                    cl_result = short_checklist.run(short_ctx)
+                    if not cl_result.passed:
+                        logger.info(f"[SKIP SELL] {symbol} — {cl_result.reason_summary()}")
+                        logger.debug(f"[CHECKLIST SELL] {symbol} {cl_result.trace()}")
                         continue
-                    # WS price staleness
-                    ws_age = now_ts - last_ws_price_time.get(symbol, 0)
-                    if last_ws_price_time.get(symbol, 0) > 0 and ws_age > WS_PRICE_STALENESS_SEC:
-                        logger.info(f"[SKIP SELL] {symbol} — WS price stale ({ws_age:.0f}s)")
-                        continue
-                    # Max concurrent positions
-                    if len(trader.account.positions) >= MAX_OPEN_POSITIONS:
-                        logger.debug(f"[SKIP SELL] {symbol} — at max positions ({MAX_OPEN_POSITIONS})")
-                        continue
-                    # Anti-correlation: don't double-up on correlated shorts
-                    # (Override for macro-driven same-direction trades — checked after gate.)
+                    logger.info(f"[CHECKLIST SELL] {symbol} score={cl_result.score:.2f} "
+                                f"{cl_result.short_trace()}")
                     _corr_blocked_short = _has_correlated_position(symbol, 'short')
-                    # Skip if OFI data is available but actively opposes direction
-                    if sig.ofi is not None and sig.ofi_score < 0:
-                        logger.info(f"[SKIP SELL] {symbol} — OFI={sig.ofi:.2f} opposes short (score={sig.ofi_score:.0f})")
-                        continue
-                    if regime_name == 'TRENDING_UP':
-                        logger.info(f"[SKIP SHORT] {symbol} — TRENDING_UP blocks shorts")
-                        continue
-                    kf_reason = _kill_filter_skip(symbol, df)
-                    if kf_reason:
-                        logger.info(f"[SKIP SELL] {symbol} — {kf_reason}")
-                        continue
                     last_entry_bar[symbol] = bar_ts
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
@@ -1353,6 +1339,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         continue
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
+                    if not prob_gate:
+                        size_usd *= cl_result.score
 
                     # ── Probability gate ─────────────────────────────────────────
                     reasoning = None
@@ -1416,36 +1404,55 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # ── EXIT LONG ───────────────────────────────────────────────────
                 elif sig.signal == Signal.SELL and pos_side == 'buy':
-                    # Exit when signal flips or OFI strongly reverses
-                    trade = trader.execute_sell(symbol, current_price, current_time, reason="SIGNAL")
-                    if trade:
-                        recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
-                        summary = trader.get_account_summary()
-                        equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                         notifier, journal, ml_scorer)
-                        _record_exit(symbol, "SIGNAL")
-                        just_halted, halt_msg = circuit_breaker.record_outcome(
-                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
-                        if just_halted and notifier:
-                            notifier.send_message(halt_msg)
+                    opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
+                    if opposing_streak[symbol] < SIGNAL_EXIT_STREAK:
+                        logger.debug(f"[EXIT-DEBOUNCE] {symbol} long: opposing "
+                                     f"{opposing_streak[symbol]}/{SIGNAL_EXIT_STREAK}")
+                    else:
+                        trade = trader.execute_sell(symbol, current_price, current_time, reason="SIGNAL")
+                        if trade:
+                            recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
+                            summary = trader.get_account_summary()
+                            equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
+                            _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
+                                             notifier, journal, ml_scorer)
+                            _record_exit(symbol, "SIGNAL")
+                            opposing_streak.pop(symbol, None)
+                            just_halted, halt_msg = circuit_breaker.record_outcome(
+                                won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
+                            if just_halted and notifier:
+                                notifier.send_message(halt_msg)
 
                 # ── EXIT SHORT ──────────────────────────────────────────────────
                 elif pos_side == 'short' and (
                     sig.signal == Signal.BUY or regime_name == 'TRENDING_UP'
                 ):
-                    trade = trader.execute_cover(symbol, current_price, current_time, reason="SIGNAL")
-                    if trade:
-                        recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
-                        summary = trader.get_account_summary()
-                        equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                         notifier, journal, ml_scorer)
-                        _record_exit(symbol, "SIGNAL")
-                        just_halted, halt_msg = circuit_breaker.record_outcome(
-                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
-                        if just_halted and notifier:
-                            notifier.send_message(halt_msg)
+                    # Regime flip to TRENDING_UP is a fast-exit (no debounce);
+                    # signal flip requires the streak.
+                    fast_exit = regime_name == 'TRENDING_UP'
+                    if not fast_exit:
+                        opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
+                    if not fast_exit and opposing_streak[symbol] < SIGNAL_EXIT_STREAK:
+                        logger.debug(f"[EXIT-DEBOUNCE] {symbol} short: opposing "
+                                     f"{opposing_streak[symbol]}/{SIGNAL_EXIT_STREAK}")
+                    else:
+                        trade = trader.execute_cover(symbol, current_price, current_time, reason="SIGNAL")
+                        if trade:
+                            recent_trades.append(_trade_to_dict(trade, symbol, "SIGNAL"))
+                            summary = trader.get_account_summary()
+                            equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
+                            _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
+                                             notifier, journal, ml_scorer)
+                            _record_exit(symbol, "SIGNAL")
+                            opposing_streak.pop(symbol, None)
+                            just_halted, halt_msg = circuit_breaker.record_outcome(
+                                won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
+                            if just_halted and notifier:
+                                notifier.send_message(halt_msg)
+                else:
+                    # Any tick without an opposing signal resets the streak
+                    if pos_side and opposing_streak.get(symbol, 0):
+                        opposing_streak[symbol] = 0
 
             # Refresh CVaR weights
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
