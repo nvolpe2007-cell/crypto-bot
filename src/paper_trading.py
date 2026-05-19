@@ -76,7 +76,7 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
 _ADAPT_FILE = 'logs/strategy_adaptations.json'
 
 _adapt: Dict = {
-    'min_confidence':     55.0,   # require multi-signal confirmation; adapts after streaks
+    'min_confidence':     35.0,   # AGGRESSIVE: low entry bar, adapts after streaks
     'loss_streak':        0,
     'win_streak':         0,
     'total_trades':       0,
@@ -114,14 +114,15 @@ def _update_streaks_and_adapt(won: bool, notifier):
 
     changes = []
 
-    # After 3 losses in a row, raise the bar
-    if _adapt['loss_streak'] == 3 and _adapt['min_confidence'] < 68:
-        _adapt['min_confidence'] = min(68.0, _adapt['min_confidence'] + 4.0)
+    # AGGRESSIVE: cap how high min_confidence can climb after losses so the bot
+    # doesn't filter itself out of the market. After 3 losses, bump to a soft
+    # ceiling of 45 (was 68). On 5 wins, can relax back to floor of 35.
+    if _adapt['loss_streak'] == 3 and _adapt['min_confidence'] < 45:
+        _adapt['min_confidence'] = min(45.0, _adapt['min_confidence'] + 3.0)
         changes.append(f"min confidence raised to {_adapt['min_confidence']:.0f}")
 
-    # After 5 wins in a row, can slightly relax (bot has edge in current conditions)
-    if _adapt['win_streak'] == 5 and _adapt['min_confidence'] > 60:
-        _adapt['min_confidence'] = max(60.0, _adapt['min_confidence'] - 2.0)
+    if _adapt['win_streak'] == 5 and _adapt['min_confidence'] > 35:
+        _adapt['min_confidence'] = max(35.0, _adapt['min_confidence'] - 2.0)
         changes.append(f"min confidence relaxed to {_adapt['min_confidence']:.0f}")
 
     _save_adaptations()
@@ -758,7 +759,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # Tunables
     COOLDOWN_AFTER_STOP_SEC   = 300.0   # 5 min after STOP_LOSS / SL / signal_stop
     COOLDOWN_AFTER_SIGNAL_SEC = 60.0    # 1 min after signal-driven exits
-    MAX_OPEN_POSITIONS        = 2        # cap simultaneous positions
+    MAX_OPEN_POSITIONS        = 4        # AGGRESSIVE: allow more concurrent positions
     WS_PRICE_STALENESS_SEC    = 12.0    # skip entry if WS price older than this
     CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
     HEARTBEAT_INTERVAL_SEC    = 60.0

@@ -101,7 +101,7 @@ class Checklist:
     veto fires. Defaults to 0.6 — i.e. setups must clear 60% of soft weight.
     """
 
-    def __init__(self, checks: List[Check], *, soft_threshold: float = 0.6):
+    def __init__(self, checks: List[Check], *, soft_threshold: float = 0.4):
         self.checks = checks
         self.soft_threshold = soft_threshold
 
@@ -223,30 +223,30 @@ def _rsi_healthy(ctx: CheckContext):
 def _adx_strong(ctx: CheckContext):
     if ctx.regime_name == "RANGING":
         return True, "ranging — n/a"
-    if ctx.sig.adx >= 25:
+    if ctx.sig.adx >= 18:
         return True, f"adx={ctx.sig.adx:.0f}"
-    return False, f"adx={ctx.sig.adx:.0f}<25"
+    return False, f"adx={ctx.sig.adx:.0f}<18"
 
 
 def _volume_strong(ctx: CheckContext):
     vr = getattr(ctx.sig, "volume_ratio", 1.0) or 1.0
-    if vr >= 1.5:
+    if vr >= 1.0:
         return True, f"vol={vr:.2f}x"
-    return False, f"vol={vr:.2f}x<1.5"
+    return False, f"vol={vr:.2f}x<1.0"
 
 
 def _atr_alive(ctx: CheckContext):
-    """Reject dead-volatility setups. ATR / price must be ≥ 0.08% — on 1m
-    bars typical crypto ATR is 0.05–0.10%, so this trims the bottom third
-    of the distribution where MFE rarely clears even the slippage budget."""
+    """Reject dead-volatility setups. AGGRESSIVE: ATR / price must be ≥ 0.05%
+    (was 0.08%). Most 1m crypto bars clear this; only the absolute dead-tape
+    setups get vetoed."""
     atr = getattr(ctx.sig, "atr", None)
     px  = getattr(ctx.sig, "close", None)
     if not atr or not px:
         return True, "no atr/price"
     ratio = atr / px
-    if ratio >= 0.0008:
+    if ratio >= 0.0005:
         return True, f"atr/px={ratio*100:.3f}%"
-    return False, f"atr/px={ratio*100:.3f}%<0.08%"
+    return False, f"atr/px={ratio*100:.3f}%<0.05%"
 
 
 def _lead_lag_aligned(ctx: CheckContext):
@@ -271,7 +271,7 @@ def _funding_favorable(ctx: CheckContext):
 
 # ── Factories ───────────────────────────────────────────────────────────────
 
-def build_long_checklist(*, soft_threshold: float = 0.6) -> Checklist:
+def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
     return Checklist([
         Check("min_confidence",    "hard", _min_confidence),
         Check("circuit_breaker",   "hard", _circuit_breaker),
@@ -291,7 +291,7 @@ def build_long_checklist(*, soft_threshold: float = 0.6) -> Checklist:
     ], soft_threshold=soft_threshold)
 
 
-def build_short_checklist(*, soft_threshold: float = 0.6) -> Checklist:
+def build_short_checklist(*, soft_threshold: float = 0.4) -> Checklist:
     return Checklist([
         Check("min_confidence",     "hard", _min_confidence),
         Check("circuit_breaker",    "hard", _circuit_breaker),
