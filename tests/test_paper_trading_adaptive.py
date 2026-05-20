@@ -116,19 +116,22 @@ class TestUpdateStreaksAndAdapt:
         _adapt['loss_streak'] = 2
         _adapt['min_confidence'] = 38.0
         _update_streaks_and_adapt(won=False, notifier=None)  # 3rd loss
-        assert _adapt['min_confidence'] == pytest.approx(42.0)
+        # ceiling=45, step=+3: min(45, 38+3) = 41
+        assert _adapt['min_confidence'] == pytest.approx(41.0)
 
-    def test_min_confidence_capped_at_68(self):
+    def test_min_confidence_capped_at_45(self):
+        # AGGRESSIVE mode: ceiling is 45, step is +3
         _adapt['loss_streak'] = 2
-        _adapt['min_confidence'] = 67.0  # +4 would overshoot 68
+        _adapt['min_confidence'] = 43.0  # +3 would overshoot 45
         _update_streaks_and_adapt(won=False, notifier=None)
-        assert _adapt['min_confidence'] == pytest.approx(68.0)
+        assert _adapt['min_confidence'] == pytest.approx(45.0)
 
     def test_min_confidence_not_raised_when_already_at_cap(self):
+        # Condition is < 45, so at or above 45 no raise occurs
         _adapt['loss_streak'] = 2
-        _adapt['min_confidence'] = 68.0
+        _adapt['min_confidence'] = 45.0
         _update_streaks_and_adapt(won=False, notifier=None)
-        assert _adapt['min_confidence'] == pytest.approx(68.0)
+        assert _adapt['min_confidence'] == pytest.approx(45.0)
 
     def test_five_wins_relaxes_min_confidence_when_above_60(self):
         _adapt['win_streak'] = 4
@@ -136,17 +139,19 @@ class TestUpdateStreaksAndAdapt:
         _update_streaks_and_adapt(won=True, notifier=None)  # 5th win
         assert _adapt['min_confidence'] == pytest.approx(63.0)
 
-    def test_min_confidence_floor_at_60_on_relaxation(self):
+    def test_min_confidence_floor_at_35_on_relaxation(self):
+        # AGGRESSIVE mode: floor is 35, step is -2
         _adapt['win_streak'] = 4
-        _adapt['min_confidence'] = 61.0  # -2 would undershoot 60
+        _adapt['min_confidence'] = 36.5  # -2 would undershoot 35
         _update_streaks_and_adapt(won=True, notifier=None)
-        assert _adapt['min_confidence'] == pytest.approx(60.0)
+        assert _adapt['min_confidence'] == pytest.approx(35.0)
 
-    def test_min_confidence_not_relaxed_when_already_at_60_or_below(self):
+    def test_min_confidence_not_relaxed_when_already_at_35_or_below(self):
+        # Condition is > 35, so at exactly 35 no relaxation occurs
         _adapt['win_streak'] = 4
-        _adapt['min_confidence'] = 60.0
+        _adapt['min_confidence'] = 35.0
         _update_streaks_and_adapt(won=True, notifier=None)
-        assert _adapt['min_confidence'] == pytest.approx(60.0)
+        assert _adapt['min_confidence'] == pytest.approx(35.0)
 
     def test_returns_empty_list_when_no_threshold_change(self):
         _adapt['loss_streak'] = 0   # 1st loss, no adjustment yet
@@ -176,7 +181,8 @@ class TestUpdateStreaksAndAdapt:
         _update_streaks_and_adapt(won=False, notifier=None)  # 2nd loss
         assert _adapt['min_confidence'] == pytest.approx(38.0)
         _update_streaks_and_adapt(won=False, notifier=None)  # 3rd loss — triggers
-        assert _adapt['min_confidence'] == pytest.approx(42.0)
+        # ceiling=45, step=+3: min(45, 38+3) = 41
+        assert _adapt['min_confidence'] == pytest.approx(41.0)
 
 
 # ── _inject_live_price ─────────────────────────────────────────────────────────
