@@ -1,0 +1,345 @@
+"""
+Funding Rate Arbitrage — Paper Trading Simulator
+
+Reuses the FundingScanner (already running in src/bot.py) for live funding-rate
+data, then simulates cash-and-carry positions:
+
+    Positive APY: LONG SPOT + SHORT PERP (collect funding from longs)
+    Negative APY: SHORT SPOT + LONG PERP (collect funding from shorts)
+
+Market-neutral by construction, so spot/perp price PnL nets to ~0; the real
+return is the funding accrued each 8h cycle.
+
+Silent: never sends per-trade Telegram. Posts a single daily P&L rollup every
+24h from bot startup.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from funding_scanner import FundingScanner
+
+logger = logging.getLogger(__name__)
+
+STATE_FILE = Path('data/funding_arb_state.json')
+
+MIN_ENTRY_APY = 15.0           # only open positions above this APY
+EXIT_APY_FRACTION = 0.40       # close when APY drops below 40% of entry rate
+MAX_HOLD_DAYS = 7              # safety cap
+MAX_CONCURRENT_POSITIONS = 3
+POSITION_SIZE_USD = 500.0      # per leg (so $1000 capital used per pair)
+FUNDING_CYCLE_HOURS = 8        # standard for Binance/Bybit perps
+ROLLUP_INTERVAL_SECONDS = 86400  # 24h
+
+
+@dataclass
+class PaperPosition:
+    symbol: str
+    exchange: str
+    direction: str               # "LONG_SPOT_SHORT_PERP" or "SHORT_SPOT_LONG_PERP"
+    entry_apy: float
+    entry_rate_8h: float
+    size_usd: float
+    entry_time_iso: str
+    funding_collected: float = 0.0
+    cycles_collected: int = 0
+    last_funding_ts_iso: Optional[str] = None
+    closed: bool = False
+    close_time_iso: Optional[str] = None
+    close_reason: Optional[str] = None
+
+    @property
+    def entry_time(self) -> datetime:
+        return datetime.fromisoformat(self.entry_time_iso)
+
+
+class FundingArbPaperSim:
+    """Paper-trades funding arb based on a live FundingScanner feed."""
+
+    def __init__(
+        self,
+        scanner: "FundingScanner",
+        notifier=None,
+        min_entry_apy: float = MIN_ENTRY_APY,
+        position_size_usd: float = POSITION_SIZE_USD,
+        max_positions: int = MAX_CONCURRENT_POSITIONS,
+    ):
+        self.scanner = scanner
+        self.notifier = notifier
+        self.min_entry_apy = min_entry_apy
+        self.position_size_usd = position_size_usd
+        self.max_positions = max_positions
+
+        self.open_positions: Dict[str, PaperPosition] = {}
+        self.closed_positions: List[PaperPosition] = []
+        self.start_time = datetime.now(timezone.utc)
+        self.last_rollup_total = 0.0       # cumulative P&L at last rollup
+        self.running = False
+
+        self._load_state()
+
+    # ── persistence ────────────────────────────────────────────────────────────
+
+    def _load_state(self):
+        if not STATE_FILE.exists():
+            return
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            self.open_positions = {
+                k: PaperPosition(**v) for k, v in data.get('open', {}).items()
+            }
+            self.closed_positions = [
+                PaperPosition(**v) for v in data.get('closed', [])
+            ]
+            self.last_rollup_total = float(data.get('last_rollup_total', 0.0))
+            start_iso = data.get('start_time_iso')
+            if start_iso:
+                self.start_time = datetime.fromisoformat(start_iso)
+            logger.info(
+                f"[FundingArbPaper] Restored {len(self.open_positions)} open, "
+                f"{len(self.closed_positions)} closed positions"
+            )
+        except Exception as e:
+            logger.warning(f"[FundingArbPaper] State load failed: {e}")
+
+    def _save_state(self):
+        STATE_FILE.parent.mkdir(exist_ok=True)
+        payload = {
+            'open': {k: asdict(v) for k, v in self.open_positions.items()},
+            'closed': [asdict(v) for v in self.closed_positions[-500:]],
+            'last_rollup_total': self.last_rollup_total,
+            'start_time_iso': self.start_time.isoformat(),
+        }
+        STATE_FILE.write_text(json.dumps(payload, indent=2))
+
+    # ── core sim loop ──────────────────────────────────────────────────────────
+
+    async def start(self):
+        self.running = True
+        logger.info(
+            f"[FundingArbPaper] Started (paper, silent). "
+            f"min_apy={self.min_entry_apy}% size=${self.position_size_usd} "
+            f"max_positions={self.max_positions}"
+        )
+
+        rollup_task = asyncio.create_task(self._rollup_loop())
+
+        try:
+            while self.running:
+                try:
+                    self._tick()
+                except Exception as e:
+                    logger.error(f"[FundingArbPaper] Tick error: {e}")
+                await asyncio.sleep(60)
+        finally:
+            rollup_task.cancel()
+
+    async def stop(self):
+        self.running = False
+        self._save_state()
+
+    def _tick(self):
+        """Process one cycle: accrue funding, manage exits, look for entries."""
+        opps = self.scanner.get_state()  # list[dict]
+        opp_by_key = {f"{o['exchange']}:{o['symbol']}": o for o in opps}
+
+        now = datetime.now(timezone.utc)
+
+        # 1. Accrue funding + check exits on existing positions
+        for key, pos in list(self.open_positions.items()):
+            self._accrue_funding(pos, opp_by_key.get(key), now)
+            reason = self._should_exit(pos, opp_by_key.get(key), now)
+            if reason:
+                pos.closed = True
+                pos.close_time_iso = now.isoformat()
+                pos.close_reason = reason
+                self.closed_positions.append(pos)
+                del self.open_positions[key]
+                logger.info(
+                    f"[FundingArbPaper] CLOSE {pos.symbol} ({pos.exchange}) "
+                    f"reason={reason} funding=${pos.funding_collected:.4f} "
+                    f"cycles={pos.cycles_collected}"
+                )
+
+        # 2. Look for new entries
+        if len(self.open_positions) < self.max_positions:
+            for opp in opps:
+                if len(self.open_positions) >= self.max_positions:
+                    break
+                key = f"{opp['exchange']}:{opp['symbol']}"
+                if key in self.open_positions:
+                    continue
+                if abs(opp['apy']) < self.min_entry_apy:
+                    continue
+                self._open_position(opp, now)
+
+        self._save_state()
+
+    def _open_position(self, opp: dict, now: datetime):
+        key = f"{opp['exchange']}:{opp['symbol']}"
+        direction = (
+            "LONG_SPOT_SHORT_PERP" if opp['apy'] > 0
+            else "SHORT_SPOT_LONG_PERP"
+        )
+        pos = PaperPosition(
+            symbol=opp['symbol'],
+            exchange=opp['exchange'],
+            direction=direction,
+            entry_apy=float(opp['apy']),
+            entry_rate_8h=float(opp['rate_8h']) / 100.0,  # scanner stores as %
+            size_usd=self.position_size_usd,
+            entry_time_iso=now.isoformat(),
+            last_funding_ts_iso=now.isoformat(),
+        )
+        self.open_positions[key] = pos
+        logger.info(
+            f"[FundingArbPaper] OPEN {pos.symbol} ({pos.exchange}) "
+            f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd}"
+        )
+
+    def _accrue_funding(
+        self,
+        pos: PaperPosition,
+        current_opp: Optional[dict],
+        now: datetime,
+    ):
+        """Accrue funding for any 8h cycles that have elapsed since last accrual."""
+        last_ts = (
+            datetime.fromisoformat(pos.last_funding_ts_iso)
+            if pos.last_funding_ts_iso else pos.entry_time
+        )
+        hours_since = (now - last_ts).total_seconds() / 3600.0
+        cycles_due = int(hours_since // FUNDING_CYCLE_HOURS)
+        if cycles_due <= 0:
+            return
+
+        # Use current rate if scanner still tracks the symbol, otherwise
+        # decay toward zero (assume rate normalised below scanner's min threshold).
+        if current_opp is not None:
+            current_rate_per_cycle = float(current_opp['rate_8h']) / 100.0
+        else:
+            current_rate_per_cycle = pos.entry_rate_8h * 0.25  # conservative
+
+        # We collect funding (we're on the receiving side by construction).
+        # Sign of entry_rate tells us which side; magnitude × size = $/cycle.
+        per_cycle_pnl = abs(current_rate_per_cycle) * pos.size_usd
+        pos.funding_collected += per_cycle_pnl * cycles_due
+        pos.cycles_collected += cycles_due
+        pos.last_funding_ts_iso = (
+            last_ts + timedelta(hours=cycles_due * FUNDING_CYCLE_HOURS)
+        ).isoformat()
+
+    def _should_exit(
+        self,
+        pos: PaperPosition,
+        current_opp: Optional[dict],
+        now: datetime,
+    ) -> Optional[str]:
+        # 1. Max-hold safety
+        age_days = (now - pos.entry_time).total_seconds() / 86400.0
+        if age_days >= MAX_HOLD_DAYS:
+            return f"max_hold_{MAX_HOLD_DAYS}d"
+
+        # 2. Funding flipped sign (paying instead of collecting)
+        if current_opp is not None:
+            current_apy = float(current_opp['apy'])
+            if (pos.entry_apy > 0 and current_apy < 0) or \
+               (pos.entry_apy < 0 and current_apy > 0):
+                return "funding_flipped"
+
+            # 3. Funding decayed below exit threshold
+            if abs(current_apy) < abs(pos.entry_apy) * EXIT_APY_FRACTION:
+                return f"apy_decayed_to_{current_apy:.1f}"
+
+        # 4. Symbol disappeared from scanner for an extended period:
+        # only force-close if we've been "off the radar" for a full day.
+        if current_opp is None:
+            last_ts = (
+                datetime.fromisoformat(pos.last_funding_ts_iso)
+                if pos.last_funding_ts_iso else pos.entry_time
+            )
+            if (now - last_ts).total_seconds() > 86400:
+                return "off_scanner_24h"
+
+        return None
+
+    # ── 24h rollup ─────────────────────────────────────────────────────────────
+
+    async def _rollup_loop(self):
+        try:
+            while self.running:
+                await asyncio.sleep(ROLLUP_INTERVAL_SECONDS)
+                try:
+                    self._send_daily_rollup()
+                except Exception as e:
+                    logger.error(f"[FundingArbPaper] Rollup error: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    def _total_pnl(self) -> float:
+        open_pnl = sum(p.funding_collected for p in self.open_positions.values())
+        closed_pnl = sum(p.funding_collected for p in self.closed_positions)
+        return open_pnl + closed_pnl
+
+    def _send_daily_rollup(self):
+        total = self._total_pnl()
+        delta = total - self.last_rollup_total
+        now = datetime.now(timezone.utc)
+        uptime_h = (now - self.start_time).total_seconds() / 3600.0
+
+        open_lines = [
+            f"  • {p.exchange} {p.symbol}: ${p.funding_collected:.4f} "
+            f"({p.cycles_collected} cycles, {p.entry_apy:.0f}% APY)"
+            for p in self.open_positions.values()
+        ] or ["  (none)"]
+
+        closed_today = [
+            p for p in self.closed_positions
+            if p.close_time_iso and
+            (now - datetime.fromisoformat(p.close_time_iso)).total_seconds() < 86400
+        ]
+        closed_lines = [
+            f"  • {p.exchange} {p.symbol}: ${p.funding_collected:.4f} "
+            f"({p.close_reason})"
+            for p in closed_today
+        ] or ["  (none)"]
+
+        msg = (
+            f"<b>📊 Funding Arb — Daily P&amp;L</b>\n"
+            f"24h P&amp;L: <b>${delta:+.4f}</b>\n"
+            f"Cumulative: ${total:.4f}\n"
+            f"Uptime: {uptime_h:.0f}h\n\n"
+            f"<b>Open ({len(self.open_positions)}):</b>\n"
+            + "\n".join(open_lines) + "\n\n"
+            f"<b>Closed in last 24h ({len(closed_today)}):</b>\n"
+            + "\n".join(closed_lines)
+        )
+
+        logger.info(f"[FundingArbPaper] Daily rollup: ${delta:+.4f} (cum ${total:.4f})")
+
+        if self.notifier:
+            try:
+                self.notifier.send_message(msg)
+            except Exception as e:
+                logger.warning(f"[FundingArbPaper] Telegram send failed: {e}")
+
+        self.last_rollup_total = total
+        self._save_state()
+
+    # ── public helpers ─────────────────────────────────────────────────────────
+
+    def get_summary(self) -> dict:
+        return {
+            'open_positions': len(self.open_positions),
+            'closed_positions': len(self.closed_positions),
+            'total_pnl': round(self._total_pnl(), 4),
+            'positions': [asdict(p) for p in self.open_positions.values()],
+        }
