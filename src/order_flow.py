@@ -24,6 +24,11 @@ _BULL_THRESH  =  0.20
 _BEAR_THRESH  = -0.20
 _HIST_LEN     = 12    # rolling OFI history per symbol
 
+# Book-imbalance gate: block entry when the *opposing* side is N× our side.
+# Protects against cascade scenarios (e.g. asks ≥ 2× bids when going long
+# means the book is one-sided and longs can get run over by liquidations).
+_BOOK_IMBALANCE_BLOCK_RATIO = 2.0
+
 
 class OrderFlowImbalance:
     """
@@ -37,6 +42,7 @@ class OrderFlowImbalance:
         self._cache:   Dict[str, float]        = {}
         self._fetched: Dict[str, float]        = {}   # timestamp of last successful fetch
         self._history: Dict[str, deque]        = {s: deque(maxlen=_HIST_LEN) for s in symbols}
+        self._depth:   Dict[str, tuple]        = {}   # symbol → (bid_vol, ask_vol) top-N
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -59,6 +65,7 @@ class OrderFlowImbalance:
             self._cache[symbol]   = ofi
             self._fetched[symbol] = time.time()
             self._history[symbol].append(ofi)
+            self._depth[symbol]   = (bid_vol, ask_vol)
             logger.debug(f"[OFI] {symbol}  {ofi:+.3f}  (bid {bid_vol:.4f}  ask {ask_vol:.4f})")
             return ofi
 
@@ -118,3 +125,29 @@ class OrderFlowImbalance:
         if ofi is None:
             return True
         return ofi < _BULL_THRESH + 0.10   # block only above +0.30
+
+    def book_imbalance_blocks(self, symbol: str, side: str,
+                              ratio: float = _BOOK_IMBALANCE_BLOCK_RATIO) -> Optional[str]:
+        """
+        Hard gate: returns a reason string if the order book is dangerously
+        one-sided against the proposed entry, else None.
+
+        Going long while asks ≥ ratio × bids → sellers stacked → cascade risk.
+        Going short while bids ≥ ratio × asks → buyers stacked → squeeze risk.
+
+        Fail-open: returns None when depth data is stale/unavailable.
+        """
+        if time.time() - self._fetched.get(symbol, 0) > _STALE_SECS:
+            return None
+        depth = self._depth.get(symbol)
+        if not depth:
+            return None
+        bid_vol, ask_vol = depth
+        if bid_vol <= 0 or ask_vol <= 0:
+            return None
+        side = side.lower()
+        if side in ('buy', 'long') and ask_vol >= ratio * bid_vol:
+            return f"BOOK_IMBALANCE asks={ask_vol:.2f} vs bids={bid_vol:.2f} ({ask_vol/bid_vol:.1f}×)"
+        if side in ('sell', 'short') and bid_vol >= ratio * ask_vol:
+            return f"BOOK_IMBALANCE bids={bid_vol:.2f} vs asks={ask_vol:.2f} ({bid_vol/ask_vol:.1f}×)"
+        return None

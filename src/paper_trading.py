@@ -880,8 +880,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         last_exit_time[sym]   = time.time()
         last_exit_reason[sym] = reason or ''
 
-    def _kill_filter_skip(sym: str, df: pd.DataFrame) -> Optional[str]:
-        """Quick pre-entry check for funding-extreme + whale-print only.
+    def _kill_filter_skip(sym: str, df: pd.DataFrame, side: str = 'buy') -> Optional[str]:
+        """Quick pre-entry check for funding-extreme, whale-print, hostile book
+        imbalance, and CVD-vs-price divergence.
         WS-stale, daily-loss, max-positions, correlation are handled elsewhere.
         Returns reason string if should skip, else None."""
         # Funding rate extreme — when paying >0.1% per 8h, longs are very expensive
@@ -895,6 +896,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 sma20   = float(df['volume'].rolling(20).mean().iloc[-2])  # exclude current
                 if sma20 > 0 and cur_vol > sma20 * 10.0:
                     return f"WHALE_PRINT ({cur_vol/sma20:.1f}× SMA20)"
+        except Exception:
+            pass
+        # Book imbalance — opposing side stacked → cascade/squeeze risk
+        try:
+            book_reason = ofi_calc.book_imbalance_blocks(sym, side)
+            if book_reason:
+                return book_reason
+        except Exception:
+            pass
+        # CVD divergence — price and order flow disagreeing
+        try:
+            tracker = strategy._cvd_trackers.get(sym) if strategy else None
+            if tracker is not None:
+                div_reason = tracker.divergence_blocks(side)
+                if div_reason:
+                    return div_reason
         except Exception:
             pass
         return None
@@ -1294,7 +1311,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         max_open_positions=MAX_OPEN_POSITIONS,
                         sentiment_allows=(sentiment_monitor.allows_long(symbol)
                                           if sentiment_monitor else True),
-                        kill_filter_reason=_kill_filter_skip(symbol, df),
+                        kill_filter_reason=_kill_filter_skip(symbol, df, side='buy'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
                     )
                     cl_result = long_checklist.run(long_ctx)
@@ -1405,7 +1422,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         open_positions_count=len(trader.account.positions),
                         max_open_positions=MAX_OPEN_POSITIONS,
                         sentiment_allows=True,   # no sentiment gate for shorts
-                        kill_filter_reason=_kill_filter_skip(symbol, df),
+                        kill_filter_reason=_kill_filter_skip(symbol, df, side='sell'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
                     )
                     cl_result = short_checklist.run(short_ctx)

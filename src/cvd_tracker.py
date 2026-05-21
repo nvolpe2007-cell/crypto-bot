@@ -169,6 +169,48 @@ class CVDTracker:
             return -1
         return 0
 
+    def divergence_blocks(self, side: str, lookback: int = 10,
+                          min_price_move_pct: float = 0.10) -> Optional[str]:
+        """
+        Bearish/bullish divergence gate.
+
+        For a long entry: blocks when price ↑ but cumulative CVD ↓ over the
+        last `lookback` candles — buyers are exhausting and the rally is
+        getting sold into.
+
+        For a short entry: blocks when price ↓ but CVD ↑ — sellers exhausting.
+
+        Returns reason string if entry should be blocked, None otherwise.
+        Fail-open when there isn't enough history.
+        """
+        closes = list(self._closes)
+        deltas = list(self._deltas)
+        n = min(lookback, len(closes), len(deltas))
+        if n < 4:
+            return None
+
+        recent_closes = closes[-n:]
+        recent_deltas = deltas[-n:]
+        first_close = recent_closes[0]
+        last_close  = recent_closes[-1]
+        if first_close <= 0:
+            return None
+
+        price_move_pct = (last_close - first_close) / first_close * 100.0
+        cvd_change     = sum(recent_deltas)
+        side = side.lower()
+
+        if side in ('buy', 'long'):
+            # price meaningfully higher, CVD lower → bearish divergence
+            if price_move_pct >= min_price_move_pct and cvd_change < 0:
+                return (f"CVD_DIVERGENCE price +{price_move_pct:.2f}% "
+                        f"but CVD {cvd_change:+.2f} over {n} bars")
+        elif side in ('sell', 'short'):
+            if price_move_pct <= -min_price_move_pct and cvd_change > 0:
+                return (f"CVD_DIVERGENCE price {price_move_pct:.2f}% "
+                        f"but CVD {cvd_change:+.2f} over {n} bars")
+        return None
+
     # ── Internal helpers ─────────────────────────────────────────────────────────
 
     def _compute_slope(self) -> float:
