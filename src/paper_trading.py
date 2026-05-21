@@ -479,7 +479,10 @@ class PaperTrader:
         pnl        = (exec_price - pos.entry_price) * pos.size - total_fees + pos.funding_accrued
         if pos.is_perp:
             cost_basis = pos.margin_locked + pos.entry_fee
-            self.account.cash += pos.margin_locked + pnl
+            # Return margin + entry_fee (already deducted at open) plus net pnl.
+            # pnl already deducts entry_fee via total_fees, so we add it back here
+            # to avoid double-counting it against cash.
+            self.account.cash += pos.margin_locked + pos.entry_fee + pnl
         else:
             cost_basis = pos.entry_price * pos.size + pos.entry_fee
             self.account.cash += exec_price * pos.size - exit_fee
@@ -547,7 +550,7 @@ class PaperTrader:
         pnl         = (pos.entry_price - exec_price) * pos.size - total_fees + pos.funding_accrued
         if pos.is_perp:
             cost_basis = pos.margin_locked + pos.entry_fee
-            self.account.cash += pos.margin_locked + pnl
+            self.account.cash += pos.margin_locked + pos.entry_fee + pnl
         else:
             cost_basis = pos.entry_price * pos.size + pos.entry_fee
             returned   = pos.entry_price * pos.size + pos.entry_fee
@@ -578,7 +581,12 @@ class PaperTrader:
                     if p > pos.peak_adverse_price:   pos.peak_adverse_price   = p
 
     def get_account_summary(self) -> Dict:
-        pos_val  = sum(p.entry_price * p.size + p.unrealized_pnl for p in self.account.positions.values())
+        # Perp positions: only margin_locked is the actual capital at risk, not full notional.
+        # Spot positions: full notional (entry_price * size) is the capital deployed.
+        pos_val  = sum(
+            (p.margin_locked if p.is_perp else p.entry_price * p.size) + p.unrealized_pnl
+            for p in self.account.positions.values()
+        )
         equity   = self.account.cash + pos_val
         closed   = self.account.closed_trades
         return {
