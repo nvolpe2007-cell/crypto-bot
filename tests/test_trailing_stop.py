@@ -180,12 +180,18 @@ class TestEma50_4hLong:
         assert pos.trail_stop_price > 0.0
         assert abs(pos.trail_stop_price - 101.5 * 0.98) < 1e-9
 
-    def test_trail_stop_triggered(self):
+    def test_be_fires_before_wider_tier_trail(self):
+        """ema50_4h trail (99.47) is wider than BE stop (100.55). BE pre-empts.
+
+        Once peak hits +1.5% (above the 0.85% BE arm), BE locks in a small
+        profit before the wide tier trail can be reached. This is intentional —
+        BE protects against give-back, tier trail catches large reversals.
+        """
         pos = self._pos()
         with _mock_now(_NOW_PLUS_30MIN):
-            update_trailing_stop(pos, 101.5)               # arms: trail at 99.47
-            result = update_trailing_stop(pos, 99.0)       # below 99.47
-        assert result == "TRAIL_STOP"
+            update_trailing_stop(pos, 101.5)               # arms BE + tier trail
+            result = update_trailing_stop(pos, 99.0)       # below BE stop 100.55
+        assert result == "BREAKEVEN"
 
     def test_wider_trail_than_ema21(self):
         """ema50_4h trail (2%) should always be wider than ema21_1h (1%) at same peak."""
@@ -254,6 +260,53 @@ class TestShortPositions:
             update_trailing_stop(pos, 99.0)                # bounce
             update_trailing_stop(pos, 95.0)                # new low
         assert pos.peak_favorable_price == 95.0
+
+
+# ── Breakeven trail (applies to ALL trail styles) ─────────────────────────────
+
+class TestBreakevenTrail:
+    """BE trail: once MFE ≥ 0.85%, exit if price retraces to entry + 0.55%."""
+
+    def test_no_be_when_peak_below_arm(self):
+        """Peak +0.5% < 0.85% arm → BE not active."""
+        pos = _FakePos(trail_style="atr_stop", entry_price=100.0, intended_hold_min=0)
+        with _mock_now(_NOW_PLUS_30MIN):
+            update_trailing_stop(pos, 100.5)               # peak +0.5%, BE not armed
+            result = update_trailing_stop(pos, 100.1)      # retrace below BE stop
+        assert result is None
+
+    def test_be_fires_after_arm_and_retrace_long(self):
+        """Peak +1.0% (≥ 0.85%) → BE armed. Retrace below entry+0.55% → exit."""
+        pos = _FakePos(trail_style="atr_stop", entry_price=100.0, intended_hold_min=0)
+        with _mock_now(_NOW_PLUS_30MIN):
+            update_trailing_stop(pos, 101.0)               # peak +1%, BE armed
+            result = update_trailing_stop(pos, 100.3)      # below BE stop 100.55
+        assert result == "BREAKEVEN"
+
+    def test_no_be_exit_when_price_above_be_stop(self):
+        """Armed but price still above BE stop → no exit."""
+        pos = _FakePos(trail_style="atr_stop", entry_price=100.0, intended_hold_min=0)
+        with _mock_now(_NOW_PLUS_30MIN):
+            update_trailing_stop(pos, 101.0)               # arms BE
+            result = update_trailing_stop(pos, 100.7)      # 100.7 > 100.55
+        assert result is None
+
+    def test_be_fires_for_short(self):
+        """Short: peak -1% (favorable), retrace to entry-0.55% → exit."""
+        pos = _FakePos(side="short", trail_style="atr_stop",
+                       entry_price=100.0, intended_hold_min=0)
+        with _mock_now(_NOW_PLUS_30MIN):
+            update_trailing_stop(pos, 99.0)                # peak -1% favorable
+            result = update_trailing_stop(pos, 99.7)       # above BE stop 99.45
+        assert result == "BREAKEVEN"
+
+    def test_be_applies_to_atr_stop(self):
+        """BE works on scalp positions even though they have no tier trail."""
+        pos = _FakePos(trail_style="atr_stop", entry_price=100.0, intended_hold_min=0)
+        with _mock_now(_NOW_PLUS_30MIN):
+            update_trailing_stop(pos, 101.0)               # arms BE
+            result = update_trailing_stop(pos, 100.2)      # below 100.55
+        assert result == "BREAKEVEN"
 
 
 # ── MAX_HOLD backstop ─────────────────────────────────────────────────────────

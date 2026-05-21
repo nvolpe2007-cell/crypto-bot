@@ -32,6 +32,15 @@ TRAIL_PARAMS = {
     "ema50_4h":  (0.010, 0.020),   # arm at +1.0%, trail by 2.0%
 }
 
+# Breakeven trail — applies to ALL trail styles regardless of tier.
+# Round-trip Kraken spot fees ≈ 0.52% (0.26% per side). BE stop must clear fees
+# or "breakeven" exits net-lose. Arm at +0.85% MFE; BE stop at entry +0.55%
+# (gross +0.55% → net ~+0.03% after fees). Live-data fix: losers had avg MFE
+# 0.23% then bled out, so this only triggers on the ~30% of trades that reach
+# 0.85% MFE — but lets them lock in a small profit instead of round-tripping.
+BE_ARM_PCT     = 0.0085  # 0.85% favorable to arm
+BE_STOP_BUFFER = 0.0055  # exit if price retraces to entry + 0.55%
+
 
 def _is_long(pos) -> bool:
     return getattr(pos, "side", "buy") == "buy"
@@ -55,13 +64,7 @@ def update_trailing_stop(pos, current_price: float) -> Optional[str]:
         if elapsed_min >= hold_min:
             return "MAX_HOLD"
 
-    if trail_style not in TRAIL_PARAMS:
-        return None
-    trigger_pct, trail_pct = TRAIL_PARAMS[trail_style]
-    if trigger_pct is None:
-        return None  # scalp / atr_stop — no trail
-
-    entry = pos.entry_price
+    entry   = pos.entry_price
     is_long = _is_long(pos)
 
     # Favorable move %
@@ -70,13 +73,39 @@ def update_trailing_stop(pos, current_price: float) -> Optional[str]:
     else:
         fav_pct = (entry - current_price) / entry
 
-    # Update peak favorable price
+    # Update peak favorable price (used by both BE trail and tier trail below)
     if is_long:
         if not pos.peak_favorable_price or current_price > pos.peak_favorable_price:
             pos.peak_favorable_price = current_price
     else:
         if not pos.peak_favorable_price or current_price < pos.peak_favorable_price:
             pos.peak_favorable_price = current_price
+
+    # Peak favorable as a fraction (uses tracked peak, not just current tick)
+    if is_long:
+        peak_fav_pct = (pos.peak_favorable_price - entry) / entry
+    else:
+        peak_fav_pct = (entry - pos.peak_favorable_price) / entry
+
+    # 2. Breakeven trail — applies to ALL trail styles. Once MFE clears fees,
+    #    set a virtual stop at entry ± small buffer. Live-data fix: losers had
+    #    avg MFE 0.23% then bled to small losses; this locks in net profit.
+    if peak_fav_pct >= BE_ARM_PCT:
+        if is_long:
+            be_stop = entry * (1 + BE_STOP_BUFFER)
+            if current_price <= be_stop:
+                return "BREAKEVEN"
+        else:
+            be_stop = entry * (1 - BE_STOP_BUFFER)
+            if current_price >= be_stop:
+                return "BREAKEVEN"
+
+    # 3. Tier-specific trailing stop
+    if trail_style not in TRAIL_PARAMS:
+        return None
+    trigger_pct, trail_pct = TRAIL_PARAMS[trail_style]
+    if trigger_pct is None:
+        return None  # scalp / atr_stop — no tier trail (BE trail above still applies)
 
     # Arm / update the trailing stop once price has moved trigger_pct in our
     # favour.  If the trail was already armed on a prior tick, skip re-arming

@@ -333,6 +333,12 @@ class PaperPosition:
     trail_style:         str   = 'atr_stop'
     trail_stop_price:    float = 0.0
     target_usd_at_entry: float = 0.0
+    # Perp-only state (zero in spot mode)
+    is_perp:             bool  = False
+    leverage:            float = 1.0
+    margin_locked:       float = 0.0    # USD locked as margin (= notional / leverage)
+    funding_accrued:     float = 0.0    # cumulative funding paid (long) or collected (short)
+    last_funding_ts:     Optional[datetime] = None
 
 
 @dataclass
@@ -350,7 +356,9 @@ class PaperTrader:
                  fee_pct: float = 0.26,
                  slippage_pct: float = 0.1,
                  stop_loss_pct: float = 2.0,
-                 take_profit_pct: float = 3.0):
+                 take_profit_pct: float = 3.0,
+                 perp_mode: bool = False,
+                 leverage: float = 1.0):
         self.initial_capital  = initial_capital
         self.account          = PaperAccount(initial_capital=initial_capital, cash=initial_capital)
         self.position_size    = position_size
@@ -362,6 +370,46 @@ class PaperTrader:
         self._started_at: Optional[str] = None
         # Live spread cache populated by paper_trading main loop; used for realistic slippage
         self.live_spreads: Dict[str, float] = {}   # symbol → current spread in price units
+        # ── Perp mode state ───────────────────────────────────────────────────
+        self.perp_mode        = perp_mode
+        self.leverage         = max(1.0, float(leverage)) if perp_mode else 1.0
+        # Symbol → current 8h funding rate (fraction, e.g. 0.0001). Caller updates.
+        self._funding_rates: Dict[str, float] = {}
+        if perp_mode:
+            logger.info(f"[PaperTrader] PERP mode ON  leverage={self.leverage:.1f}x")
+
+    # ── Perp funding helpers ──────────────────────────────────────────────────
+
+    def set_funding_rate(self, symbol: str, rate_8h_fraction: float) -> None:
+        """Update the current 8h funding rate (as a fraction, e.g. 0.0001 = 0.01%)."""
+        self._funding_rates[symbol] = float(rate_8h_fraction)
+
+    def accrue_funding(self, now: datetime) -> None:
+        """
+        Accrue funding for all open perp positions across any 8h cycles
+        elapsed since the last accrual. Long pays positive funding, short collects.
+        Called each tick from the main loop; no-op outside perp mode.
+        """
+        if not self.perp_mode:
+            return
+        for symbol, pos in self.account.positions.items():
+            if not pos.is_perp:
+                continue
+            rate = self._funding_rates.get(symbol)
+            if rate is None:
+                continue
+            last_ts = pos.last_funding_ts or pos.entry_time
+            hours = (now - last_ts).total_seconds() / 3600.0
+            cycles = int(hours // 8)
+            if cycles <= 0:
+                continue
+            notional = pos.entry_price * pos.size
+            # Long pays positive funding → -rate*notional per cycle
+            # Short collects positive funding → +rate*notional per cycle
+            sign = -1.0 if pos.side == 'buy' else 1.0
+            delta = sign * rate * notional * cycles
+            pos.funding_accrued += delta
+            pos.last_funding_ts = last_ts + timedelta(hours=cycles * 8)
 
     def _slippage_pct_for(self, symbol: str, price: float) -> float:
         """
@@ -382,12 +430,20 @@ class PaperTrader:
         slip       = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 + slip)
         fee        = exec_price * size * self.fee_pct
-        total_cost = exec_price * size + fee
+        notional   = exec_price * size
+        margin_req = notional / self.leverage if self.perp_mode else notional
+        total_cost = margin_req + fee
 
         if total_cost > self.account.cash:
-            size       = (self.account.cash * 0.98) / (exec_price * (1 + self.fee_pct))
-            fee        = exec_price * size * self.fee_pct
-            total_cost = exec_price * size + fee
+            # Scale down to fit available cash
+            available  = self.account.cash * 0.98
+            # cash >= notional/lev + notional*fee_pct  →  notional <= cash / (1/lev + fee_pct)
+            denom      = (1.0 / self.leverage) + self.fee_pct if self.perp_mode else (1.0 + self.fee_pct)
+            notional   = available / denom
+            size       = notional / exec_price
+            fee        = notional * self.fee_pct
+            margin_req = notional / self.leverage if self.perp_mode else notional
+            total_cost = margin_req + fee
 
         if size <= 0 or total_cost > self.account.cash:
             return None
@@ -397,9 +453,14 @@ class PaperTrader:
                             size=size, side='buy', entry_fee=fee, entry_signal=signal,
                             peak_favorable_price=exec_price,
                             peak_adverse_price=exec_price,
-                            size_usd_target=size_usd)
+                            size_usd_target=size_usd,
+                            is_perp=self.perp_mode,
+                            leverage=self.leverage,
+                            margin_locked=margin_req,
+                            last_funding_ts=timestamp)
         self.account.positions[symbol] = pos
-        logger.info(f"[BUY]  {symbol} @ ${exec_price:,.2f}  ${size_usd:.2f}  conf={signal.confidence:.0f}%" if signal else f"[BUY]  {symbol} @ ${exec_price:,.2f}")
+        tag = "[LONG-PERP]" if self.perp_mode else "[BUY]"
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
         return pos
 
     def execute_sell(self, symbol: str, price: float, timestamp: datetime,
@@ -407,21 +468,30 @@ class PaperTrader:
         if symbol not in self.account.positions:
             return None
         pos        = self.account.positions[symbol]
+        # Final funding accrual on the position before closing it
+        if pos.is_perp:
+            self.accrue_funding(timestamp)
         slip       = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 - slip)
         exit_fee   = exec_price * pos.size * self.fee_pct
         total_fees = exit_fee + pos.entry_fee
-        pnl        = (exec_price - pos.entry_price) * pos.size - total_fees
-        cost_basis = pos.entry_price * pos.size + pos.entry_fee
-        pnl_pct    = pnl / cost_basis * 100
-        self.account.cash      += exec_price * pos.size - exit_fee
+        pnl        = (exec_price - pos.entry_price) * pos.size - total_fees + pos.funding_accrued
+        if pos.is_perp:
+            cost_basis = pos.margin_locked + pos.entry_fee
+            self.account.cash += pos.margin_locked + pnl
+        else:
+            cost_basis = pos.entry_price * pos.size + pos.entry_fee
+            self.account.cash += exec_price * pos.size - exit_fee
+        pnl_pct    = pnl / cost_basis * 100 if cost_basis else 0.0
         self.account.total_pnl += pnl
         trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
                       entry_price=pos.entry_price, exit_price=exec_price,
                       size=pos.size, side='sell', pnl=pnl, pnl_pct=pnl_pct, fees=total_fees)
         self.account.closed_trades.append(trade)
         del self.account.positions[symbol]
-        logger.info(f"[SELL] {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%)  {reason}")
+        tag = "[CLOSE-LONG]" if pos.is_perp else "[SELL]"
+        funding_note = f" funding=${pos.funding_accrued:+.4f}" if pos.is_perp else ""
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%){funding_note}  {reason}")
         return trade
 
     def execute_short(self, symbol: str, price: float, timestamp: datetime,
@@ -430,21 +500,34 @@ class PaperTrader:
         slip       = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 - slip)
         fee        = exec_price * size * self.fee_pct
-        margin     = exec_price * size + fee
-        if margin > self.account.cash:
-            size   = (self.account.cash * 0.98) / (exec_price * (1 + self.fee_pct))
-            fee    = exec_price * size * self.fee_pct
-            margin = exec_price * size + fee
-        if size <= 0 or margin > self.account.cash:
+        notional   = exec_price * size
+        margin_req = notional / self.leverage if self.perp_mode else notional
+        total_cost = margin_req + fee
+
+        if total_cost > self.account.cash:
+            available  = self.account.cash * 0.98
+            denom      = (1.0 / self.leverage) + self.fee_pct if self.perp_mode else (1.0 + self.fee_pct)
+            notional   = available / denom
+            size       = notional / exec_price
+            fee        = notional * self.fee_pct
+            margin_req = notional / self.leverage if self.perp_mode else notional
+            total_cost = margin_req + fee
+
+        if size <= 0 or total_cost > self.account.cash:
             return None
-        self.account.cash -= margin
+        self.account.cash -= total_cost
         pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
                             size=size, side='short', entry_fee=fee, entry_signal=signal,
                             peak_favorable_price=exec_price,
                             peak_adverse_price=exec_price,
-                            size_usd_target=size_usd)
+                            size_usd_target=size_usd,
+                            is_perp=self.perp_mode,
+                            leverage=self.leverage,
+                            margin_locked=margin_req,
+                            last_funding_ts=timestamp)
         self.account.positions[symbol] = pos
-        logger.info(f"[SHORT] {symbol} @ ${exec_price:,.2f}  ${size_usd:.2f}  conf={signal.confidence:.0f}%" if signal else f"[SHORT] {symbol} @ ${exec_price:,.2f}")
+        tag = "[SHORT-PERP]" if self.perp_mode else "[SHORT]"
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
         return pos
 
     def execute_cover(self, symbol: str, price: float, timestamp: datetime,
@@ -454,22 +537,30 @@ class PaperTrader:
         pos = self.account.positions[symbol]
         if pos.side != 'short':
             return self.execute_sell(symbol, price, timestamp, reason)
+        if pos.is_perp:
+            self.accrue_funding(timestamp)
         slip        = self._slippage_pct_for(symbol, price)
         exec_price  = price * (1 + slip)
         exit_fee    = exec_price * pos.size * self.fee_pct
         total_fees  = exit_fee + pos.entry_fee
-        pnl         = (pos.entry_price - exec_price) * pos.size - total_fees
-        cost_basis  = pos.entry_price * pos.size + pos.entry_fee
-        pnl_pct     = pnl / cost_basis * 100
-        returned    = pos.entry_price * pos.size + pos.entry_fee
-        self.account.cash      += returned + pnl
+        pnl         = (pos.entry_price - exec_price) * pos.size - total_fees + pos.funding_accrued
+        if pos.is_perp:
+            cost_basis = pos.margin_locked + pos.entry_fee
+            self.account.cash += pos.margin_locked + pnl
+        else:
+            cost_basis = pos.entry_price * pos.size + pos.entry_fee
+            returned   = pos.entry_price * pos.size + pos.entry_fee
+            self.account.cash += returned + pnl
+        pnl_pct = pnl / cost_basis * 100 if cost_basis else 0.0
         self.account.total_pnl += pnl
         trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
                       entry_price=pos.entry_price, exit_price=exec_price,
                       size=pos.size, side='cover', pnl=pnl, pnl_pct=pnl_pct, fees=total_fees)
         self.account.closed_trades.append(trade)
         del self.account.positions[symbol]
-        logger.info(f"[COVER] {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%)  {reason}")
+        tag = "[CLOSE-SHORT]" if pos.is_perp else "[COVER]"
+        funding_note = f" funding=${pos.funding_accrued:+.4f}" if pos.is_perp else ""
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%){funding_note}  {reason}")
         return trade
 
     def update_unrealized_pnl(self, prices: Dict[str, float]):
@@ -673,8 +764,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     exit_reason = trail_reason
                 elif pnl_pct / 100 <= -sl_pct:
                     exit_reason = 'STOP_LOSS'
-                elif pnl_pct / 100 >= tp_pct and getattr(pos, 'trail_style', 'atr_stop') == 'atr_stop':
-                    # Only honor fixed TP for scalps; swing/position let winners run
+                elif pnl_pct / 100 >= tp_pct:
+                    # All tiers honor fixed TP — was previously gated to atr_stop only;
+                    # losers had MFE 0.23% so they never hit TP and bled out instead.
                     exit_reason = 'TAKE_PROFIT'
 
                 if exit_reason:
@@ -1076,22 +1168,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         sig.confidence = max(0.0, min(100.0, sig.confidence + mtf_adj))
                         sig.size_mult  = _get_size_mult(sig.confidence)
 
-                # ── Mean-reversion: fires in non-trending regimes OR on extreme RSI ─
-                # MR is a separate edge (tight stops, BB+RSI mean reversion).
-                # Conditions: main signal HOLD AND (non-trending regime OR extreme RSI),
-                # so we capture short scalp opportunities without fighting trends.
+                # ── Mean-reversion: RANGING regime only (mr-extreme disabled) ──
+                # mr-extreme was 28/32 trades with 7.1% WR — disabled after live data.
                 _mr_ok_regime = regime_name in ('RANGING', 'VOLATILE', 'UNKNOWN')
                 if sig.signal == Signal.HOLD and _mr_ok_regime:
                     mr_sig = mr_strategy.get_latest_signal(df)
-                    # Allow MR if it has any signal in non-trending regime,
-                    # OR if RSI is at an extreme (≤27 or ≥73) even outside RANGING
-                    _rsi_extreme = mr_sig and (
-                        (mr_sig.is_buy  and mr_sig.rsi <= 27) or
-                        (mr_sig.is_sell and mr_sig.rsi >= 73)
-                    )
-                    if mr_sig and mr_sig.signal != Signal.HOLD and (
-                        regime_name == 'RANGING' or _rsi_extreme
-                    ):
+                    _rsi_extreme = False  # mr-extreme path disabled
+                    if mr_sig and mr_sig.signal != Signal.HOLD and regime_name == 'RANGING':
                         # Higher confidence for the extreme-RSI variant (higher edge)
                         mr_conf = 70.0 if _rsi_extreme else 62.0
                         regime_score_mr = 12.0 if regime_name == 'RANGING' else 8.0
@@ -1459,6 +1542,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
                 portfolio_opt.optimize(symbol_returns)
 
+            # Refresh perp funding rates ~ every 5 min when in perp mode
+            if trader.perp_mode and iteration % 150 == 0 and hasattr(exchange, 'fetch_funding_rate'):
+                for sym in symbols:
+                    try:
+                        rate = await exchange.fetch_funding_rate(sym)
+                        if rate is not None:
+                            trader.set_funding_rate(sym, float(rate))
+                    except Exception as fr_exc:
+                        logger.debug(f"[PERPS] funding fetch failed for {sym}: {fr_exc}")
+
             # Update prices from WS
             if public_ws:
                 for sym, p in public_ws.get_prices().items():
@@ -1467,6 +1560,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         last_ws_price_time[sym] = time.time()
                         lead_lag.update_price(sym, p)
             trader.update_unrealized_pnl(prices)
+            if trader.perp_mode:
+                trader.accrue_funding(datetime.now(timezone.utc))
 
             # Heartbeat — log alive status once a minute so we know it's running
             now_hb = time.time()
