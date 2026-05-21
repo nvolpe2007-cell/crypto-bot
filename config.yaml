@@ -28,16 +28,23 @@ risk:
   max_open_positions: 3
 
 futures:
-  enabled: false          # set true to enable perp trading alongside spot
-  sandbox: true           # uses Kraken Futures demo (demo.kraken-futures.com)
+  enabled: true           # set true to enable perp trading
+  sandbox: false          # public funding/price data is mainnet
   pairs:
     - BTC/USD             # internally mapped to BTC/USD:USD on krakenfutures
     - ETH/USD
     - SOL/USD
-  leverage: 1             # 1x = no liquidation risk, same exposure as spot
-  max_position_size: 25   # max USD per perp trade
-  # Keys: set KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET in .env
-  # Get them from: https://futures.kraken.com → Settings → API
+  leverage: 3             # 3x default — capital efficient, modest liquidation risk
+  max_position_size: 25   # max USD margin per perp trade
+  # ── Activation ────────────────────────────────────────────────────────────
+  # Paper perps (no money at risk):
+  #   set TRADING_MODE=perps  in env, restart bot
+  # Live perps on Kraken Futures (real money):
+  #   1. set KRAKEN_FUTURES_API_KEY and KRAKEN_FUTURES_API_SECRET in .env
+  #      (separate keys from spot — get them from futures.kraken.com → Settings → API)
+  #   2. set TRADING_MODE=perps
+  #   3. set PERPS_LIVE_ACK=yes (explicit confirmation gate)
+  #   4. set trading.mode=live in this config
 
 backtest:
   # Historical period to test

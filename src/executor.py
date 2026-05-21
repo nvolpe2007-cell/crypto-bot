@@ -133,45 +133,115 @@ class KrakenSpotExecutor(Executor):
 
 class KrakenPerpsExecutor(Executor):
     """
-    Kraken Futures perpetuals via Kraken Futures REST API or ccxt's
-    'krakenfutures' module. Supports both directions natively with up
-    to 50x leverage on majors (we default to PERPS_LEVERAGE=3 for safety).
+    Live Kraken Futures perpetuals via ccxt.krakenfutures.
 
-    NOT YET WIRED. Two things needed before going live:
-      1. Kraken Futures API key (separate from spot keys)
-      2. Position sizing in CONTRACTS — perps quote in USD-margined contracts,
-         so size_usd / contract_value = contracts to buy/sell
+    Sizing semantics: caller passes `size_usd` representing notional exposure.
+    With leverage L, margin actually locked on the exchange is size_usd / L.
+    Contracts to trade = size_usd / price (1 contract = 1 unit of underlying
+    for BTC/ETH/SOL perps on Kraken Futures; CCXT handles the conversion).
+
+    Expects the bot to maintain its own picture of open positions; the executor
+    just routes orders. Position tracking continues to live in PaperTrader-like
+    accounts, but with real fills swapped in.
     """
     name = "kraken-perps"
 
     def __init__(self, ccxt_futures_client, leverage: float = PERPS_DEFAULT_LEVERAGE):
-        self.client   = ccxt_futures_client
-        self.leverage = leverage
+        self.client    = ccxt_futures_client
+        self.leverage  = max(1.0, float(leverage))
+        # Track open position size per symbol so close_* can size correctly.
+        self._open_size: Dict[str, float] = {}
         logger.info(f"[PERPS] Kraken Futures executor initialized "
-                    f"(leverage={self.leverage:.1f}x) — STUB, not wired")
+                    f"(leverage={self.leverage:.1f}x)")
 
-    def _contracts_from_usd(self, symbol: str, price: float, size_usd: float) -> float:
-        # Each contract on Kraken Futures is 1 USD notional for most perps;
-        # number of contracts = notional in USD. Override per-symbol if needed.
-        return size_usd * self.leverage
+    def _amount_from_usd(self, price: float, size_usd: float) -> float:
+        """Number of underlying units to trade for the requested USD notional."""
+        if price <= 0:
+            return 0.0
+        return size_usd / price
 
-    def open_long(self, symbol, price, size_usd, timestamp, **kw):
-        # When wired:
-        #   contracts = self._contracts_from_usd(symbol, price, size_usd)
-        #   self.client.create_market_buy_order(symbol, contracts, params={'leverage': self.leverage})
-        raise NotImplementedError(
-            "KrakenPerpsExecutor.open_long: wire up when ready. "
-            "Will use leverage and quote in contracts."
+    def _perp_symbol(self, symbol: str) -> str:
+        """Map spot symbol → perp unified symbol (e.g. BTC/USD → BTC/USD:USD)."""
+        if ":" in symbol:
+            return symbol
+        return f"{symbol}:USD"
+
+    def _market_order(self, side: str, symbol: str, amount: float,
+                      reduce_only: bool = False) -> Dict:
+        perp   = self._perp_symbol(symbol)
+        params = {
+            "leverage": self.leverage,
+            "reduceOnly": reduce_only,
+        }
+        return self.client.create_order(
+            perp, type="market", side=side, amount=amount, params=params
         )
 
+    def open_long(self, symbol, price, size_usd, timestamp, **kw):
+        amount = self._amount_from_usd(price, size_usd)
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="zero amount")
+        try:
+            order = self._market_order("buy", symbol, amount, reduce_only=False)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            filled_size  = float(order.get("filled") or amount)
+            fee          = float((order.get("fee") or {}).get("cost", 0.0))
+            self._open_size[symbol] = self._open_size.get(symbol, 0.0) + filled_size
+            logger.info(f"[PERPS-LIVE] LONG  {symbol} {filled_size:.6f} @ ${filled_price:.2f}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price,
+                               filled_size, fee, is_leveraged=True,
+                               leverage=self.leverage)
+        except Exception as e:
+            logger.error(f"[PERPS-LIVE] open_long failed: {e}")
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
+
     def open_short(self, symbol, price, size_usd, timestamp, **kw):
-        raise NotImplementedError("KrakenPerpsExecutor.open_short: wire up when ready")
+        amount = self._amount_from_usd(price, size_usd)
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="zero amount")
+        try:
+            order = self._market_order("sell", symbol, amount, reduce_only=False)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            filled_size  = float(order.get("filled") or amount)
+            fee          = float((order.get("fee") or {}).get("cost", 0.0))
+            self._open_size[symbol] = self._open_size.get(symbol, 0.0) - filled_size
+            logger.info(f"[PERPS-LIVE] SHORT {symbol} {filled_size:.6f} @ ${filled_price:.2f}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price,
+                               filled_size, fee, is_leveraged=True,
+                               leverage=self.leverage)
+        except Exception as e:
+            logger.error(f"[PERPS-LIVE] open_short failed: {e}")
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_long(self, symbol, price, timestamp, reason=""):
-        raise NotImplementedError("KrakenPerpsExecutor.close_long: wire up when ready")
+        amount = abs(self._open_size.get(symbol, 0.0))
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="no long position")
+        try:
+            order = self._market_order("sell", symbol, amount, reduce_only=True)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            self._open_size[symbol] = 0.0
+            logger.info(f"[PERPS-LIVE] CLOSE-LONG {symbol} {amount:.6f} @ ${filled_price:.2f}  {reason}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price,
+                               amount, 0.0, is_leveraged=True, leverage=self.leverage)
+        except Exception as e:
+            logger.error(f"[PERPS-LIVE] close_long failed: {e}")
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_short(self, symbol, price, timestamp, reason=""):
-        raise NotImplementedError("KrakenPerpsExecutor.close_short: wire up when ready")
+        amount = abs(self._open_size.get(symbol, 0.0))
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="no short position")
+        try:
+            order = self._market_order("buy", symbol, amount, reduce_only=True)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            self._open_size[symbol] = 0.0
+            logger.info(f"[PERPS-LIVE] CLOSE-SHORT {symbol} {amount:.6f} @ ${filled_price:.2f}  {reason}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price,
+                               amount, 0.0, is_leveraged=True, leverage=self.leverage)
+        except Exception as e:
+            logger.error(f"[PERPS-LIVE] close_short failed: {e}")
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
 
 
 # ── Factory ────────────────────────────────────────────────────────────────

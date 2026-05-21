@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 # Ensure logs/ directory exists before FileHandler is created
 Path('logs').mkdir(exist_ok=True)
 
-from .exchange import ExchangeConnection
+from .exchange import ExchangeConnection, KrakenFuturesConnection
 from .indicators import prepare_ohlcv_dataframe
 from .backtester import Backtester, run_backtest, print_backtest_report
 from .paper_trading import PaperTrader, run_paper_trading_session
@@ -33,6 +33,7 @@ from .task_supervisor import supervised
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'arbitrage'))
 from funding_scanner import FundingScanner
+from funding_arb_paper import FundingArbPaperSim
 
 # Load environment variables
 load_dotenv()
@@ -124,14 +125,22 @@ class ScalpingBot:
 
     async def _run_paper_mode(self):
         """Run paper trading simulation"""
+        trading_mode = os.getenv('TRADING_MODE', 'paper').lower()
+        is_perps     = trading_mode == 'perps'
+        leverage     = float(os.getenv('PERPS_LEVERAGE',
+                                       str(self.config.get('futures', {}).get('leverage', 3))))
+
         print(f"\n{'='*60}")
-        print(f"PAPER TRADING MODE")
+        print(f"PAPER TRADING MODE  ({'PERPS @ ' + str(leverage) + 'x' if is_perps else 'SPOT'})")
         print(f"Initial Capital: ${self.initial_capital}")
         print(f"Symbols: {self.symbols}")
         print(f"{'='*60}\n")
 
-        # Initialize exchange (public data only for paper trading)
-        self.exchange = ExchangeConnection(sandbox=False)
+        # Initialize exchange (Kraken Futures for perps, spot otherwise)
+        if is_perps:
+            self.exchange = KrakenFuturesConnection(sandbox=False)
+        else:
+            self.exchange = ExchangeConnection(sandbox=False)
         await self.exchange.connect()
 
         # Initialize paper trader
@@ -140,7 +149,9 @@ class ScalpingBot:
             initial_capital=self.initial_capital,
             position_size=self.position_size,
             stop_loss_pct=risk_cfg.get('stop_loss_pct', 2.0),
-            take_profit_pct=risk_cfg.get('take_profit_pct', 3.0)
+            take_profit_pct=risk_cfg.get('take_profit_pct', 3.0),
+            perp_mode=is_perps,
+            leverage=leverage,
         )
 
         notifier  = create_notifier_from_env()
@@ -175,14 +186,33 @@ class ScalpingBot:
 
     async def _run_live_mode(self):
         """Run live trading with real money on Kraken."""
-        api_key    = os.getenv('KRAKEN_API_KEY')
-        api_secret = os.getenv('KRAKEN_API_SECRET')
+        trading_mode = os.getenv('TRADING_MODE', 'spot').lower()
+        is_perps     = trading_mode == 'perps'
 
-        if not api_key or not api_secret:
-            logger.error("KRAKEN_API_KEY or KRAKEN_API_SECRET not set in .env")
-            return
-
-        self.exchange = ExchangeConnection(api_key=api_key, secret=api_secret, sandbox=False)
+        if is_perps:
+            api_key    = os.getenv('KRAKEN_FUTURES_API_KEY')
+            api_secret = os.getenv('KRAKEN_FUTURES_API_SECRET')
+            if not api_key or not api_secret:
+                logger.error("KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET not set — "
+                             "get separate keys from futures.kraken.com")
+                return
+            if not os.getenv('PERPS_LIVE_ACK'):
+                logger.error(
+                    "LIVE PERPS gate: set PERPS_LIVE_ACK=yes to confirm. "
+                    "LiveTrader currently routes orders for spot; live perp execution "
+                    "via KrakenPerpsExecutor is wired at the executor level but is not "
+                    "yet plumbed through LiveTrader. Prove out paper perps first."
+                )
+                return
+            self.exchange = KrakenFuturesConnection(api_key=api_key, secret=api_secret, sandbox=False)
+            logger.warning("[PERPS-LIVE] Running live with Kraken Futures data feed")
+        else:
+            api_key    = os.getenv('KRAKEN_API_KEY')
+            api_secret = os.getenv('KRAKEN_API_SECRET')
+            if not api_key or not api_secret:
+                logger.error("KRAKEN_API_KEY or KRAKEN_API_SECRET not set in .env")
+                return
+            self.exchange = ExchangeConnection(api_key=api_key, secret=api_secret, sandbox=False)
         await self.exchange.connect()
 
         notifier   = create_notifier_from_env()
@@ -225,9 +255,10 @@ class ScalpingBot:
             await self.exchange.disconnect()
 
 
-async def _run_funding_scanner():
-    """Run funding rate scanner and merge results into shared state."""
+async def _run_funding_scanner(notifier=None):
+    """Run funding rate scanner + paper-arb sim. Merge scanner results into shared state."""
     scanner = FundingScanner(notifier=None)
+    arb_sim = FundingArbPaperSim(scanner=scanner, notifier=notifier)
 
     async def _merge_state():
         while True:
@@ -235,11 +266,12 @@ async def _run_funding_scanner():
             try:
                 state = read_state()
                 state['funding_opportunities'] = scanner.get_state()
+                state['funding_arb'] = arb_sim.get_summary()
                 write_state(state)
             except Exception as exc:
                 logger.warning("[FundingScanner] State merge failed: %s", exc)
 
-    await asyncio.gather(scanner.start(), _merge_state())
+    await asyncio.gather(scanner.start(), arb_sim.start(), _merge_state())
 
 
 async def main():
@@ -248,10 +280,11 @@ async def main():
     bot = ScalpingBot(config)
 
     loop = asyncio.get_running_loop()
+    notifier = create_notifier_from_env()
     gather_task = asyncio.gather(
         bot.start(),
         run_dashboard(),
-        _run_funding_scanner(),
+        _run_funding_scanner(notifier=notifier),
     )
 
     def _handle_shutdown():
