@@ -43,6 +43,7 @@ class OrderFlowImbalance:
         self._fetched: Dict[str, float]        = {}   # timestamp of last successful fetch
         self._history: Dict[str, deque]        = {s: deque(maxlen=_HIST_LEN) for s in symbols}
         self._depth:   Dict[str, tuple]        = {}   # symbol → (bid_vol, ask_vol) top-N
+        self._top:     Dict[str, tuple]        = {}   # symbol → (bid_px, bid_sz, ask_px, ask_sz)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -66,6 +67,12 @@ class OrderFlowImbalance:
             self._fetched[symbol] = time.time()
             self._history[symbol].append(ofi)
             self._depth[symbol]   = (bid_vol, ask_vol)
+            # Cache best bid/ask (price, size) for microprice
+            if bids and asks and len(bids[0]) >= 2 and len(asks[0]) >= 2:
+                self._top[symbol] = (
+                    float(bids[0][0]), float(bids[0][1]),
+                    float(asks[0][0]), float(asks[0][1]),
+                )
             logger.debug(f"[OFI] {symbol}  {ofi:+.3f}  (bid {bid_vol:.4f}  ask {ask_vol:.4f})")
             return ofi
 
@@ -125,6 +132,57 @@ class OrderFlowImbalance:
         if ofi is None:
             return True
         return ofi < _BULL_THRESH + 0.10   # block only above +0.30
+
+    def get_microprice(self, symbol: str) -> Optional[float]:
+        """
+        Depth-weighted true mid:
+            microprice = (bid_sz × ask_px + ask_sz × bid_px) / (bid_sz + ask_sz)
+        Tilts toward whichever side has more size — a better short-term fair
+        value than (bid+ask)/2.  Returns None when book data is stale.
+        """
+        if time.time() - self._fetched.get(symbol, 0) > _STALE_SECS:
+            return None
+        top = self._top.get(symbol)
+        if not top:
+            return None
+        bid_px, bid_sz, ask_px, ask_sz = top
+        denom = bid_sz + ask_sz
+        if denom <= 0:
+            return None
+        return (bid_sz * ask_px + ask_sz * bid_px) / denom
+
+    def microprice_blocks(self, symbol: str, side: str, last_price: float,
+                          unfair_mult: float = 1.5) -> Optional[str]:
+        """
+        Block entry when last traded price is meaningfully *worse* than
+        microprice in our direction — i.e. we'd be paying a markup over fair
+        value.  Threshold scales with the bid/ask spread.
+
+        Going long: skip when last_price > microprice + unfair_mult × spread.
+        Going short: skip when last_price < microprice - unfair_mult × spread.
+        """
+        if time.time() - self._fetched.get(symbol, 0) > _STALE_SECS:
+            return None
+        top = self._top.get(symbol)
+        if not top or last_price <= 0:
+            return None
+        bid_px, _, ask_px, _ = top
+        spread = ask_px - bid_px
+        if spread <= 0:
+            return None
+        micro = self.get_microprice(symbol)
+        if micro is None:
+            return None
+        diff = last_price - micro
+        side = side.lower()
+        threshold = unfair_mult * spread
+        if side in ('buy', 'long') and diff > threshold:
+            return (f"MICROPRICE_UNFAIR last={last_price:.2f} > micro={micro:.2f} "
+                    f"by {diff:.4f} ({diff/spread:.1f}× spread)")
+        if side in ('sell', 'short') and -diff > threshold:
+            return (f"MICROPRICE_UNFAIR last={last_price:.2f} < micro={micro:.2f} "
+                    f"by {-diff:.4f} ({-diff/spread:.1f}× spread)")
+        return None
 
     def book_imbalance_blocks(self, symbol: str, side: str,
                               ratio: float = _BOOK_IMBALANCE_BLOCK_RATIO) -> Optional[str]:

@@ -33,6 +33,7 @@ from .regime_detector import RegimeDetector
 from .portfolio_optimizer import PortfolioOptimizer
 from .crypto_vol import CryptoVolMonitor
 from .order_flow import OrderFlowImbalance
+from .wick_analyzer import detect_rejection, detect_stop_hunt
 from .lead_lag_detector import LeadLagDetector
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
@@ -914,6 +915,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     return div_reason
         except Exception:
             pass
+        # Microprice unfair — paying a markup over depth-weighted fair value
+        try:
+            last_price = float(df['close'].iloc[-1]) if len(df) else 0.0
+            if last_price > 0:
+                mp_reason = ofi_calc.microprice_blocks(sym, side, last_price)
+                if mp_reason:
+                    return mp_reason
+        except Exception:
+            pass
+        # Wick rejection — clustered rejections forming a ceiling (long) or floor (short)
+        try:
+            rej_reason = detect_rejection(df, side=side)
+            if rej_reason:
+                return rej_reason
+        except Exception:
+            pass
         return None
 
     async def _seed_cache():
@@ -1184,6 +1201,25 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if mtf_adj != 0.0:
                         sig.confidence = max(0.0, min(100.0, sig.confidence + mtf_adj))
                         sig.size_mult  = _get_size_mult(sig.confidence)
+
+                # ── Stop-hunt boost: +6 confidence when a recent flush aligns ──
+                # A wick that pierced a 60-bar swing and was reclaimed within 2
+                # bars is a forced-liquidation event; trading WITH the reversal
+                # historically prints a high win rate, so nudge confidence up.
+                if sig.signal != Signal.HOLD:
+                    try:
+                        hunt_side = 'buy' if sig.is_buy else 'sell'
+                        hunt = detect_stop_hunt(df, side=hunt_side)
+                        if hunt is not None:
+                            sig.confidence = min(100.0, sig.confidence + 6.0)
+                            sig.size_mult  = _get_size_mult(sig.confidence)
+                            logger.info(
+                                f"[STOP-HUNT] {symbol} {hunt_side.upper()} pierce="
+                                f"{hunt['pierce_price']:.2f} swing={hunt['swing_level']:.2f} "
+                                f"reclaim_lag={hunt['reclaim_lag']} → conf+6"
+                            )
+                    except Exception:
+                        pass
 
                 # ── Mean-reversion: RANGING regime only (mr-extreme disabled) ──
                 # mr-extreme was 28/32 trades with 7.1% WR — disabled after live data.
