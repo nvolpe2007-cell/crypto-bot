@@ -86,22 +86,19 @@ class PortfolioOptimizer:
         min_len = min(len(v) for v in returns.values())
         if min_len < _MIN_HISTORY:
             logger.debug(f"[CVaR] Not enough history ({min_len} < {_MIN_HISTORY}) — equal weights")
-            equal = 1.0 / n
-            return {s: round(equal, 4) for s in symbols}
+            return self._equal_weights(symbols)
+
+        # Build returns matrix and correlation matrix unconditionally — these use
+        # only numpy (always available) and must be stored even when scipy is absent.
+        max_len = max(len(v) for v in returns.values())
+        R = np.zeros((max_len, n))
+        for j, sym in enumerate(symbols):
+            r = np.array(returns[sym])
+            R[max_len - len(r):, j] = r
+        self._correlations = np.corrcoef(R.T)
 
         try:
             from scipy.optimize import minimize
-
-            # Build returns matrix (rows=observations, cols=assets)
-            max_len = max(len(v) for v in returns.values())
-            R = np.zeros((max_len, n))
-            for j, sym in enumerate(symbols):
-                r = np.array(returns[sym])
-                # Align to same length by padding with zeros at start
-                R[max_len - len(r):, j] = r
-
-            # Store correlation matrix for display
-            self._correlations = np.corrcoef(R.T)
 
             # Initial guess: equal weights
             w0 = np.ones(n) / n
@@ -146,7 +143,9 @@ class PortfolioOptimizer:
 
     def _equal_weights(self, symbols: List[str]) -> Dict[str, float]:
         w = round(1.0 / len(symbols), 4)
-        return {s: w for s in symbols}
+        weights = {s: w for s in symbols}
+        self._last_weights = weights
+        return weights
 
     def get_position_size(self, symbol: str, base_usd: float) -> float:
         """Scale base_usd by the symbol's CVaR weight."""
