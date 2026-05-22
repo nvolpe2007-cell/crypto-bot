@@ -129,9 +129,26 @@ class TestRetryHelper:
         fn = AsyncMock(side_effect=[ccxt.NetworkError("x"), ccxt.NetworkError("y"), "ok"])
         await conn._retry(fn, retries=3, label='test')
         calls = asyncio.sleep.call_args_list
-        # First backoff: 2**1 = 2, second: 2**2 = 4
-        assert calls[0] == call(2)
-        assert calls[1] == call(4)
+        # Base: 2**1 = 2 and 2**2 = 4; jitter adds up to 1s so check floor
+        assert 2 <= calls[0].args[0] < 3
+        assert 4 <= calls[1].args[0] < 5
+
+    async def test_retry_backoff_includes_jitter(self, monkeypatch):
+        """Jitter is added so concurrent instances don't retry in lock-step."""
+        calls = []
+
+        async def capture_sleep(delay):
+            calls.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+
+        conn = _make_conn()
+        fn = AsyncMock(side_effect=[ccxt.NetworkError("x"), "ok"])
+        with patch('src.exchange.random.uniform', return_value=0.42):
+            await conn._retry(fn, retries=3, label='test')
+
+        assert len(calls) == 1
+        assert calls[0] == pytest.approx(2.0 + 0.42)  # 2**1 + fixed jitter
 
     async def test_passes_args_and_kwargs_through(self):
         conn = _make_conn()
@@ -447,6 +464,37 @@ class TestFetchOhlcvBetween:
         )
         assert len(result) == 1
         assert result[0] == batch1[0]
+
+    async def test_stall_guard_breaks_on_no_timestamp_progress(self):
+        """If the exchange keeps returning data with the same last timestamp,
+        the loop must stop instead of spinning forever."""
+        conn = _make_conn()
+        start_ms = 1_704_067_200_000  # 2024-01-01 00:00 UTC
+        # Batch whose last timestamp is BEFORE start_ms — next_ms == start_ms,
+        # so next_ms <= current_ms and the stall guard fires.
+        stale_batch = [[start_ms - 1, 50000, 50100, 49900, 50050, 1.0]]
+        conn.exchange.fetch_ohlcv = AsyncMock(return_value=stale_batch)
+
+        result = await conn.fetch_ohlcv_between(
+            'BTC/USD', '1m', '2024-01-01', '2024-01-02'
+        )
+        # Stale data still returned, but the loop called fetch_ohlcv only once.
+        assert result == stale_batch
+        assert conn.exchange.fetch_ohlcv.call_count == 1
+
+    async def test_aggregates_three_batches(self):
+        """Happy path: multiple pages are concatenated until an empty page."""
+        conn = _make_conn()
+        start_ms = 1_704_067_200_000
+        candle_ms = 60_000  # 1-minute candles
+        batch1 = [[start_ms + i * candle_ms, 1, 1, 1, 1, 1] for i in range(3)]
+        batch2 = [[start_ms + (3 + i) * candle_ms, 1, 1, 1, 1, 1] for i in range(2)]
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=[batch1, batch2, []])
+
+        result = await conn.fetch_ohlcv_between(
+            'BTC/USD', '1m', '2024-01-01', '2024-01-02'
+        )
+        assert len(result) == 5
 
 
 # ── CircuitBreaker unit tests ─────────────────────────────────────────────────

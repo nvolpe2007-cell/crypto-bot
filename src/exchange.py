@@ -5,6 +5,7 @@ Handles market data fetching and order execution via ccxt
 
 import ccxt.async_support as ccxt
 import asyncio
+import random
 import time
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -143,7 +144,9 @@ class ExchangeConnection:
                     f"({type(exc).__name__}): {exc}"
                 )
                 if attempt < retries:
-                    await asyncio.sleep(2 ** attempt)   # 2 s, 4 s, …
+                    # Jitter spreads retries from concurrent instances so they
+                    # don't all hammer the exchange at the exact same moment.
+                    await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
         self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
@@ -208,7 +211,16 @@ class ExchangeConnection:
                 break
 
             all_data.extend(batch)
-            current_ms = batch[-1][0] + 1   # move past last candle
+            next_ms = batch[-1][0] + 1  # move past last candle
+            if next_ms <= current_ms:
+                # Exchange returned data that doesn't advance our cursor —
+                # bail out to avoid an infinite loop.
+                logger.warning(
+                    f"fetch_ohlcv_between({symbol}): timestamp stall "
+                    f"(batch[-1]={batch[-1][0]}, cursor={current_ms}), stopping early"
+                )
+                break
+            current_ms = next_ms
 
         logger.info(f"Fetched {len(all_data)} total candles for {symbol}")
         return all_data
@@ -334,7 +346,7 @@ class KrakenFuturesConnection:
                     f"({type(exc).__name__}): {exc}"
                 )
                 if attempt < retries:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
         self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
