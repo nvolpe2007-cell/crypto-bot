@@ -22,7 +22,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, call, patch
 import ccxt.async_support as ccxt
 
-from src.exchange import KrakenFuturesConnection
+from src.exchange import KrakenFuturesConnection, CircuitBreaker
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -34,7 +34,11 @@ def no_sleep(monkeypatch):
 
 
 def _make_conn() -> KrakenFuturesConnection:
-    """Build a KrakenFuturesConnection with a fully-mocked inner exchange."""
+    """Build a KrakenFuturesConnection with a fully-mocked inner exchange.
+
+    Uses a high circuit-breaker threshold so existing tests are unaffected
+    by the breaker — they only test retry behaviour, not circuit behaviour.
+    """
     conn = KrakenFuturesConnection.__new__(KrakenFuturesConnection)
     conn.sandbox = True
     conn.exchange = MagicMock()
@@ -48,6 +52,8 @@ def _make_conn() -> KrakenFuturesConnection:
     conn.exchange.fetch_funding_rate_history = AsyncMock(return_value=[])
     conn.exchange.fetch_positions = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
+    # High threshold so existing retry tests are not affected by the circuit breaker
+    conn._circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
     return conn
 
 

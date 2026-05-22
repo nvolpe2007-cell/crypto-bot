@@ -11,16 +11,24 @@ Covers:
 - create_order: NO retry — raises immediately (non-idempotent)
 - connect: retry on NetworkError
 - fetch_ohlcv_between: delegates to fetch_ohlcv (inherits retry)
+- CircuitBreaker: opens after threshold consecutive total-failures, resets on
+  success, half-opens after cooldown, does not trip on non-retryable errors
+- _retry circuit integration: CircuitBreakerOpen raised when open, breaker
+  resets on success, only transient exhaustions count toward threshold
+- fetch_ohlcv propagates CircuitBreakerOpen (does not swallow it)
+- KrakenFuturesConnection._retry also has circuit breaker
+- fetch_funding_rate propagates CircuitBreakerOpen
 
 All tests mock asyncio.sleep to avoid actual delays.
 """
 
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch, call
 import ccxt.async_support as ccxt
 
-from src.exchange import ExchangeConnection
+from src.exchange import ExchangeConnection, CircuitBreaker, CircuitBreakerOpen, KrakenFuturesConnection
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -32,7 +40,11 @@ def no_sleep(monkeypatch):
 
 
 def _make_conn() -> ExchangeConnection:
-    """Build an ExchangeConnection with a fully-mocked inner exchange."""
+    """Build an ExchangeConnection with a fully-mocked inner exchange.
+
+    Uses a high circuit-breaker threshold so existing tests are unaffected by
+    the breaker — they only test retry behaviour, not circuit-breaker behaviour.
+    """
     conn = ExchangeConnection.__new__(ExchangeConnection)
     conn.sandbox = True
     conn.exchange = MagicMock()
@@ -46,6 +58,8 @@ def _make_conn() -> ExchangeConnection:
     conn.exchange.fetch_open_orders = AsyncMock(return_value=[])
     conn.exchange.fetch_trades = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
+    # High threshold so existing retry tests are not affected by the circuit breaker
+    conn._circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
     return conn
 
 
@@ -433,3 +447,272 @@ class TestFetchOhlcvBetween:
         )
         assert len(result) == 1
         assert result[0] == batch1[0]
+
+
+# ── CircuitBreaker unit tests ─────────────────────────────────────────────────
+
+class TestCircuitBreakerUnit:
+    def test_initially_closed(self):
+        cb = CircuitBreaker(threshold=3, cooldown_seconds=60)
+        assert not cb.is_open
+        assert cb.failure_count == 0
+
+    def test_check_does_nothing_when_closed(self):
+        cb = CircuitBreaker(threshold=3, cooldown_seconds=60)
+        cb.check()  # must not raise
+
+    def test_record_failure_increments_count(self):
+        cb = CircuitBreaker(threshold=5, cooldown_seconds=60)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.failure_count == 2
+        assert not cb.is_open
+
+    def test_circuit_opens_at_threshold(self):
+        cb = CircuitBreaker(threshold=3, cooldown_seconds=60)
+        for _ in range(3):
+            cb.record_failure()
+        assert cb.is_open
+
+    def test_check_raises_when_open(self):
+        cb = CircuitBreaker(threshold=2, cooldown_seconds=60)
+        cb.record_failure()
+        cb.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            cb.check()
+
+    def test_record_success_resets_failure_count(self):
+        cb = CircuitBreaker(threshold=5, cooldown_seconds=60)
+        cb.record_failure()
+        cb.record_failure()
+        cb.record_success()
+        assert cb.failure_count == 0
+        assert not cb.is_open
+
+    def test_record_success_closes_open_circuit(self):
+        cb = CircuitBreaker(threshold=2, cooldown_seconds=60)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open
+        cb.record_success()
+        assert not cb.is_open
+        cb.check()  # must not raise after reset
+
+    def test_circuit_half_opens_after_cooldown(self):
+        cb = CircuitBreaker(threshold=2, cooldown_seconds=0.01)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open
+        time.sleep(0.02)
+        # After cooldown, is_open returns False (half-open)
+        assert not cb.is_open
+        cb.check()  # must not raise
+
+    def test_check_message_includes_remaining_time(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=120)
+        cb.record_failure()
+        with pytest.raises(CircuitBreakerOpen, match="pausing"):
+            cb.check()
+
+    def test_additional_failures_do_not_reset_timer(self):
+        cb = CircuitBreaker(threshold=2, cooldown_seconds=60)
+        cb.record_failure()
+        cb.record_failure()
+        assert cb.is_open
+        # Extra failures while already open should keep it open
+        cb.record_failure()
+        assert cb.is_open
+
+
+# ── _retry circuit-breaker integration ───────────────────────────────────────
+
+def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> ExchangeConnection:
+    """ExchangeConnection with a custom threshold for easier testing."""
+    conn = ExchangeConnection.__new__(ExchangeConnection)
+    conn.sandbox = True
+    conn.exchange = MagicMock()
+    conn.exchange.load_markets = AsyncMock(return_value={})
+    conn.exchange.fetch_ohlcv = AsyncMock(return_value=[])
+    conn.exchange.fetch_ticker = AsyncMock(return_value={})
+    conn.exchange.fetch_balance = AsyncMock(return_value={})
+    conn.exchange.create_order = AsyncMock(return_value={})
+    conn.exchange.cancel_order = AsyncMock(return_value={})
+    conn.exchange.fetch_open_orders = AsyncMock(return_value=[])
+    conn.exchange.fetch_trades = AsyncMock(return_value=[])
+    conn.exchange.close = AsyncMock(return_value=None)
+    conn._circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    return conn
+
+
+class TestRetryCircuitIntegration:
+    async def test_circuit_starts_closed(self):
+        conn = _make_conn_with_circuit(threshold=3)
+        assert not conn._circuit.is_open
+
+    async def test_successful_call_keeps_circuit_closed(self):
+        conn = _make_conn_with_circuit(threshold=3)
+        fn = AsyncMock(return_value="ok")
+        await conn._retry(fn, retries=3, label='test')
+        assert not conn._circuit.is_open
+
+    async def test_success_resets_partial_failure_count(self):
+        conn = _make_conn_with_circuit(threshold=5)
+        # Two consecutive failures then a success
+        fn = AsyncMock(side_effect=[
+            ccxt.NetworkError("x"), ccxt.NetworkError("x"),  # exhausted on call 1
+        ])
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn, retries=2, label='test')
+        assert conn._circuit.failure_count == 1
+
+        fn2 = AsyncMock(return_value="ok")
+        await conn._retry(fn2, retries=1, label='test2')
+        assert conn._circuit.failure_count == 0
+
+    async def test_circuit_opens_after_threshold_exhausted_retries(self):
+        conn = _make_conn_with_circuit(threshold=2, cooldown=60)
+        fn = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        # Each call to _retry exhausts its retries and increments failure count
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn, retries=2, label='t')  # failure 1
+        assert conn._circuit.failure_count == 1
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn, retries=2, label='t')  # failure 2 → opens
+        assert conn._circuit.is_open
+
+    async def test_circuit_open_raises_circuit_breaker_open(self):
+        conn = _make_conn_with_circuit(threshold=1, cooldown=60)
+        fn = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn, retries=1, label='t')  # trips breaker
+        assert conn._circuit.is_open
+
+        fn2 = AsyncMock(return_value="ok")
+        with pytest.raises(CircuitBreakerOpen):
+            await conn._retry(fn2, retries=1, label='t2')
+        # fn2 must NOT have been called — circuit blocked it
+        fn2.assert_not_called()
+
+    async def test_non_retryable_error_does_not_trip_circuit(self):
+        """Auth errors propagate immediately and must NOT count toward the circuit."""
+        conn = _make_conn_with_circuit(threshold=2, cooldown=60)
+        fn = AsyncMock(side_effect=ccxt.AuthenticationError("bad key"))
+        for _ in range(5):
+            with pytest.raises(ccxt.AuthenticationError):
+                await conn._retry(fn, retries=3, label='t')
+        # Non-retryable errors never exhaust retries, so circuit stays closed
+        assert not conn._circuit.is_open
+        assert conn._circuit.failure_count == 0
+
+    async def test_circuit_resets_on_success_after_partial_failures(self):
+        conn = _make_conn_with_circuit(threshold=3, cooldown=60)
+        fn_fail = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        # Two exhausted calls (below threshold — circuit stays closed)
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn_fail, retries=1, label='t')
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(fn_fail, retries=1, label='t')
+        assert conn._circuit.failure_count == 2
+
+        fn_ok = AsyncMock(return_value="recovered")
+        result = await conn._retry(fn_ok, retries=1, label='t')
+        assert result == "recovered"
+        assert conn._circuit.failure_count == 0
+        assert not conn._circuit.is_open
+
+
+# ── fetch_ohlcv propagates CircuitBreakerOpen ─────────────────────────────────
+
+class TestFetchOhlcvCircuitBreaker:
+    async def test_fetch_ohlcv_propagates_circuit_breaker_open(self):
+        """fetch_ohlcv must NOT swallow CircuitBreakerOpen (unlike other errors)."""
+        conn = _make_conn_with_circuit(threshold=1, cooldown=60)
+        # Trip the breaker
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        result = await conn.fetch_ohlcv('BTC/USD', retries=1)
+        assert result == []  # first call exhausts retries → returns []
+        assert conn._circuit.is_open
+
+        # Second call must raise CircuitBreakerOpen, not return []
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.fetch_ohlcv('BTC/USD', retries=1)
+
+    async def test_fetch_ohlcv_normal_failure_still_returns_empty(self):
+        """Non-circuit-breaker failures still return [] as before."""
+        conn = _make_conn_with_circuit(threshold=10)  # high threshold, won't open
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        result = await conn.fetch_ohlcv('BTC/USD', retries=1)
+        assert result == []
+
+
+# ── KrakenFuturesConnection circuit breaker ───────────────────────────────────
+
+def _make_futures_conn(threshold: int = 3, cooldown: float = 60.0) -> KrakenFuturesConnection:
+    conn = KrakenFuturesConnection.__new__(KrakenFuturesConnection)
+    conn.sandbox = True
+    conn.exchange = MagicMock()
+    conn.exchange.load_markets = AsyncMock(return_value={})
+    conn.exchange.fetch_ohlcv = AsyncMock(return_value=[])
+    conn.exchange.fetch_ticker = AsyncMock(return_value={})
+    conn.exchange.fetch_balance = AsyncMock(return_value={})
+    conn.exchange.fetch_funding_rate = AsyncMock(return_value={'fundingRate': 0.0001})
+    conn.exchange.fetch_funding_rate_history = AsyncMock(return_value=[])
+    conn.exchange.create_order = AsyncMock(return_value={})
+    conn.exchange.cancel_order = AsyncMock(return_value={})
+    conn.exchange.fetch_positions = AsyncMock(return_value=[])
+    conn.exchange.close = AsyncMock(return_value=None)
+    conn._circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    return conn
+
+
+class TestFuturesCircuitBreaker:
+    async def test_circuit_starts_closed(self):
+        conn = _make_futures_conn()
+        assert not conn._circuit.is_open
+
+    async def test_circuit_opens_after_threshold_failures(self):
+        conn = _make_futures_conn(threshold=2, cooldown=60)
+        conn.exchange.fetch_ticker = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(conn.exchange.fetch_ticker, retries=1, label='t')
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(conn.exchange.fetch_ticker, retries=1, label='t')
+        assert conn._circuit.is_open
+
+    async def test_retry_raises_circuit_breaker_open_when_open(self):
+        conn = _make_futures_conn(threshold=1, cooldown=60)
+        conn.exchange.fetch_ticker = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn._retry(conn.exchange.fetch_ticker, retries=1, label='t')
+        assert conn._circuit.is_open
+        with pytest.raises(CircuitBreakerOpen):
+            await conn._retry(AsyncMock(return_value="ok"), retries=1, label='t2')
+
+    async def test_fetch_ohlcv_propagates_circuit_breaker_open(self):
+        conn = _make_futures_conn(threshold=1, cooldown=60)
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        await conn.fetch_ohlcv('BTC/USD', retries=1)  # trips breaker
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.fetch_ohlcv('BTC/USD', retries=1)
+
+    async def test_fetch_funding_rate_propagates_circuit_breaker_open(self):
+        conn = _make_futures_conn(threshold=1, cooldown=60)
+        conn.exchange.fetch_funding_rate = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        result = await conn.fetch_funding_rate('BTC/USD', retries=1)
+        assert result is None  # first call → exhausted retries → None
+        # Now circuit is open — next call must raise
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.fetch_funding_rate('BTC/USD', retries=1)
+
+    async def test_success_resets_circuit(self):
+        conn = _make_futures_conn(threshold=3, cooldown=60)
+        conn.exchange.fetch_ticker = AsyncMock(side_effect=ccxt.NetworkError("x"))
+        # Two failures (below threshold)
+        for _ in range(2):
+            with pytest.raises(ccxt.NetworkError):
+                await conn._retry(conn.exchange.fetch_ticker, retries=1, label='t')
+        assert conn._circuit.failure_count == 2
+        # Success resets
+        fn_ok = AsyncMock(return_value={'last': 50000.0})
+        await conn._retry(fn_ok, retries=1, label='ok')
+        assert conn._circuit.failure_count == 0

@@ -5,6 +5,7 @@ Handles market data fetching and order execution via ccxt
 
 import ccxt.async_support as ccxt
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional, List, Dict
 import logging
@@ -17,10 +18,89 @@ logger = logging.getLogger(__name__)
 _RETRYABLE = (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.RateLimitExceeded)
 
 
+class CircuitBreakerOpen(Exception):
+    """Raised when too many consecutive API call failures have tripped the circuit breaker.
+
+    The bot should treat this as a signal to pause all trading until the exchange
+    recovers. The circuit resets automatically after `cooldown_seconds`, or
+    immediately when the next call succeeds.
+    """
+
+
+class CircuitBreaker:
+    """
+    Tracks consecutive total-failure calls and opens a cooldown window once
+    the failure count reaches the configured threshold.
+
+    Usage inside _retry:
+      - Call check() at the top — raises CircuitBreakerOpen if the circuit is open.
+      - Call record_success() when a call succeeds — resets the failure counter.
+      - Call record_failure() when all retries are exhausted — increments counter
+        and opens the circuit if threshold is reached.
+
+    The circuit is "half-open" after the cooldown expires: it allows one call
+    through. If that call succeeds, record_success() fully resets the state.
+    If it fails again, record_failure() re-opens the circuit.
+    """
+
+    def __init__(self, threshold: int = 5, cooldown_seconds: float = 60.0):
+        self.threshold = threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._failures = 0
+        self._open_until: Optional[float] = None  # time.monotonic() timestamp
+
+    @property
+    def failure_count(self) -> int:
+        return self._failures
+
+    @property
+    def is_open(self) -> bool:
+        if self._open_until is None:
+            return False
+        if time.monotonic() < self._open_until:
+            return True
+        # Cooldown expired — half-open; let next call through
+        self._open_until = None
+        return False
+
+    def check(self) -> None:
+        """Raise CircuitBreakerOpen if the circuit is currently open."""
+        if self._open_until is not None and time.monotonic() < self._open_until:
+            remaining = self._open_until - time.monotonic()
+            raise CircuitBreakerOpen(
+                f"Exchange circuit breaker open — pausing for {remaining:.0f}s more "
+                f"after {self._failures} consecutive failures"
+            )
+        if self._open_until is not None:
+            # Cooldown just expired — half-open, allow call through
+            self._open_until = None
+
+    def record_success(self) -> None:
+        """Reset the breaker after any successful API call."""
+        if self._failures > 0:
+            logger.info(
+                f"[CircuitBreaker] Reset — exchange recovered after "
+                f"{self._failures} consecutive failure(s)"
+            )
+        self._failures = 0
+        self._open_until = None
+
+    def record_failure(self) -> None:
+        """Increment failure count; open circuit when threshold is reached."""
+        self._failures += 1
+        if self._failures >= self.threshold:
+            self._open_until = time.monotonic() + self.cooldown_seconds
+            logger.warning(
+                f"[CircuitBreaker] OPEN — {self._failures} consecutive total-failures. "
+                f"Pausing all exchange calls for {self.cooldown_seconds:.0f}s."
+            )
+
+
 class ExchangeConnection:
     """Async wrapper around Kraken exchange"""
 
-    def __init__(self, api_key: str = None, secret: str = None, sandbox: bool = True):
+    def __init__(self, api_key: str = None, secret: str = None, sandbox: bool = True,
+                 circuit_threshold: int = 5, circuit_cooldown: float = 60.0):
         self.sandbox = sandbox
         self.exchange = ccxt.kraken({
             'apiKey': api_key or '',
@@ -32,6 +112,8 @@ class ExchangeConnection:
         })
         if sandbox:
             self.exchange.set_sandbox_mode(True)
+        self._circuit = CircuitBreaker(threshold=circuit_threshold,
+                                       cooldown_seconds=circuit_cooldown)
         logger.info(f"Exchange initialized (sandbox={sandbox})")
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
@@ -42,12 +124,18 @@ class ExchangeConnection:
         RateLimitExceeded).  Any other exception propagates immediately so that
         programming errors and permanent exchange rejections are never hidden.
 
-        Raises the last seen exception when all attempts are exhausted.
+        Raises CircuitBreakerOpen if the circuit is currently open (too many
+        consecutive total-failures across all calls on this connection).
+
+        Raises the last seen _RETRYABLE exception when all attempts are exhausted.
         """
+        self._circuit.check()  # raises CircuitBreakerOpen if open
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
-                return await coro_fn(*args, **kwargs)
+                result = await coro_fn(*args, **kwargs)
+                self._circuit.record_success()
+                return result
             except _RETRYABLE as exc:
                 last_exc = exc
                 logger.warning(
@@ -56,6 +144,7 @@ class ExchangeConnection:
                 )
                 if attempt < retries:
                     await asyncio.sleep(2 ** attempt)   # 2 s, 4 s, …
+        self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
 
@@ -74,8 +163,9 @@ class ExchangeConnection:
                           retries: int = 3) -> List:
         """Fetch candlestick data with automatic retry on transient errors.
 
-        Returns [] (rather than raising) when all retries are exhausted so that
-        callers that poll in a loop can simply skip the symbol for this tick.
+        Returns [] when all retries are exhausted so that callers in a polling
+        loop can skip the symbol for this tick.  CircuitBreakerOpen propagates
+        to the caller unchanged so the bot can detect an outage and pause.
         """
         try:
             return await self._retry(
@@ -83,6 +173,8 @@ class ExchangeConnection:
                 timeframe=timeframe, limit=limit, since=since,
                 retries=retries, label=f'fetch_ohlcv({symbol})',
             )
+        except CircuitBreakerOpen:
+            raise
         except Exception as exc:
             logger.error(f"fetch_ohlcv({symbol}) exhausted retries: {exc}")
             return []
@@ -202,7 +294,8 @@ class KrakenFuturesConnection:
         'SOL/USD': 'SOL/USD:USD',
     }
 
-    def __init__(self, api_key: str = None, secret: str = None, sandbox: bool = True):
+    def __init__(self, api_key: str = None, secret: str = None, sandbox: bool = True,
+                 circuit_threshold: int = 5, circuit_cooldown: float = 60.0):
         self.sandbox = sandbox
         self.exchange = ccxt.krakenfutures({
             'apiKey': api_key or '',
@@ -211,6 +304,8 @@ class KrakenFuturesConnection:
         })
         if sandbox:
             self.exchange.set_sandbox_mode(True)
+        self._circuit = CircuitBreaker(threshold=circuit_threshold,
+                                       cooldown_seconds=circuit_cooldown)
         logger.info(f"Kraken Futures initialized (sandbox={sandbox})")
 
     def perp_symbol(self, spot_symbol: str) -> str:
@@ -219,15 +314,19 @@ class KrakenFuturesConnection:
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
                      label: str = '?', **kwargs):
-        """Identical retry semantics to ExchangeConnection._retry.
+        """Identical retry + circuit-breaker semantics to ExchangeConnection._retry.
 
         Retries only _RETRYABLE errors with exponential backoff.
         Non-transient errors (auth, bad params) propagate immediately.
+        Raises CircuitBreakerOpen if the circuit is open.
         """
+        self._circuit.check()
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
-                return await coro_fn(*args, **kwargs)
+                result = await coro_fn(*args, **kwargs)
+                self._circuit.record_success()
+                return result
             except _RETRYABLE as exc:
                 last_exc = exc
                 logger.warning(
@@ -236,6 +335,7 @@ class KrakenFuturesConnection:
                 )
                 if attempt < retries:
                     await asyncio.sleep(2 ** attempt)
+        self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
 
@@ -251,7 +351,9 @@ class KrakenFuturesConnection:
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m',
                           limit: int = 1000, since: Optional[int] = None,
                           retries: int = 3) -> List:
-        """Fetch futures OHLCV with retry. Returns [] when all retries fail."""
+        """Fetch futures OHLCV with retry. Returns [] when all retries fail.
+        CircuitBreakerOpen propagates unchanged.
+        """
         perp = self.perp_symbol(symbol)
         try:
             return await self._retry(
@@ -259,6 +361,8 @@ class KrakenFuturesConnection:
                 timeframe=timeframe, limit=limit, since=since,
                 retries=retries, label=f'futures.fetch_ohlcv({perp})',
             )
+        except CircuitBreakerOpen:
+            raise
         except Exception as exc:
             logger.error(f"futures.fetch_ohlcv({perp}) exhausted retries: {exc}")
             return []
@@ -275,6 +379,7 @@ class KrakenFuturesConnection:
         """Current funding rate as a fraction (e.g. 0.0001 = 0.01% per 8h).
 
         Returns None on permanent failure so callers can skip gracefully.
+        CircuitBreakerOpen propagates unchanged.
         """
         try:
             data = await self._retry(
@@ -282,13 +387,17 @@ class KrakenFuturesConnection:
                 retries=retries, label=f'futures.fetch_funding_rate({symbol})',
             )
             return data.get('fundingRate')
+        except CircuitBreakerOpen:
+            raise
         except Exception as e:
             logger.warning(f"Funding rate fetch failed for {symbol}: {e}")
             return None
 
     async def fetch_funding_rate_history(self, symbol: str, limit: int = 3,
                                           retries: int = 3) -> List[Dict]:
-        """Recent funding rate history. Returns [] on permanent failure."""
+        """Recent funding rate history. Returns [] on permanent failure.
+        CircuitBreakerOpen propagates unchanged.
+        """
         try:
             return await self._retry(
                 self.exchange.fetch_funding_rate_history,
@@ -297,6 +406,8 @@ class KrakenFuturesConnection:
                 retries=retries,
                 label=f'futures.fetch_funding_rate_history({symbol})',
             )
+        except CircuitBreakerOpen:
+            raise
         except Exception as e:
             logger.warning(f"Funding history fetch failed for {symbol}: {e}")
             return []
@@ -328,12 +439,16 @@ class KrakenFuturesConnection:
         )
 
     async def get_open_positions(self, retries: int = 3) -> List:
-        """Get all open perp positions with retry. Returns [] on permanent failure."""
+        """Get all open perp positions with retry. Returns [] on permanent failure.
+        CircuitBreakerOpen propagates unchanged.
+        """
         try:
             return await self._retry(
                 self.exchange.fetch_positions,
                 retries=retries, label='futures.get_open_positions',
             )
+        except CircuitBreakerOpen:
+            raise
         except Exception as e:
             logger.warning(f"Fetch positions failed: {e}")
             return []
