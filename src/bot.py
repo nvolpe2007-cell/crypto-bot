@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 Path('logs').mkdir(exist_ok=True)
 
 from .exchange import ExchangeConnection, KrakenFuturesConnection
+from .config_validator import validate_config, ConfigValidationError
 from .indicators import prepare_ohlcv_dataframe
 from .backtester import Backtester, run_backtest, print_backtest_report
 from .paper_trading import PaperTrader, run_paper_trading_session
@@ -51,9 +52,27 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(config_path: str = 'config.yaml') -> dict:
-    """Load configuration from YAML file"""
+    """Load and validate configuration from YAML file.
+
+    Raises ConfigValidationError if any critical setting is missing or invalid.
+    Non-critical warnings are logged at WARNING level so they appear in the log
+    file before the first exchange connection is opened.
+    """
     with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+
+    try:
+        warnings = validate_config(config)
+    except ConfigValidationError as exc:
+        # Log each error individually so they're easy to spot in log files
+        for err in exc.errors:
+            logger.error(f"[CONFIG] {err}")
+        raise
+
+    for w in warnings:
+        logger.warning(f"[CONFIG] {w}")
+
+    return config
 
 
 class ScalpingBot:
