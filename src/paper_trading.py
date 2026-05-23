@@ -1846,6 +1846,9 @@ _POSITIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data
 
 def _save_open_positions(trader):
     """Dump open positions to disk so a restart can resume them."""
+    def _iso(dt):
+        return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
+
     try:
         os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
         out = []
@@ -1853,7 +1856,7 @@ def _save_open_positions(trader):
             out.append({
                 'symbol':           sym,
                 'side':             pos.side,
-                'entry_time':       pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                'entry_time':       _iso(pos.entry_time),
                 'entry_price':      pos.entry_price,
                 'size':             pos.size,
                 'entry_fee':        pos.entry_fee,
@@ -1861,6 +1864,25 @@ def _save_open_positions(trader):
                 'peak_adverse':     pos.peak_adverse_price,
                 'entry_path':       pos.entry_path,
                 'size_usd_target':  pos.size_usd_target,
+                # Trailing stop / conviction tier
+                'tier':             pos.tier,
+                'intended_hold_min': pos.intended_hold_min,
+                'trail_style':      pos.trail_style,
+                'trail_stop_price': pos.trail_stop_price,
+                'target_usd_at_entry': pos.target_usd_at_entry,
+                # Probability gate context
+                'prob_win':         pos.prob_win,
+                'edges_used':       pos.edges_used,
+                # Entry context snapshot
+                'spread_at_entry':  pos.spread_at_entry,
+                'sentiment_fng':    pos.sentiment_fng,
+                'sentiment_btc_dom': pos.sentiment_btc_dom,
+                # Perp-specific fields (zeros in spot mode, important for perp resume)
+                'is_perp':          pos.is_perp,
+                'leverage':         pos.leverage,
+                'margin_locked':    pos.margin_locked,
+                'funding_accrued':  pos.funding_accrued,
+                'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
             })
         with open(_POSITIONS_FILE, 'w') as f:
             json.dump({
@@ -1883,6 +1905,9 @@ def _load_open_positions(trader):
         restored = 0
         for p in state.get('positions', []):
             try:
+                last_funding_raw = p.get('last_funding_ts')
+                last_funding_ts  = datetime.fromisoformat(last_funding_raw) if last_funding_raw else None
+
                 pos = PaperPosition(
                     entry_time      = datetime.fromisoformat(p['entry_time']),
                     entry_price     = float(p['entry_price']),
@@ -1893,6 +1918,25 @@ def _load_open_positions(trader):
                     peak_adverse_price   = float(p.get('peak_adverse',   p['entry_price'])),
                     entry_path      = p.get('entry_path', 'main'),
                     size_usd_target = float(p.get('size_usd_target', 0.0)),
+                    # Trailing stop / conviction tier
+                    tier                 = p.get('tier', 'scalp'),
+                    intended_hold_min    = int(p.get('intended_hold_min', 0)),
+                    trail_style          = p.get('trail_style', 'atr_stop'),
+                    trail_stop_price     = float(p.get('trail_stop_price', 0.0)),
+                    target_usd_at_entry  = float(p.get('target_usd_at_entry', 0.0)),
+                    # Probability gate context
+                    prob_win             = float(p.get('prob_win', 0.0)),
+                    edges_used           = list(p.get('edges_used', [])),
+                    # Entry context snapshot
+                    spread_at_entry      = float(p.get('spread_at_entry', 0.0)),
+                    sentiment_fng        = p.get('sentiment_fng'),
+                    sentiment_btc_dom    = p.get('sentiment_btc_dom'),
+                    # Perp-specific fields
+                    is_perp              = bool(p.get('is_perp', False)),
+                    leverage             = float(p.get('leverage', 1.0)),
+                    margin_locked        = float(p.get('margin_locked', 0.0)),
+                    funding_accrued      = float(p.get('funding_accrued', 0.0)),
+                    last_funding_ts      = last_funding_ts,
                 )
                 trader.account.positions[p['symbol']] = pos
                 restored += 1
