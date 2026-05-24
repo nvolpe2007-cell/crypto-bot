@@ -42,17 +42,28 @@ class CircuitBreaker:
     The circuit is "half-open" after the cooldown expires: it allows one call
     through. If that call succeeds, record_success() fully resets the state.
     If it fails again, record_failure() re-opens the circuit.
+
+    Cooldown escalates on repeated trips (×1 → ×2 → ×5) so a persistently
+    down exchange doesn't get hammered every 60 seconds.
     """
+
+    # Cooldown multipliers for successive trips: 1st=×1, 2nd=×2, 3rd+=×5
+    _COOLDOWN_MULTIPLIERS = (1, 2, 5)
 
     def __init__(self, threshold: int = 5, cooldown_seconds: float = 60.0):
         self.threshold = threshold
         self.cooldown_seconds = cooldown_seconds
         self._failures = 0
         self._open_until: Optional[float] = None  # time.monotonic() timestamp
+        self._consecutive_opens: int = 0  # tracks escalation across trips
 
     @property
     def failure_count(self) -> int:
         return self._failures
+
+    @property
+    def consecutive_open_count(self) -> int:
+        return self._consecutive_opens
 
     @property
     def is_open(self) -> bool:
@@ -85,15 +96,24 @@ class CircuitBreaker:
             )
         self._failures = 0
         self._open_until = None
+        self._consecutive_opens = 0
 
     def record_failure(self) -> None:
-        """Increment failure count; open circuit when threshold is reached."""
+        """Increment failure count; open circuit when threshold is reached.
+
+        Cooldown escalates on repeated trips so a persistently-down exchange
+        is not retried every 60s: trip 1=60s, trip 2=120s, trip 3+=300s.
+        """
         self._failures += 1
         if self._failures >= self.threshold:
-            self._open_until = time.monotonic() + self.cooldown_seconds
+            self._consecutive_opens += 1
+            idx = min(self._consecutive_opens - 1, len(self._COOLDOWN_MULTIPLIERS) - 1)
+            cooldown = self.cooldown_seconds * self._COOLDOWN_MULTIPLIERS[idx]
+            self._open_until = time.monotonic() + cooldown
             logger.warning(
-                f"[CircuitBreaker] OPEN — {self._failures} consecutive total-failures. "
-                f"Pausing all exchange calls for {self.cooldown_seconds:.0f}s."
+                f"[CircuitBreaker] OPEN (trip #{self._consecutive_opens}) — "
+                f"{self._failures} consecutive total-failures. "
+                f"Pausing all exchange calls for {cooldown:.0f}s."
             )
 
 
@@ -125,6 +145,9 @@ class ExchangeConnection:
         RateLimitExceeded).  Any other exception propagates immediately so that
         programming errors and permanent exchange rejections are never hidden.
 
+        RateLimitExceeded uses a 30s minimum wait because Kraken's rate-limit
+        window is typically 30+ seconds — hammering it sooner wastes retries.
+
         Raises CircuitBreakerOpen if the circuit is currently open (too many
         consecutive total-failures across all calls on this connection).
 
@@ -144,9 +167,14 @@ class ExchangeConnection:
                     f"({type(exc).__name__}): {exc}"
                 )
                 if attempt < retries:
-                    # Jitter spreads retries from concurrent instances so they
-                    # don't all hammer the exchange at the exact same moment.
-                    await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
+                    if isinstance(exc, ccxt.RateLimitExceeded):
+                        # Kraken's rate-limit window is ≥30s; respect it.
+                        wait = max(30.0, 2 ** attempt) + random.uniform(0, 2)
+                    else:
+                        # Jitter spreads retries from concurrent instances so
+                        # they don't all hammer the exchange at the same moment.
+                        wait = 2 ** attempt + random.uniform(0, 1)
+                    await asyncio.sleep(wait)
         self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
@@ -329,6 +357,7 @@ class KrakenFuturesConnection:
         """Identical retry + circuit-breaker semantics to ExchangeConnection._retry.
 
         Retries only _RETRYABLE errors with exponential backoff.
+        RateLimitExceeded uses a 30s minimum wait (Kraken's reset window).
         Non-transient errors (auth, bad params) propagate immediately.
         Raises CircuitBreakerOpen if the circuit is open.
         """
@@ -346,7 +375,11 @@ class KrakenFuturesConnection:
                     f"({type(exc).__name__}): {exc}"
                 )
                 if attempt < retries:
-                    await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
+                    if isinstance(exc, ccxt.RateLimitExceeded):
+                        wait = max(30.0, 2 ** attempt) + random.uniform(0, 2)
+                    else:
+                        wait = 2 ** attempt + random.uniform(0, 1)
+                    await asyncio.sleep(wait)
         self._circuit.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc

@@ -764,3 +764,143 @@ class TestFuturesCircuitBreaker:
         fn_ok = AsyncMock(return_value={'last': 50000.0})
         await conn._retry(fn_ok, retries=1, label='ok')
         assert conn._circuit.failure_count == 0
+
+
+# ── Rate-limit-specific backoff ───────────────────────────────────────────────
+
+class TestRateLimitBackoff:
+    """RateLimitExceeded must wait ≥30s; other retryable errors use 2^n backoff."""
+
+    async def test_rate_limit_waits_at_least_30s(self, monkeypatch):
+        waits = []
+
+        async def capture_sleep(delay):
+            waits.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+        conn = _make_conn()
+        fn = AsyncMock(side_effect=[ccxt.RateLimitExceeded("429"), "ok"])
+        with patch('src.exchange.random.uniform', return_value=0.0):
+            await conn._retry(fn, retries=3, label='test')
+        assert len(waits) == 1
+        assert waits[0] >= 30.0
+
+    async def test_network_error_does_not_trigger_30s_wait(self, monkeypatch):
+        waits = []
+
+        async def capture_sleep(delay):
+            waits.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+        conn = _make_conn()
+        fn = AsyncMock(side_effect=[ccxt.NetworkError("blip"), "ok"])
+        with patch('src.exchange.random.uniform', return_value=0.0):
+            await conn._retry(fn, retries=3, label='test')
+        assert len(waits) == 1
+        assert waits[0] < 30.0  # 2**1 = 2s
+
+    async def test_rate_limit_adds_jitter_on_top_of_minimum(self, monkeypatch):
+        waits = []
+
+        async def capture_sleep(delay):
+            waits.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+        conn = _make_conn()
+        fn = AsyncMock(side_effect=[ccxt.RateLimitExceeded("429"), "ok"])
+        with patch('src.exchange.random.uniform', return_value=1.5):
+            await conn._retry(fn, retries=3, label='test')
+        assert waits[0] == pytest.approx(31.5)  # 30 + 1.5 jitter
+
+    async def test_rate_limit_still_retries_and_succeeds(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        conn = _make_conn()
+        fn = AsyncMock(side_effect=[ccxt.RateLimitExceeded("429"), "recovered"])
+        result = await conn._retry(fn, retries=3, label='test')
+        assert result == "recovered"
+        assert fn.call_count == 2
+
+    async def test_futures_rate_limit_waits_at_least_30s(self, monkeypatch):
+        waits = []
+
+        async def capture_sleep(delay):
+            waits.append(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", capture_sleep)
+        conn = _make_futures_conn()
+        fn = AsyncMock(side_effect=[ccxt.RateLimitExceeded("429"), "ok"])
+        with patch('src.exchange.random.uniform', return_value=0.0):
+            await conn._retry(fn, retries=3, label='test')
+        assert len(waits) == 1
+        assert waits[0] >= 30.0
+
+
+# ── CircuitBreaker cooldown escalation ────────────────────────────────────────
+
+class TestCircuitBreakerEscalation:
+    """Cooldown escalates across repeated trips: ×1 → ×2 → ×5 (capped)."""
+
+    def _trip_and_force_close(self, cb: CircuitBreaker) -> None:
+        """Trip the breaker then immediately expire the cooldown."""
+        cb.record_failure()
+        cb._open_until = time.monotonic() - 1  # fast-forward past cooldown
+
+    def test_first_trip_uses_base_cooldown(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        before = time.monotonic()
+        cb.record_failure()
+        assert cb.is_open
+        assert cb.consecutive_open_count == 1
+        assert cb._open_until == pytest.approx(before + 60.0, abs=1.0)
+
+    def test_second_trip_doubles_cooldown(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        self._trip_and_force_close(cb)
+        before = time.monotonic()
+        cb.record_failure()
+        assert cb.consecutive_open_count == 2
+        assert cb._open_until == pytest.approx(before + 120.0, abs=1.0)
+
+    def test_third_trip_applies_5x_multiplier(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        self._trip_and_force_close(cb)
+        self._trip_and_force_close(cb)
+        before = time.monotonic()
+        cb.record_failure()
+        assert cb.consecutive_open_count == 3
+        assert cb._open_until == pytest.approx(before + 300.0, abs=1.0)
+
+    def test_fourth_trip_caps_at_5x(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        for _ in range(3):
+            self._trip_and_force_close(cb)
+        before = time.monotonic()
+        cb.record_failure()
+        assert cb.consecutive_open_count == 4
+        # Still capped at ×5 = 300s
+        assert cb._open_until == pytest.approx(before + 300.0, abs=1.0)
+
+    def test_success_resets_escalation_counter(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        self._trip_and_force_close(cb)
+        self._trip_and_force_close(cb)
+        assert cb.consecutive_open_count == 2
+        cb.record_success()
+        assert cb.consecutive_open_count == 0
+
+    def test_after_success_reset_next_trip_uses_base_cooldown(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        self._trip_and_force_close(cb)
+        self._trip_and_force_close(cb)
+        cb.record_success()
+        before = time.monotonic()
+        cb.record_failure()
+        # Should be back to ×1 = 60s
+        assert cb.consecutive_open_count == 1
+        assert cb._open_until == pytest.approx(before + 60.0, abs=1.0)
+
+    def test_consecutive_open_count_property(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        assert cb.consecutive_open_count == 0
+        self._trip_and_force_close(cb)
+        assert cb.consecutive_open_count == 1
