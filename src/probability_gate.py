@@ -30,7 +30,11 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
-# ── Tunables (calibrate from trade_journal later) ──────────────────────────
+# ── Tunables ───────────────────────────────────────────────────────────────
+# The per-edge priors below are deliberately modest hand-set values. They are
+# NOT assumed correct: src/calibration.py fits an isotonic map from the stacked
+# combined_p to the empirical win rate in the trade journal, and the gate routes
+# its reject threshold + Kelly sizing through that calibrated probability.
 
 # Hard threshold: don't take trades below this combined probability
 MIN_PROBABILITY = float(os.getenv("PROB_GATE_MIN_P", "0.58"))
@@ -70,7 +74,10 @@ class Edge:
 class TradeReasoning:
     direction: str                   # "LONG" / "SHORT"
     edges: List[Edge]                # all edges considered (present + absent)
-    combined_p: float                # stacked probability across present edges
+    combined_p: float                # RAW stacked probability across present edges
+                                     #   (this is what gets journaled as prob_win and
+                                     #    what the calibrator is trained to map FROM —
+                                     #    never overwrite it with a calibrated value)
     kelly_fraction: float            # full-Kelly f*
     quarter_kelly: float             # f*/4 (what we actually use)
     size_scale: float                # final size multiplier (≤ 1.0)
@@ -82,6 +89,11 @@ class TradeReasoning:
     target_usd: float = 5.0          # dollar size suggested by tier
     hold_minutes: int = 60           # intended max hold (trail can exit sooner)
     trail_style: str = "atr_stop"    # atr_stop | ema21_1h | ema50_4h
+    # Calibration (set when a fitted ProbabilityCalibrator is attached to the gate)
+    calibrated_p: float = 0.0        # combined_p mapped through the calibrator;
+                                     #   == combined_p when calibration is inactive.
+                                     #   ALL decisions (reject / Kelly / tier) use this.
+    calibration_active: bool = False
 
     @property
     def present_edges(self) -> List[Edge]:
@@ -324,9 +336,14 @@ class ProbabilityGate:
             notifier.send_trade_reasoning(symbol, side, price, reasoning, size_usd, entry_path)
     """
 
-    def __init__(self, min_p: float = MIN_PROBABILITY, kelly_ref: float = KELLY_REF):
+    def __init__(self, min_p: float = MIN_PROBABILITY, kelly_ref: float = KELLY_REF,
+                 calibrator=None):
         self.min_p = min_p
         self.kelly_ref = kelly_ref
+        # Optional ProbabilityCalibrator (src/calibration.py). When attached and
+        # active, the gate's reject threshold and Kelly sizing run on the
+        # *calibrated* win probability instead of the raw stacked guess.
+        self.calibrator = calibrator
 
     def evaluate(self,
                  sig,
@@ -351,7 +368,12 @@ class ProbabilityGate:
         ]
 
         present_probs = [e.p_win for e in edges if e.present]
-        combined_p = _stack(present_probs)
+        combined_p = _stack(present_probs)               # RAW — journaled & used to train the calibrator
+
+        # Calibrated probability drives every downstream decision. When no
+        # calibrator is attached (or it lacks data) this is identical to raw.
+        cal_active = self.calibrator is not None and getattr(self.calibrator, "is_active", False)
+        decision_p = self.calibrator.calibrate(combined_p) if cal_active else combined_p
 
         # R:R from the signal's own stop/target
         try:
@@ -361,23 +383,27 @@ class ProbabilityGate:
         except Exception:
             rr = 2.0
 
-        k_full = _kelly(combined_p, rr)
+        k_full = _kelly(decision_p, rr)
         k_quarter = k_full * 0.25
         size_scale = min(1.0, k_quarter / self.kelly_ref) if self.kelly_ref > 0 else 1.0
         size_scale = max(0.0, size_scale)
 
-        rejected = combined_p < self.min_p
+        rejected = decision_p < self.min_p
         reason = None
         if rejected:
-            reason = f"P={combined_p:.2f} < min {self.min_p:.2f} (only {len(present_probs)} edges present)"
+            cal_note = f" (raw {combined_p:.2f}, calibrated)" if cal_active else ""
+            reason = (f"P={decision_p:.2f}{cal_note} < min {self.min_p:.2f} "
+                      f"(only {len(present_probs)} edges present)")
 
         macro_driven = any(e.present and e.name in ("gold", "contagion") for e in edges)
-        tier, target_usd, hold_min, trail = _classify_tier(combined_p, len(present_probs))
+        tier, target_usd, hold_min, trail = _classify_tier(decision_p, len(present_probs))
 
         return TradeReasoning(
             direction="LONG" if is_buy else "SHORT",
             edges=edges,
             combined_p=combined_p,
+            calibrated_p=decision_p,
+            calibration_active=cal_active,
             kelly_fraction=k_full,
             quarter_kelly=k_quarter,
             size_scale=size_scale,

@@ -649,7 +649,19 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     ml_scorer   = MLScorer(journal)
     htf_filter  = MultiTimeframeFilter(exchange)
     mr_strategy = MeanReversionStrategy()
-    prob_gate   = ProbabilityGate() if PROB_GATE_ENABLED else None
+    # Probability calibrator: maps the gate's raw stacked P(win) to the empirical
+    # win rate from the journal. Stays identity until ~40 resolved trades exist.
+    calibrator = None
+    if PROB_GATE_ENABLED:
+        try:
+            from .calibration import ProbabilityCalibrator
+            calibrator = ProbabilityCalibrator()
+            _calib_report = calibrator.fit_from_journal(journal)
+            logger.info("[CALIB] %s", _calib_report.render().splitlines()[0])
+        except Exception as e:
+            logger.warning(f"[CALIB] disabled ({e}); gate will use raw stacked P")
+            calibrator = None
+    prob_gate   = ProbabilityGate(calibrator=calibrator) if PROB_GATE_ENABLED else None
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
     macro_provider = MacroDataProvider()
@@ -659,7 +671,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
                 f"(max {cb_status['max_losses']} losses, halted={cb_status['halted']})")
     if prob_gate:
-        logger.info(f"[PROB-GATE] Enabled (min_p={prob_gate.min_p:.2f}, kelly_ref={prob_gate.kelly_ref:.3f})")
+        _cal_on = bool(getattr(calibrator, "is_active", False))
+        logger.info(f"[PROB-GATE] Enabled (min_p={prob_gate.min_p:.2f}, kelly_ref={prob_gate.kelly_ref:.3f}, "
+                    f"calibration={'active' if _cal_on else 'identity (collecting trades)'})")
     strategy.ml_scorer = ml_scorer
     # Attempt initial load/train if journal already has data
     if ml_scorer.should_retrain():
@@ -785,7 +799,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         summary = trader.get_account_summary()
                         equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
                         _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
-                                         notifier, journal, ml_scorer)
+                                         notifier, journal, ml_scorer, calibrator)
                         _record_exit(sym, exit_reason)
                         just_halted, halt_msg = circuit_breaker.record_outcome(
                             won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
@@ -1185,7 +1199,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 summary = trader.get_account_summary()
                                 equity_curve.append({'t': _ts(datetime.now(timezone.utc)), 'v': round(summary['total_equity'], 2)})
                                 _on_trade_closed(symbol, pos_check, trade, exit_reason,
-                                                 summary['total_equity'], notifier, journal, ml_scorer)
+                                                 summary['total_equity'], notifier, journal, ml_scorer, calibrator)
                                 _record_exit(symbol, exit_reason)
                                 just_halted, halt_msg = circuit_breaker.record_outcome(
                                     won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
@@ -1392,8 +1406,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             macro_state=macro_provider.current(),
                             symbol=symbol,
                         )
+                        _praw = f" (raw {reasoning.combined_p:.2f})" if reasoning.calibration_active else ""
                         logger.info(
-                            f"[PROB-GATE] {symbol} LONG  P={reasoning.combined_p:.2f} "
+                            f"[PROB-GATE] {symbol} LONG  P={reasoning.calibrated_p:.2f}{_praw} "
                             f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
                             f"macro={reasoning.is_macro_driven}"
                         )
@@ -1497,8 +1512,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             macro_state=macro_provider.current(),
                             symbol=symbol,
                         )
+                        _praw = f" (raw {reasoning.combined_p:.2f})" if reasoning.calibration_active else ""
                         logger.info(
-                            f"[PROB-GATE] {symbol} SHORT P={reasoning.combined_p:.2f} "
+                            f"[PROB-GATE] {symbol} SHORT P={reasoning.calibrated_p:.2f}{_praw} "
                             f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
                             f"macro={reasoning.is_macro_driven}"
                         )
@@ -1560,7 +1576,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             summary = trader.get_account_summary()
                             equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                             _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                             notifier, journal, ml_scorer)
+                                             notifier, journal, ml_scorer, calibrator)
                             _record_exit(symbol, "SIGNAL")
                             opposing_streak.pop(symbol, None)
                             just_halted, halt_msg = circuit_breaker.record_outcome(
@@ -1587,7 +1603,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             summary = trader.get_account_summary()
                             equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                             _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                             notifier, journal, ml_scorer)
+                                             notifier, journal, ml_scorer, calibrator)
                             _record_exit(symbol, "SIGNAL")
                             opposing_streak.pop(symbol, None)
                             just_halted, halt_msg = circuit_breaker.record_outcome(
@@ -1775,7 +1791,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
                      exit_reason: str, total_equity: float,
                      notifier: Optional[TelegramNotifier], journal: TradeJournal,
-                     ml_scorer: Optional['MLScorer'] = None):
+                     ml_scorer: Optional['MLScorer'] = None,
+                     calibrator=None):
     if pos is None:
         return
 
@@ -1792,6 +1809,16 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
     if ml_scorer is not None and ml_scorer.should_retrain():
         logger.info("[ML] Retraining triggered after new trades")
         ml_scorer.train()
+
+    # Refit the probability calibrator on the freshly-updated journal (no-op
+    # until it has grown by CALIB_REFIT_EVERY trades since the last fit).
+    if calibrator is not None:
+        try:
+            if calibrator.maybe_refit(journal):
+                logger.info("[CALIB] refit on %d trades (active=%s)",
+                            calibrator._n_fit, calibrator.is_active)
+        except Exception as e:
+            logger.warning(f"[CALIB] refit skipped: {e}")
 
     adaptations = _update_streaks_and_adapt(trade.pnl > 0, notifier)
 
