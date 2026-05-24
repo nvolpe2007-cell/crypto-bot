@@ -571,7 +571,12 @@ class PaperTrader:
         for sym, pos in self.account.positions.items():
             if sym in prices:
                 p = prices[sym]
-                pos.unrealized_pnl = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
+                raw = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
+                # Perp positions accrue funding continuously; include it so that
+                # get_account_summary() and the daily circuit breaker see the true
+                # equity (funding paid by longs reduces equity, collected by shorts
+                # increases it) before the position is closed.
+                pos.unrealized_pnl = raw + pos.funding_accrued if pos.is_perp else raw
                 # Track excursions (favorable = direction we want, adverse = against us)
                 if pos.side == 'buy':
                     if p > pos.peak_favorable_price: pos.peak_favorable_price = p
