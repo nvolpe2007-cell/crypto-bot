@@ -38,7 +38,21 @@ MAX_HOLD_DAYS = 7              # safety cap
 MAX_CONCURRENT_POSITIONS = 3
 POSITION_SIZE_USD = 500.0      # per leg (so $1000 capital used per pair)
 FUNDING_CYCLE_HOURS = 8        # standard for Binance/Bybit perps
-ROLLUP_INTERVAL_SECONDS = 86400  # 24h
+
+# ── APY cap: skip absurd funding ─────────────────────────────────────────────
+# The scanner's top |APY| names are almost always tiny illiquid alt perps
+# (e.g. 800–2000% APY meme coins). That funding is real on paper but rarely
+# capturable live — you may not be able to short the perp or buy the spot at
+# size, and the rate flips violently. Cap entries so we only hold plausibly
+# realistic, executable opportunities. Env-tunable.
+MAX_ENTRY_APY = float(os.getenv('FUNDING_ARB_MAX_APY', '150.0'))
+
+# ── Notifications ────────────────────────────────────────────────────────────
+# Per-open / per-close Telegram alerts (default on) + a configurable rollup
+# cadence (default hourly) so funding activity is actually visible, not buried
+# in a once-a-day summary.
+NOTIFY_PER_TRADE = os.getenv('FUNDING_ARB_NOTIFY_PER_TRADE', '1') == '1'
+ROLLUP_INTERVAL_SECONDS = float(os.getenv('FUNDING_ARB_ROLLUP_HOURS', '1.0')) * 3600
 
 # ── Cost model ───────────────────────────────────────────────────────────────
 # Cash-and-carry is FOUR taker fills round-trip: open(spot)+open(perp) and
@@ -91,10 +105,12 @@ class FundingArbPaperSim:
         min_entry_apy: float = MIN_ENTRY_APY,
         position_size_usd: float = POSITION_SIZE_USD,
         max_positions: int = MAX_CONCURRENT_POSITIONS,
+        max_entry_apy: float = MAX_ENTRY_APY,
     ):
         self.scanner = scanner
         self.notifier = notifier
         self.min_entry_apy = min_entry_apy
+        self.max_entry_apy = max_entry_apy
         self.position_size_usd = position_size_usd
         self.max_positions = max_positions
 
@@ -142,12 +158,22 @@ class FundingArbPaperSim:
 
     # ── core sim loop ──────────────────────────────────────────────────────────
 
+    def _notify(self, msg: str):
+        """Best-effort per-event Telegram alert (gated by NOTIFY_PER_TRADE)."""
+        if not (NOTIFY_PER_TRADE and self.notifier):
+            return
+        try:
+            self.notifier.send_message(msg)
+        except Exception as e:
+            logger.warning(f"[FundingArbPaper] notify failed: {e}")
+
     async def start(self):
         self.running = True
         logger.info(
-            f"[FundingArbPaper] Started (paper, silent). "
-            f"min_apy={self.min_entry_apy}% size=${self.position_size_usd} "
-            f"max_positions={self.max_positions}"
+            f"[FundingArbPaper] Started (paper). "
+            f"apy={self.min_entry_apy}-{self.max_entry_apy}% size=${self.position_size_usd} "
+            f"max_positions={self.max_positions} per_trade_alerts={NOTIFY_PER_TRADE} "
+            f"rollup={ROLLUP_INTERVAL_SECONDS/3600:.0f}h"
         )
 
         rollup_task = asyncio.create_task(self._rollup_loop())
@@ -189,6 +215,14 @@ class FundingArbPaperSim:
                     f"cost=${pos.entry_cost:.4f} net=${pos.net_pnl:+.4f} "
                     f"cycles={pos.cycles_collected}"
                 )
+                emoji = "✅" if pos.net_pnl >= 0 else "❌"
+                self._notify(
+                    f"{emoji} <b>Funding Arb CLOSE</b>\n"
+                    f"{pos.exchange} {pos.symbol}\n"
+                    f"net <b>${pos.net_pnl:+.4f}</b> "
+                    f"(funding ${pos.funding_collected:.4f} − cost ${pos.entry_cost:.2f})\n"
+                    f"{pos.cycles_collected} funding cycles · {reason}"
+                )
 
         # 2. Look for new entries
         if len(self.open_positions) < self.max_positions:
@@ -199,6 +233,13 @@ class FundingArbPaperSim:
                 if key in self.open_positions:
                     continue
                 if abs(opp['apy']) < self.min_entry_apy:
+                    continue
+                if abs(opp['apy']) > self.max_entry_apy:
+                    logger.info(
+                        f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                        f"apy={opp['apy']:.0f}% > cap {self.max_entry_apy:.0f}% "
+                        f"(illiquid/unstable — not realistically capturable)"
+                    )
                     continue
                 # Cost-aware gate: reject unless funding at the entry rate clears
                 # the round-trip cost within MAX_BREAKEVEN_CYCLES. The position
@@ -242,6 +283,15 @@ class FundingArbPaperSim:
             f"[FundingArbPaper] OPEN {pos.symbol} ({pos.exchange}) "
             f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd} "
             f"entry_cost=${entry_cost:.4f}"
+        )
+        dir_label = ("long spot / short perp" if direction == "LONG_SPOT_SHORT_PERP"
+                     else "short spot / long perp")
+        self._notify(
+            f"📈 <b>Funding Arb OPEN</b>\n"
+            f"{pos.exchange} {pos.symbol}\n"
+            f"{pos.entry_apy:+.0f}% APY · {dir_label}\n"
+            f"size ${pos.size_usd:.0f} · entry cost ${entry_cost:.2f}\n"
+            f"<i>collects funding every {FUNDING_CYCLE_HOURS}h while open</i>"
         )
 
     def _accrue_funding(
@@ -342,6 +392,7 @@ class FundingArbPaperSim:
         delta = total - self.last_rollup_total
         now = datetime.now(timezone.utc)
         uptime_h = (now - self.start_time).total_seconds() / 3600.0
+        interval_h = ROLLUP_INTERVAL_SECONDS / 3600.0
 
         open_lines = [
             f"  • {p.exchange} {p.symbol}: net ${p.net_pnl:+.4f} "
@@ -362,8 +413,8 @@ class FundingArbPaperSim:
         ] or ["  (none)"]
 
         msg = (
-            f"<b>📊 Funding Arb — Daily P&amp;L (net of costs)</b>\n"
-            f"24h net P&amp;L: <b>${delta:+.4f}</b>\n"
+            f"<b>📊 Funding Arb — P&amp;L rollup (net of costs)</b>\n"
+            f"Last {interval_h:.0f}h net P&amp;L: <b>${delta:+.4f}</b>\n"
             f"Cumulative net: ${total:.4f}\n"
             f"  (gross funding ${self._total_gross_funding():.4f} − "
             f"costs ${self._total_costs():.4f})\n"

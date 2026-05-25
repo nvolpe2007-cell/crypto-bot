@@ -82,6 +82,20 @@ def test_cost_gate_accepts_rich_apy(tmp_path, monkeypatch):
     assert len(sim.open_positions) == 1
 
 
+def test_apy_cap_rejects_absurd_funding(tmp_path, monkeypatch):
+    # apy=2000% is an illiquid meme perp — above the 150% cap → skip.
+    sim = _make_sim(tmp_path, [_opp("LITEUSDT", 2000.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_apy_within_band_opens(tmp_path, monkeypatch):
+    # apy=80% is elevated-but-plausible: clears min (15%), cap (150%), cost gate.
+    sim = _make_sim(tmp_path, [_opp("DOGEUSDT", 80.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
 def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     sim = _make_sim(tmp_path, [_opp("BTCUSDT", 40.0)], monkeypatch)
     sim._tick()
