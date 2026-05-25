@@ -108,6 +108,45 @@ def test_apy_within_band_opens(tmp_path, monkeypatch):
     assert len(sim.open_positions) == 1
 
 
+def _make_majors_sim(tmp_path, opps, monkeypatch):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        symbol_allowlist=fap.MAJOR_SYMBOLS,
+        cost_frac=0.0008,
+        state_file=tmp_path / "majors_state.json",
+        label="Funding Arb (majors)",
+    )
+
+
+def test_majors_arm_rejects_non_major(tmp_path, monkeypatch):
+    # ENJ isn't in the majors allowlist → conservative arm skips it.
+    sim = _make_majors_sim(tmp_path, [_opp("ENJUSDT", 30.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_rejects_negative_funding(tmp_path, monkeypatch):
+    # Negative funding would need a spot short (borrow) → conservative arm skips.
+    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", -30.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_opens_positive_major(tmp_path, monkeypatch):
+    # Positive funding on a major, above the maker-fee floor (~9%) → opens.
+    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", 15.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_majors_arm_lower_cost_floor(tmp_path, monkeypatch):
+    # Maker-fee cost (0.08%) gives a much lower APY floor than the taker default.
+    sim = _make_majors_sim(tmp_path, [], monkeypatch)
+    assert sim._apy_floor() < 10.0   # ~8.8% at 0.08% cost / 10 cycles
+
+
 def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     sim = _make_sim(tmp_path, [_opp("BTCUSDT", 40.0)], monkeypatch)
     sim._tick()

@@ -721,12 +721,31 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     _funding_tasks: List[asyncio.Task] = []
     if os.getenv('FUNDING_ARB_ENABLED', '1') == '1':
         try:
+            from pathlib import Path as _Path
             from arbitrage.funding_scanner import FundingScanner
-            from arbitrage.funding_arb_paper import FundingArbPaperSim
+            from arbitrage.funding_arb_paper import FundingArbPaperSim, MAJOR_SYMBOLS
             from .state import read_state as _read_state, write_state as _write_state
 
             _funding_scanner = FundingScanner(notifier=None)
+
+            # Arm 1 — aggressive/experimental: all symbols, both funding sides,
+            # taker cost. Trades often, but optimistic (ignores spot-borrow on
+            # short-spot legs). Existing behavior, unchanged.
             _funding_arb_sim = FundingArbPaperSim(scanner=_funding_scanner, notifier=notifier)
+
+            # Arm 2 — conservative/"honest": liquid majors only, positive funding
+            # only (long spot / short perp → no borrow needed), maker-fee cost
+            # (~0.08%). Trades rarely, but every trade is genuinely retail-
+            # executable, so its P&L is a believable estimate. Separate ledger +
+            # alert label so the two arms can be compared side by side.
+            _funding_arb_majors = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=True,
+                symbol_allowlist=MAJOR_SYMBOLS,
+                cost_frac=0.0008,
+                state_file=_Path('data/funding_arb_majors_state.json'),
+                label="Funding Arb (majors)",
+            )
 
             async def _merge_funding_state():
                 while True:
@@ -735,6 +754,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         st = _read_state()
                         st['funding_opportunities'] = _funding_scanner.get_state()
                         st['funding_arb'] = _funding_arb_sim.get_summary()
+                        st['funding_arb_majors'] = _funding_arb_majors.get_summary()
                         _write_state(st)
                     except Exception as _exc:
                         logger.warning(f"[FUNDING] state merge failed: {_exc}")
@@ -742,9 +762,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             _funding_tasks = [
                 asyncio.create_task(_funding_scanner.start()),
                 asyncio.create_task(_funding_arb_sim.start()),
+                asyncio.create_task(_funding_arb_majors.start()),
                 asyncio.create_task(_merge_funding_state()),
             ]
-            logger.info("[FUNDING] scanner + cost-aware delta-neutral arb sim started")
+            logger.info("[FUNDING] scanner + 2 delta-neutral arb arms "
+                        "(aggressive + majors-honest) started")
         except Exception as _exc:
             logger.warning(f"[FUNDING] disabled ({_exc})")
 

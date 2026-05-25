@@ -78,6 +78,23 @@ MAX_POSITION_USD   = float(os.getenv('FUNDING_ARB_MAX_SIZE', '1000'))
 MAX_TOTAL_NOTIONAL = float(os.getenv('FUNDING_ARB_MAX_TOTAL', '3000'))
 
 
+# Liquid majors for the conservative "honest" arm — names with deep spot+perp
+# markets where a positive-funding cash-and-carry is genuinely retail-executable.
+MAJOR_SYMBOLS = {
+    'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'AVAX', 'LINK', 'LTC',
+}
+
+
+def _base_symbol(symbol: str) -> str:
+    """Strip the quote suffix from an exchange symbol → base asset.
+    'BTCUSDT' → 'BTC', 'ETHUSD' → 'ETH'."""
+    s = symbol.upper()
+    for quote in ('USDT', 'USDC', 'USD'):
+        if s.endswith(quote):
+            return s[: -len(quote)]
+    return s
+
+
 @dataclass
 class PaperPosition:
     symbol: str
@@ -116,6 +133,11 @@ class FundingArbPaperSim:
         position_size_usd: float = POSITION_SIZE_USD,
         max_positions: int = MAX_CONCURRENT_POSITIONS,
         max_entry_apy: float = MAX_ENTRY_APY,
+        cost_frac: float = ROUND_TRIP_COST_FRAC,
+        positive_funding_only: bool = False,
+        symbol_allowlist: Optional[set] = None,
+        state_file: Optional[Path] = None,
+        label: str = "Funding Arb",
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -123,6 +145,14 @@ class FundingArbPaperSim:
         self.max_entry_apy = max_entry_apy
         self.position_size_usd = position_size_usd
         self.max_positions = max_positions
+        # Per-instance config so the same class can run an aggressive arm
+        # (all symbols, both funding sides) AND a conservative "honest" arm
+        # (liquid majors, positive funding only, maker-fee cost) at once.
+        self.cost_frac = cost_frac
+        self.positive_funding_only = positive_funding_only
+        self.symbol_allowlist = symbol_allowlist   # set of BASE symbols, e.g. {'BTC','ETH'}
+        self.state_file = state_file or STATE_FILE
+        self.label = label
 
         self.open_positions: Dict[str, PaperPosition] = {}
         self.closed_positions: List[PaperPosition] = []
@@ -135,10 +165,10 @@ class FundingArbPaperSim:
     # ── persistence ────────────────────────────────────────────────────────────
 
     def _load_state(self):
-        if not STATE_FILE.exists():
+        if not self.state_file.exists():
             return
         try:
-            data = json.loads(STATE_FILE.read_text())
+            data = json.loads(self.state_file.read_text())
             self.open_positions = {
                 k: PaperPosition(**v) for k, v in data.get('open', {}).items()
             }
@@ -150,21 +180,21 @@ class FundingArbPaperSim:
             if start_iso:
                 self.start_time = datetime.fromisoformat(start_iso)
             logger.info(
-                f"[FundingArbPaper] Restored {len(self.open_positions)} open, "
+                f"[{self.label}] Restored {len(self.open_positions)} open, "
                 f"{len(self.closed_positions)} closed positions"
             )
         except Exception as e:
-            logger.warning(f"[FundingArbPaper] State load failed: {e}")
+            logger.warning(f"[{self.label}] State load failed: {e}")
 
     def _save_state(self):
-        STATE_FILE.parent.mkdir(exist_ok=True)
+        self.state_file.parent.mkdir(exist_ok=True)
         payload = {
             'open': {k: asdict(v) for k, v in self.open_positions.items()},
             'closed': [asdict(v) for v in self.closed_positions[-500:]],
             'last_rollup_total': self.last_rollup_total,
             'start_time_iso': self.start_time.isoformat(),
         }
-        STATE_FILE.write_text(json.dumps(payload, indent=2))
+        self.state_file.write_text(json.dumps(payload, indent=2))
 
     # ── core sim loop ──────────────────────────────────────────────────────────
 
@@ -179,10 +209,13 @@ class FundingArbPaperSim:
 
     async def start(self):
         self.running = True
+        mode = "positive-funding only" if self.positive_funding_only else "both sides"
+        universe = ("majors " + "/".join(sorted(self.symbol_allowlist))
+                    if self.symbol_allowlist else "all symbols")
         logger.info(
-            f"[FundingArbPaper] Started (paper). "
-            f"apy={self.min_entry_apy}-{self.max_entry_apy}% size=${self.position_size_usd} "
-            f"max_positions={self.max_positions} per_trade_alerts={NOTIFY_PER_TRADE} "
+            f"[{self.label}] Started (paper). {mode}, {universe}. "
+            f"floor~{self._apy_floor():.0f}% cap={self.max_entry_apy:.0f}% "
+            f"cost={self.cost_frac*100:.2f}% max_positions={self.max_positions} "
             f"rollup={ROLLUP_INTERVAL_SECONDS/3600:.0f}h"
         )
 
@@ -193,7 +226,7 @@ class FundingArbPaperSim:
                 try:
                     self._tick()
                 except Exception as e:
-                    logger.error(f"[FundingArbPaper] Tick error: {e}")
+                    logger.error(f"[{self.label}] Tick error: {e}")
                 await asyncio.sleep(60)
         finally:
             rollup_task.cancel()
@@ -220,14 +253,14 @@ class FundingArbPaperSim:
                 self.closed_positions.append(pos)
                 del self.open_positions[key]
                 logger.info(
-                    f"[FundingArbPaper] CLOSE {pos.symbol} ({pos.exchange}) "
+                    f"[{self.label}] CLOSE {pos.symbol} ({pos.exchange}) "
                     f"reason={reason} funding=${pos.funding_collected:.4f} "
                     f"cost=${pos.entry_cost:.4f} net=${pos.net_pnl:+.4f} "
                     f"cycles={pos.cycles_collected}"
                 )
                 emoji = "✅" if pos.net_pnl >= 0 else "❌"
                 self._notify(
-                    f"{emoji} <b>Funding Arb CLOSE</b>\n"
+                    f"{emoji} <b>{self.label} CLOSE</b>\n"
                     f"{pos.exchange} {pos.symbol}\n"
                     f"net <b>${pos.net_pnl:+.4f}</b> "
                     f"(funding ${pos.funding_collected:.4f} − cost ${pos.entry_cost:.2f})\n"
@@ -242,11 +275,19 @@ class FundingArbPaperSim:
                 key = f"{opp['exchange']}:{opp['symbol']}"
                 if key in self.open_positions:
                     continue
+                # Conservative arm: positive funding only (long spot / short perp
+                # → no spot borrow needed, so genuinely retail-executable).
+                if self.positive_funding_only and opp['apy'] <= 0:
+                    continue
+                # Conservative arm: restrict to a liquid-majors allowlist.
+                if self.symbol_allowlist is not None and \
+                        _base_symbol(opp['symbol']) not in self.symbol_allowlist:
+                    continue
                 if abs(opp['apy']) < self.min_entry_apy:
                     continue
                 if abs(opp['apy']) > self.max_entry_apy:
                     logger.info(
-                        f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                        f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
                         f"apy={opp['apy']:.0f}% > cap {self.max_entry_apy:.0f}% "
                         f"(illiquid/unstable — not realistically capturable)"
                     )
@@ -257,12 +298,12 @@ class FundingArbPaperSim:
                 rate_8h_frac = abs(float(opp['rate_8h'])) / 100.0
                 if rate_8h_frac <= 0:
                     continue
-                breakeven_cycles = ROUND_TRIP_COST_FRAC / rate_8h_frac
+                breakeven_cycles = self.cost_frac / rate_8h_frac
                 if breakeven_cycles > MAX_BREAKEVEN_CYCLES:
                     logger.info(
-                        f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                        f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
                         f"apy={opp['apy']:.1f}%: breakeven {breakeven_cycles:.1f} cycles "
-                        f"> max {MAX_BREAKEVEN_CYCLES:.0f} (cost {ROUND_TRIP_COST_FRAC*100:.2f}% "
+                        f"> max {MAX_BREAKEVEN_CYCLES:.0f} (cost {self.cost_frac*100:.2f}% "
                         f"vs {rate_8h_frac*100:.4f}%/cycle)"
                     )
                     continue
@@ -273,8 +314,8 @@ class FundingArbPaperSim:
     def _apy_floor(self) -> float:
         """The effective APY floor — the rate at which breakeven == the cost
         gate's max cycles. Below this the cost gate rejects entries, so it's the
-        natural bottom of the conviction-sizing band. ≈24% at defaults."""
-        rate_floor = ROUND_TRIP_COST_FRAC / MAX_BREAKEVEN_CYCLES
+        natural bottom of the conviction-sizing band. ≈24% at the 0.22% cost."""
+        rate_floor = self.cost_frac / MAX_BREAKEVEN_CYCLES
         return rate_floor * 3 * 365 * 100
 
     def _size_for_apy(self, apy: float) -> float:
@@ -302,13 +343,13 @@ class FundingArbPaperSim:
         remaining = MAX_TOTAL_NOTIONAL - self._total_notional()
         if remaining < MIN_POSITION_USD:
             logger.info(
-                f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
                 f"total notional ${self._total_notional():.0f} near cap "
                 f"${MAX_TOTAL_NOTIONAL:.0f}"
             )
             return
         size = min(size, remaining)
-        entry_cost = ROUND_TRIP_COST_FRAC * size
+        entry_cost = self.cost_frac * size
         pos = PaperPosition(
             symbol=opp['symbol'],
             exchange=opp['exchange'],
@@ -323,14 +364,14 @@ class FundingArbPaperSim:
         self.open_positions[key] = pos
         conviction_pct = pos.size_usd / MAX_POSITION_USD * 100
         logger.info(
-            f"[FundingArbPaper] OPEN {pos.symbol} ({pos.exchange}) "
+            f"[{self.label}] OPEN {pos.symbol} ({pos.exchange}) "
             f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd:.0f} "
             f"(conviction {conviction_pct:.0f}% of max) entry_cost=${entry_cost:.4f}"
         )
         dir_label = ("long spot / short perp" if direction == "LONG_SPOT_SHORT_PERP"
                      else "short spot / long perp")
         self._notify(
-            f"📈 <b>Funding Arb OPEN</b>\n"
+            f"📈 <b>{self.label} OPEN</b>\n"
             f"{pos.exchange} {pos.symbol}\n"
             f"{pos.entry_apy:+.0f}% APY · {dir_label}\n"
             f"size <b>${pos.size_usd:.0f}</b> "
@@ -414,7 +455,7 @@ class FundingArbPaperSim:
                 try:
                     self._send_daily_rollup()
                 except Exception as e:
-                    logger.error(f"[FundingArbPaper] Rollup error: {e}")
+                    logger.error(f"[{self.label}] Rollup error: {e}")
         except asyncio.CancelledError:
             pass
 
@@ -458,7 +499,7 @@ class FundingArbPaperSim:
         ] or ["  (none)"]
 
         msg = (
-            f"<b>📊 Funding Arb — P&amp;L rollup (net of costs)</b>\n"
+            f"<b>📊 {self.label} — P&amp;L rollup (net of costs)</b>\n"
             f"Last {interval_h:.0f}h net P&amp;L: <b>${delta:+.4f}</b>\n"
             f"Cumulative net: ${total:.4f}\n"
             f"  (gross funding ${self._total_gross_funding():.4f} − "
@@ -470,13 +511,13 @@ class FundingArbPaperSim:
             + "\n".join(closed_lines)
         )
 
-        logger.info(f"[FundingArbPaper] Daily rollup: ${delta:+.4f} (cum ${total:.4f})")
+        logger.info(f"[{self.label}] rollup: ${delta:+.4f} (cum ${total:.4f})")
 
         if self.notifier:
             try:
                 self.notifier.send_message(msg)
             except Exception as e:
-                logger.warning(f"[FundingArbPaper] Telegram send failed: {e}")
+                logger.warning(f"[{self.label}] Telegram send failed: {e}")
 
         self.last_rollup_total = total
         self._save_state()
