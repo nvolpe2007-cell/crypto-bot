@@ -61,10 +61,22 @@ def test_entry_charges_round_trip_cost(tmp_path, monkeypatch):
     sim._tick()
     assert len(sim.open_positions) == 1
     pos = next(iter(sim.open_positions.values()))
-    expected_cost = fap.ROUND_TRIP_COST_FRAC * sim.position_size_usd
+    # Invariant: entry cost is always the round-trip fraction of the (now
+    # conviction-weighted) position size.
+    expected_cost = fap.ROUND_TRIP_COST_FRAC * pos.size_usd
     assert abs(pos.entry_cost - expected_cost) < 1e-9
     # No funding accrued yet → net PnL starts negative (we paid to open).
     assert pos.net_pnl < 0
+
+
+def test_conviction_sizing_scales_with_apy(tmp_path, monkeypatch):
+    sim = _make_sim(tmp_path, [], monkeypatch)
+    low  = sim._size_for_apy(30)    # just above the cost floor
+    high = sim._size_for_apy(140)   # near the cap
+    assert fap.MIN_POSITION_USD <= low < high <= fap.MAX_POSITION_USD
+    # Clamps: below floor → MIN, above cap → MAX.
+    assert sim._size_for_apy(5) == fap.MIN_POSITION_USD
+    assert sim._size_for_apy(5000) == fap.MAX_POSITION_USD
 
 
 def test_cost_gate_rejects_marginal_apy(tmp_path, monkeypatch):

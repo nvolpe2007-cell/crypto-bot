@@ -67,6 +67,16 @@ ROUND_TRIP_COST_FRAC = float(os.getenv('FUNDING_ARB_COST_FRAC', '0.0022'))  # 0.
 # MAX_HOLD. At 0.22% cost this implies an effective floor of ~24% APY after costs.
 MAX_BREAKEVEN_CYCLES = float(os.getenv('FUNDING_ARB_MAX_BREAKEVEN_CYCLES', '10'))
 
+# ── Conviction-weighted sizing ───────────────────────────────────────────────
+# Instead of a flat size per position, scale capital by opportunity quality:
+# the further an opportunity's |APY| sits above the cost-gate floor (~24% at
+# defaults) toward the cap, the larger the position. Best risk-adjusted yields
+# get the most capital, marginal ones the least. Bounded both per-position and
+# in total so it can never over-concentrate. Env-tunable.
+MIN_POSITION_USD   = float(os.getenv('FUNDING_ARB_MIN_SIZE', '250'))
+MAX_POSITION_USD   = float(os.getenv('FUNDING_ARB_MAX_SIZE', '1000'))
+MAX_TOTAL_NOTIONAL = float(os.getenv('FUNDING_ARB_MAX_TOTAL', '3000'))
+
 
 @dataclass
 class PaperPosition:
@@ -260,29 +270,62 @@ class FundingArbPaperSim:
 
         self._save_state()
 
+    def _apy_floor(self) -> float:
+        """The effective APY floor — the rate at which breakeven == the cost
+        gate's max cycles. Below this the cost gate rejects entries, so it's the
+        natural bottom of the conviction-sizing band. ≈24% at defaults."""
+        rate_floor = ROUND_TRIP_COST_FRAC / MAX_BREAKEVEN_CYCLES
+        return rate_floor * 3 * 365 * 100
+
+    def _size_for_apy(self, apy: float) -> float:
+        """Conviction-weighted position size: scale linearly from MIN→MAX as
+        |APY| moves from the cost floor up to the cap. Clamped to [MIN, MAX]."""
+        floor = max(self.min_entry_apy, self._apy_floor())
+        cap = self.max_entry_apy
+        if cap <= floor:
+            return MIN_POSITION_USD
+        q = (abs(apy) - floor) / (cap - floor)
+        q = max(0.0, min(1.0, q))
+        return MIN_POSITION_USD + (MAX_POSITION_USD - MIN_POSITION_USD) * q
+
+    def _total_notional(self) -> float:
+        return sum(p.size_usd for p in self.open_positions.values())
+
     def _open_position(self, opp: dict, now: datetime):
         key = f"{opp['exchange']}:{opp['symbol']}"
         direction = (
             "LONG_SPOT_SHORT_PERP" if opp['apy'] > 0
             else "SHORT_SPOT_LONG_PERP"
         )
-        entry_cost = ROUND_TRIP_COST_FRAC * self.position_size_usd
+        # Conviction-weighted size, trimmed to stay within the total budget.
+        size = self._size_for_apy(opp['apy'])
+        remaining = MAX_TOTAL_NOTIONAL - self._total_notional()
+        if remaining < MIN_POSITION_USD:
+            logger.info(
+                f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                f"total notional ${self._total_notional():.0f} near cap "
+                f"${MAX_TOTAL_NOTIONAL:.0f}"
+            )
+            return
+        size = min(size, remaining)
+        entry_cost = ROUND_TRIP_COST_FRAC * size
         pos = PaperPosition(
             symbol=opp['symbol'],
             exchange=opp['exchange'],
             direction=direction,
             entry_apy=float(opp['apy']),
             entry_rate_8h=float(opp['rate_8h']) / 100.0,  # scanner stores as %
-            size_usd=self.position_size_usd,
+            size_usd=size,
             entry_time_iso=now.isoformat(),
             last_funding_ts_iso=now.isoformat(),
             entry_cost=entry_cost,
         )
         self.open_positions[key] = pos
+        conviction_pct = pos.size_usd / MAX_POSITION_USD * 100
         logger.info(
             f"[FundingArbPaper] OPEN {pos.symbol} ({pos.exchange}) "
-            f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd} "
-            f"entry_cost=${entry_cost:.4f}"
+            f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd:.0f} "
+            f"(conviction {conviction_pct:.0f}% of max) entry_cost=${entry_cost:.4f}"
         )
         dir_label = ("long spot / short perp" if direction == "LONG_SPOT_SHORT_PERP"
                      else "short spot / long perp")
@@ -290,7 +333,9 @@ class FundingArbPaperSim:
             f"📈 <b>Funding Arb OPEN</b>\n"
             f"{pos.exchange} {pos.symbol}\n"
             f"{pos.entry_apy:+.0f}% APY · {dir_label}\n"
-            f"size ${pos.size_usd:.0f} · entry cost ${entry_cost:.2f}\n"
+            f"size <b>${pos.size_usd:.0f}</b> "
+            f"(conviction {conviction_pct:.0f}% of ${MAX_POSITION_USD:.0f} max) · "
+            f"cost ${entry_cost:.2f}\n"
             f"<i>collects funding every {FUNDING_CYCLE_HOURS}h while open</i>"
         )
 
