@@ -26,6 +26,7 @@ Exit rules (3-layer):
 """
 
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -54,6 +55,18 @@ _T2_SPREAD_MULT    = 4.5     # T2 full exit = spread × 4.5 in favor
 _SIG_STOP_THRESH   = -0.15   # OFI crosses past this in opposite dir → signal stop
 _SIG_FADE_THRESH   = 0.10    # OFI drops below this after T1 → fade exit
 _TIME_STOP_SECS    = 90.0    # max open time before time-stop (raised from 20s to match 2s polling)
+
+# ── Cost-aware expectancy ─────────────────────────────────────────────────────
+# Forensics on 228 live trades (win rate 0.9%) showed the spread-multiple targets
+# above (~0.05–0.09% on liquid pairs) are ~10× SMALLER than round-trip cost
+# (~0.30% notional after the perp-fee fix; ~0.72% before). A taker trade whose
+# target is smaller than its cost loses by construction. These make stops/targets
+# clear the cost band and gate entries whose required move is unreachable.
+#   round-trip ≈ 2×taker-fee + 2×slippage (+ spread crossing), as a price fraction
+_ROUND_TRIP_COST_FRAC = float(os.getenv('MICRO_ROUND_TRIP_COST_FRAC', '0.003'))  # 0.30%
+_T2_COST_MULT         = float(os.getenv('MICRO_T2_COST_MULT',   '2.0'))  # T2 must clear cost ×this
+_STOP_COST_MULT       = float(os.getenv('MICRO_STOP_COST_MULT', '1.2'))  # stop wider than cost band
+_MAX_TARGET_ATR_FRAC  = float(os.getenv('MICRO_MAX_TARGET_ATR', '3.0'))  # skip if needed move > this×ATR
 
 # Regime size multipliers
 _REGIME_MULT = {
@@ -406,6 +419,19 @@ class MicrostructureStrategy:
         # ── Compute spread for exit management ───────────────────────────────
         spread = self._estimate_spread(df, symbol, atr_v)
 
+        # ── Cost-aware expectancy gate ────────────────────────────────────────
+        # Only enter if the move needed to clear round-trip cost (with margin) is
+        # realistically reachable given current volatility. Without this, the tiny
+        # spread-multiple target is dwarfed by fees+slippage and every scalp loses.
+        round_trip = price * _ROUND_TRIP_COST_FRAC
+        t2_needed  = max(spread * _T2_SPREAD_MULT, round_trip * _T2_COST_MULT)
+        if atr_v > 0 and t2_needed > _MAX_TARGET_ATR_FRAC * atr_v:
+            logger.info(
+                f"[MICRO] {symbol} SKIP cost-gate: need {t2_needed / price * 100:.2f}% to clear cost "
+                f"but ATR is only {atr_v / price * 100:.2f}% (max {_MAX_TARGET_ATR_FRAC:.1f}×ATR)"
+            )
+            return _hold_micro(price, legacy_ofi, regime, funding_rate)
+
         # ── Confidence scoring (microstructure-based) ─────────────────────────
         # OFI score: up to 30 pts
         ofi_score = self._score_ofi(ofi_state, is_buy)
@@ -540,7 +566,7 @@ class MicrostructureStrategy:
             return 'SIGNAL_STOP', 'FULL'
 
         # ── 2. Price stop ──────────────────────────────────────────────────────
-        stop_distance = spread * _STOP_SPREAD_MULT
+        stop_distance = max(spread * _STOP_SPREAD_MULT, entry_px * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
         if price_delta < -stop_distance:
             logger.info(
                 f"[MICRO EXIT] {symbol} PRICE_STOP  "
@@ -550,7 +576,7 @@ class MicrostructureStrategy:
             return 'PRICE_STOP', 'FULL'
 
         # ── 3. T1 partial (first, before T2, so we can mark t1_taken) ─────────
-        t1_distance = spread * _T1_SPREAD_MULT
+        t1_distance = max(spread * _T1_SPREAD_MULT, entry_px * _ROUND_TRIP_COST_FRAC)
         if not sig.t1_taken and price_delta >= t1_distance:
             logger.info(
                 f"[MICRO EXIT] {symbol} T1_PARTIAL  "
@@ -566,7 +592,7 @@ class MicrostructureStrategy:
             return 'PRICE_STOP', 'FULL'
 
         # ── 5. T2 full exit ───────────────────────────────────────────────────
-        t2_distance = spread * _T2_SPREAD_MULT
+        t2_distance = max(spread * _T2_SPREAD_MULT, entry_px * _ROUND_TRIP_COST_FRAC * _T2_COST_MULT)
         if price_delta >= t2_distance:
             logger.info(
                 f"[MICRO EXIT] {symbol} T2  "
@@ -625,7 +651,8 @@ class MicrostructureStrategy:
         if spread <= 0 or price <= 0 or equity <= 0:
             return 0.0
 
-        stop_distance = spread * _STOP_SPREAD_MULT
+        # Must match the cost-aware stop used in check_exit so size reflects true risk.
+        stop_distance = max(spread * _STOP_SPREAD_MULT, price * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
         if stop_distance <= 0:
             return 0.0
 

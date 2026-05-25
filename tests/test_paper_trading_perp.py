@@ -58,10 +58,14 @@ class TestPerpExecuteBuy:
         assert abs(pos.margin_locked - 50.0) < 1e-6
 
     def test_cash_reduced_by_margin_plus_fee(self):
-        # notional=100, leverage=2 → margin=50; fee=100*0.0026=0.26
+        # notional=100, leverage=2 → margin=50; fee = notional * effective fee_pct.
+        # In perp mode the trader caps fee_pct at the realistic Kraken Futures
+        # taker (~0.05%), so derive the expected fee from the trader rather than
+        # hard-coding the spot rate — the invariant under test is the accounting
+        # identity cash == capital - margin - fee, not the fee value itself.
         t = _perp_trader(initial_capital=1_000.0, leverage=2.0, fee_pct=0.26)
         t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
-        expected_fee    = 100.0 * 0.0026
+        expected_fee    = 100.0 * t.fee_pct
         expected_margin = 50.0
         assert abs(t.account.cash - (1_000.0 - expected_margin - expected_fee)) < 1e-6
 

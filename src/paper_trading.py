@@ -374,6 +374,13 @@ class PaperTrader:
         # ── Perp mode state ───────────────────────────────────────────────────
         self.perp_mode        = perp_mode
         self.leverage         = max(1.0, float(leverage)) if perp_mode else 1.0
+        # Fee correction: the 0.26% default is the Kraken SPOT taker fee. On
+        # Kraken FUTURES (perp mode) taker is ~0.05%. Applying the spot fee to
+        # perps overstated round-trip cost ~5× and was a primary cause of the
+        # ~1% win rate (cost dwarfed the per-trade target). Use the realistic
+        # futures fee when in perp mode.
+        if self.perp_mode:
+            self.fee_pct = min(self.fee_pct, float(os.getenv('PERP_TAKER_FEE_PCT', '0.05')) / 100)
         # Symbol → current 8h funding rate (fraction, e.g. 0.0001). Caller updates.
         self._funding_rates: Dict[str, float] = {}
         if perp_mode:
