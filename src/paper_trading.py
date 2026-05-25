@@ -567,6 +567,58 @@ class PaperTrader:
         logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%){funding_note}  {reason}")
         return trade
 
+    def execute_partial_close(self, symbol: str, price: float, timestamp: datetime,
+                              fraction: float = 0.5) -> Optional[Trade]:
+        """Close `fraction` of an open position (default 50%) and return a Trade.
+
+        Correct fee accounting for both longs and shorts:
+          - Long: proceeds = exec_price * size, exit fee charged on proceeds
+          - Short: margin returned + gross profit, exit fee charged on cover cost
+
+        The position remains open with the reduced size. `entry_fee` is reduced
+        proportionally so subsequent full-close PnL doesn't double-count fees.
+        """
+        pos = self.account.positions.get(symbol)
+        if pos is None or fraction <= 0.0 or fraction >= 1.0:
+            return None
+
+        partial_size = pos.size * fraction
+        slip = self._slippage_pct_for(symbol, price)
+
+        if pos.side == 'buy':
+            exec_price = price * (1 - slip)
+            exit_fee = exec_price * partial_size * self.fee_pct
+            entry_fee_partial = pos.entry_fee * fraction
+            pnl = (exec_price - pos.entry_price) * partial_size - exit_fee - entry_fee_partial
+            cost_basis = pos.entry_price * partial_size + entry_fee_partial
+            pos.size -= partial_size
+            pos.entry_fee -= entry_fee_partial
+            self.account.cash += exec_price * partial_size - exit_fee
+        else:  # short
+            exec_price = price * (1 + slip)
+            exit_fee = exec_price * partial_size * self.fee_pct
+            entry_fee_partial = pos.entry_fee * fraction
+            gross_pnl = (pos.entry_price - exec_price) * partial_size
+            pnl = gross_pnl - exit_fee - entry_fee_partial
+            cost_basis = pos.entry_price * partial_size + entry_fee_partial
+            pos.size -= partial_size
+            pos.entry_fee -= entry_fee_partial
+            # Return proportional collateral + profit, minus exit fee
+            self.account.cash += pos.entry_price * partial_size + gross_pnl - exit_fee
+
+        pnl_pct = pnl / cost_basis * 100 if cost_basis else 0.0
+        self.account.total_pnl += pnl
+        total_fees = exit_fee + entry_fee_partial
+        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
+                      entry_price=pos.entry_price, exit_price=exec_price,
+                      size=partial_size,
+                      side='partial_sell' if pos.side == 'buy' else 'partial_cover',
+                      pnl=pnl, pnl_pct=pnl_pct, fees=total_fees)
+        tag = "[PARTIAL-LONG]" if pos.side == 'buy' else "[PARTIAL-SHORT]"
+        logger.info(f"{tag} {symbol} {fraction:.0%} @ ${exec_price:,.2f}  "
+                    f"pnl=${pnl:+.4f} ({pnl_pct:+.2f}%)")
+        return trade
+
     def update_unrealized_pnl(self, prices: Dict[str, float]):
         for sym, pos in self.account.positions.items():
             if sym in prices:
@@ -1173,22 +1225,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     if exit_reason is not None:
                         if exit_type == 'PARTIAL':
-                            # T1 partial: close 50% of position
-                            partial_size = pos_check.size * 0.5
-                            if pos_check.side == 'buy':
-                                exec_price = current_price * (1 - trader.slippage_pct)
-                                pnl_partial = (exec_price - pos_check.entry_price) * partial_size
-                                pos_check.size -= partial_size
-                                trader.account.cash += exec_price * partial_size - exec_price * partial_size * trader.fee_pct
-                                trader.account.total_pnl += pnl_partial
-                            else:
-                                exec_price = current_price * (1 + trader.slippage_pct)
-                                pnl_partial = (pos_check.entry_price - exec_price) * partial_size
-                                pos_check.size -= partial_size
-                                trader.account.cash += pos_check.entry_price * partial_size + pnl_partial
-                                trader.account.total_pnl += pnl_partial
-                            logger.info(f"[MICRO T1] {symbol} partial exit @ ${current_price:,.2f}  pnl=${pnl_partial:+.4f}")
-                            if notifier:
+                            partial_trade = trader.execute_partial_close(
+                                symbol, current_price, datetime.now(timezone.utc), fraction=0.5
+                            )
+                            if partial_trade and notifier:
                                 notifier.send_message(
                                     f"📊 <b>Half closed</b> — {symbol.split('/')[0]}\n"
                                     f"Locked in partial profit @ ${current_price:,.2f}"

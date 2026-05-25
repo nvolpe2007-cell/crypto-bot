@@ -579,3 +579,155 @@ class TestAccountingIdentityShorts:
         lower_price = PRICE * 0.90
         trade = t.execute_cover(SYMBOL, lower_price, T1)
         assert abs(t.account.cash - (1_000.0 + trade.pnl)) < 1e-6
+
+
+# ── execute_partial_close ─────────────────────────────────────────────────────
+
+class TestExecutePartialClose:
+    """
+    execute_partial_close must charge exit fees for both longs and shorts and
+    keep the accounting identity: total_equity == initial_capital + total_pnl.
+    """
+
+    # ── guard rails ───────────────────────────────────────────────────────────
+
+    def test_returns_none_when_no_position(self):
+        t = _trader()
+        result = t.execute_partial_close(SYMBOL, PRICE, T1)
+        assert result is None
+
+    def test_returns_none_for_invalid_fraction_zero(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.0) is None
+
+    def test_returns_none_for_invalid_fraction_one(self):
+        t = _trader()
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert t.execute_partial_close(SYMBOL, PRICE, T1, fraction=1.0) is None
+
+    # ── long partial ──────────────────────────────────────────────────────────
+
+    def test_long_position_size_halved(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        original_size = t.account.positions[SYMBOL].size
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert abs(t.account.positions[SYMBOL].size - original_size * 0.5) < 1e-10
+
+    def test_long_position_still_open_after_partial(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert SYMBOL in t.account.positions
+
+    def test_long_partial_trade_returned(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert trade is not None
+        assert trade.side == 'partial_sell'
+
+    def test_long_partial_exit_fee_charged(self):
+        """Exit fee must be deducted from cash — closing at entry price with
+        zero slippage should leave cash at: proceeds - exit_fee."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=10_000.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        cash_before = t.account.cash
+        pos = t.account.positions[SYMBOL]
+        partial_size = pos.size * 0.5
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        expected_proceeds = PRICE * partial_size
+        expected_fee = expected_proceeds * 0.0026
+        assert abs(t.account.cash - (cash_before + expected_proceeds - expected_fee)) < 1e-6
+
+    def test_long_accounting_identity_after_partial_then_full_close(self):
+        """total_equity == initial_capital + total_pnl after partial + full exit."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=1_000.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        higher = PRICE * 1.02
+        t.execute_partial_close(SYMBOL, higher, T1, fraction=0.5)
+        T2 = datetime(2024, 1, 1, 0, 2, 0)
+        t.execute_sell(SYMBOL, higher * 1.01, T2)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
+
+    # ── short partial ─────────────────────────────────────────────────────────
+
+    def test_short_position_size_halved(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        original_size = t.account.positions[SYMBOL].size
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert abs(t.account.positions[SYMBOL].size - original_size * 0.5) < 1e-10
+
+    def test_short_position_still_open_after_partial(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert SYMBOL in t.account.positions
+
+    def test_short_partial_trade_returned(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        trade = t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        assert trade is not None
+        assert trade.side == 'partial_cover'
+
+    def test_short_partial_exit_fee_charged(self):
+        """Short partial must deduct exit fees — the original bug was missing this."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=10_000.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        cash_before = t.account.cash
+        pos = t.account.positions[SYMBOL]
+        partial_size = pos.size * 0.5
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        # Cash should be: before + returned_margin(partial) + gross_pnl - exit_fee
+        # At same price: gross_pnl = 0, so cash += entry_price * partial_size - exit_fee
+        expected_margin_return = PRICE * partial_size
+        expected_exit_fee = PRICE * partial_size * 0.0026
+        assert abs(t.account.cash - (cash_before + expected_margin_return - expected_exit_fee)) < 1e-6
+
+    def test_short_accounting_identity_after_partial_then_full_close(self):
+        """total_equity == initial_capital + total_pnl after partial + full cover."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0, initial_capital=1_000.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        lower = PRICE * 0.97
+        t.execute_partial_close(SYMBOL, lower, T1, fraction=0.5)
+        T2 = datetime(2024, 1, 1, 0, 2, 0)
+        t.execute_cover(SYMBOL, lower * 0.99, T2)
+        summary = t.get_account_summary()
+        assert abs(summary["total_equity"] - (1_000.0 + summary["total_pnl"])) < 1e-6
+
+    def test_short_partial_pnl_positive_when_price_falls(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        lower = PRICE * 0.95
+        trade = t.execute_partial_close(SYMBOL, lower, T1, fraction=0.5)
+        assert trade.pnl > 0
+
+    def test_short_partial_pnl_negative_when_price_rises(self):
+        t = _trader(fee_pct=0.0, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        higher = PRICE * 1.05
+        trade = t.execute_partial_close(SYMBOL, higher, T1, fraction=0.5)
+        assert trade.pnl < 0
+
+    # ── entry_fee bookkeeping ─────────────────────────────────────────────────
+
+    def test_entry_fee_reduced_proportionally_on_long_partial(self):
+        """Remaining entry_fee on position should be halved after 50% partial."""
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        original_fee = t.account.positions[SYMBOL].entry_fee
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        remaining_fee = t.account.positions[SYMBOL].entry_fee
+        assert abs(remaining_fee - original_fee * 0.5) < 1e-10
+
+    def test_entry_fee_reduced_proportionally_on_short_partial(self):
+        t = _trader(fee_pct=0.26, slippage_pct=0.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        original_fee = t.account.positions[SYMBOL].entry_fee
+        t.execute_partial_close(SYMBOL, PRICE, T1, fraction=0.5)
+        remaining_fee = t.account.positions[SYMBOL].entry_fee
+        assert abs(remaining_fee - original_fee * 0.5) < 1e-10
