@@ -46,6 +46,9 @@ from src.microstructure_strategy import (
     _OFI_STRONG_MULT,
     _STRUCTURE_SAMPLE,
     _STRUCTURE_LOWS_N,
+    _ROUND_TRIP_COST_FRAC,
+    _STOP_COST_MULT,
+    _T2_COST_MULT,
 )
 from src.ofi_v2 import OFIState
 from src.cvd_tracker import CVDState
@@ -244,22 +247,23 @@ class TestCheckExitPriceStop:
 
     def test_price_stop_long_falls_too_far(self):
         spread = SPREAD
-        stop_dist = spread * _STOP_SPREAD_MULT   # = 10 * 2.5 = 25
+        # Code uses max(spread×mult, price×cost_frac×mult) — cost floor dominates at $50k
+        stop_dist = max(spread * _STOP_SPREAD_MULT,
+                        PRICE * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
         pos = _make_position('buy', entry_price=PRICE, signal=_make_signal('buy', spread=spread))
-        # Current price: PRICE - stop_dist - 1 → price_delta = -26 < -25
-        strat = MicrostructureStrategy()
         bad_price = PRICE - stop_dist - 1.0
+        strat = MicrostructureStrategy()
         reason, etype = strat.check_exit(SYMBOL, pos, bad_price, 0.05, 10.0)
         assert reason == 'PRICE_STOP'
         assert etype == 'FULL'
 
     def test_price_stop_short_rises_too_far(self):
         spread = SPREAD
-        stop_dist = spread * _STOP_SPREAD_MULT   # = 25
+        stop_dist = max(spread * _STOP_SPREAD_MULT,
+                        PRICE * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
         pos = _make_position('short', entry_price=PRICE, signal=_make_signal('short', spread=spread))
-        # Short: price_delta = entry - current. If price rises: delta = PRICE - (PRICE+26) = -26
-        strat = MicrostructureStrategy()
         bad_price = PRICE + stop_dist + 1.0
+        strat = MicrostructureStrategy()
         reason, etype = strat.check_exit(SYMBOL, pos, bad_price, -0.05, 10.0)
         assert reason == 'PRICE_STOP'
         assert etype == 'FULL'
@@ -278,9 +282,11 @@ class TestCheckExitPriceStop:
         sig = _make_signal('buy', spread=0.0)
         pos = _make_position('buy', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
-        # With spread=0, fallback = PRICE * 0.0001 = 5.0; stop_dist = 5 * 2.5 = 12.5
-        # Drop price by 15 — beyond 12.5 stop
-        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - 15.0, 0.05, 10.0)
+        # spread=0 → fallback = PRICE * 0.0001; cost floor dominates at $50k
+        fallback_spread = PRICE * 0.0001
+        stop_dist = max(fallback_spread * _STOP_SPREAD_MULT,
+                        PRICE * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
+        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - stop_dist - 1.0, 0.05, 10.0)
         assert reason == 'PRICE_STOP'
 
 
@@ -289,7 +295,8 @@ class TestCheckExitT1Partial:
 
     def test_t1_partial_long(self):
         spread = SPREAD
-        t1_dist = spread * _T1_SPREAD_MULT   # = 10 * 2.0 = 20
+        # Code: max(spread×T1_mult, price×cost_frac) — cost floor dominates at $50k
+        t1_dist = max(spread * _T1_SPREAD_MULT, PRICE * _ROUND_TRIP_COST_FRAC)
         sig = _make_signal('buy', spread=spread)
         pos = _make_position('buy', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
@@ -299,7 +306,7 @@ class TestCheckExitT1Partial:
 
     def test_t1_partial_sets_flags(self):
         spread = SPREAD
-        t1_dist = spread * _T1_SPREAD_MULT
+        t1_dist = max(spread * _T1_SPREAD_MULT, PRICE * _ROUND_TRIP_COST_FRAC)
         sig = _make_signal('buy', spread=spread)
         pos = _make_position('buy', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
@@ -318,11 +325,10 @@ class TestCheckExitT1Partial:
 
     def test_t1_short_position(self):
         spread = SPREAD
-        t1_dist = spread * _T1_SPREAD_MULT   # = 20; short: favorable = price falls
+        t1_dist = max(spread * _T1_SPREAD_MULT, PRICE * _ROUND_TRIP_COST_FRAC)
         sig = _make_signal('short', spread=spread)
         pos = _make_position('short', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
-        # Price falls by t1_dist + 1 → price_delta = PRICE - (PRICE - 21) = 21 >= 20
         reason, etype = strat.check_exit(SYMBOL, pos, PRICE - t1_dist - 1.0, -0.40, 10.0)
         assert reason == 'T1_PARTIAL'
         assert etype == 'PARTIAL'
@@ -355,7 +361,9 @@ class TestCheckExitT2:
 
     def test_t2_long(self):
         spread = SPREAD
-        t2_dist = spread * _T2_SPREAD_MULT   # = 10 * 4.5 = 45
+        # Code: max(spread×T2_mult, price×cost_frac×T2_cost_mult) — cost floor dominates
+        t2_dist = max(spread * _T2_SPREAD_MULT,
+                      PRICE * _ROUND_TRIP_COST_FRAC * _T2_COST_MULT)
         sig = _make_signal('buy', spread=spread, t1_taken=True)
         pos = _make_position('buy', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
@@ -365,7 +373,8 @@ class TestCheckExitT2:
 
     def test_t2_short(self):
         spread = SPREAD
-        t2_dist = spread * _T2_SPREAD_MULT   # = 45
+        t2_dist = max(spread * _T2_SPREAD_MULT,
+                      PRICE * _ROUND_TRIP_COST_FRAC * _T2_COST_MULT)
         sig = _make_signal('short', spread=spread, t1_taken=True)
         pos = _make_position('short', entry_price=PRICE, signal=sig)
         strat = MicrostructureStrategy()
