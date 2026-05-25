@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -39,6 +40,19 @@ POSITION_SIZE_USD = 500.0      # per leg (so $1000 capital used per pair)
 FUNDING_CYCLE_HOURS = 8        # standard for Binance/Bybit perps
 ROLLUP_INTERVAL_SECONDS = 86400  # 24h
 
+# ── Cost model ───────────────────────────────────────────────────────────────
+# Cash-and-carry is FOUR taker fills round-trip: open(spot)+open(perp) and
+# close(spot)+close(perp). On Binance/Bybit, perp taker ≈0.04% + spot taker
+# ≈0.10% → ~0.28% of one leg's notional round-trip, before slippage. Ignoring
+# this is exactly the cost-blind mistake that produced the bot's old ~1% win
+# rate (see strategy_cost_expectancy_fix). We deduct it ONCE at entry and report
+# PnL net of it. Env-tunable; default leans conservative (taker, not maker).
+ROUND_TRIP_COST_FRAC = float(os.getenv('FUNDING_ARB_COST_FRAC', '0.0022'))  # 0.22%
+# Don't open unless funding at the entry rate clears round-trip cost within this
+# many 8h cycles — i.e. the position is expected to be net-positive well inside
+# MAX_HOLD. At 0.22% cost this implies an effective floor of ~24% APY after costs.
+MAX_BREAKEVEN_CYCLES = float(os.getenv('FUNDING_ARB_MAX_BREAKEVEN_CYCLES', '10'))
+
 
 @dataclass
 class PaperPosition:
@@ -49,7 +63,8 @@ class PaperPosition:
     entry_rate_8h: float
     size_usd: float
     entry_time_iso: str
-    funding_collected: float = 0.0
+    funding_collected: float = 0.0   # GROSS funding accrued (before costs)
+    entry_cost: float = 0.0          # round-trip transaction cost, charged at open
     cycles_collected: int = 0
     last_funding_ts_iso: Optional[str] = None
     closed: bool = False
@@ -59,6 +74,11 @@ class PaperPosition:
     @property
     def entry_time(self) -> datetime:
         return datetime.fromisoformat(self.entry_time_iso)
+
+    @property
+    def net_pnl(self) -> float:
+        """Funding collected minus the round-trip transaction cost."""
+        return self.funding_collected - self.entry_cost
 
 
 class FundingArbPaperSim:
@@ -166,6 +186,7 @@ class FundingArbPaperSim:
                 logger.info(
                     f"[FundingArbPaper] CLOSE {pos.symbol} ({pos.exchange}) "
                     f"reason={reason} funding=${pos.funding_collected:.4f} "
+                    f"cost=${pos.entry_cost:.4f} net=${pos.net_pnl:+.4f} "
                     f"cycles={pos.cycles_collected}"
                 )
 
@@ -179,6 +200,21 @@ class FundingArbPaperSim:
                     continue
                 if abs(opp['apy']) < self.min_entry_apy:
                     continue
+                # Cost-aware gate: reject unless funding at the entry rate clears
+                # the round-trip cost within MAX_BREAKEVEN_CYCLES. The position
+                # size cancels out, so this is purely rate-vs-cost.
+                rate_8h_frac = abs(float(opp['rate_8h'])) / 100.0
+                if rate_8h_frac <= 0:
+                    continue
+                breakeven_cycles = ROUND_TRIP_COST_FRAC / rate_8h_frac
+                if breakeven_cycles > MAX_BREAKEVEN_CYCLES:
+                    logger.info(
+                        f"[FundingArbPaper] SKIP {opp['symbol']} ({opp['exchange']}) "
+                        f"apy={opp['apy']:.1f}%: breakeven {breakeven_cycles:.1f} cycles "
+                        f"> max {MAX_BREAKEVEN_CYCLES:.0f} (cost {ROUND_TRIP_COST_FRAC*100:.2f}% "
+                        f"vs {rate_8h_frac*100:.4f}%/cycle)"
+                    )
+                    continue
                 self._open_position(opp, now)
 
         self._save_state()
@@ -189,6 +225,7 @@ class FundingArbPaperSim:
             "LONG_SPOT_SHORT_PERP" if opp['apy'] > 0
             else "SHORT_SPOT_LONG_PERP"
         )
+        entry_cost = ROUND_TRIP_COST_FRAC * self.position_size_usd
         pos = PaperPosition(
             symbol=opp['symbol'],
             exchange=opp['exchange'],
@@ -198,11 +235,13 @@ class FundingArbPaperSim:
             size_usd=self.position_size_usd,
             entry_time_iso=now.isoformat(),
             last_funding_ts_iso=now.isoformat(),
+            entry_cost=entry_cost,
         )
         self.open_positions[key] = pos
         logger.info(
             f"[FundingArbPaper] OPEN {pos.symbol} ({pos.exchange}) "
-            f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd}"
+            f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd} "
+            f"entry_cost=${entry_cost:.4f}"
         )
 
     def _accrue_funding(
@@ -285,9 +324,18 @@ class FundingArbPaperSim:
             pass
 
     def _total_pnl(self) -> float:
-        open_pnl = sum(p.funding_collected for p in self.open_positions.values())
-        closed_pnl = sum(p.funding_collected for p in self.closed_positions)
+        """Cumulative NET P&L (funding collected minus transaction costs)."""
+        open_pnl = sum(p.net_pnl for p in self.open_positions.values())
+        closed_pnl = sum(p.net_pnl for p in self.closed_positions)
         return open_pnl + closed_pnl
+
+    def _total_gross_funding(self) -> float:
+        return (sum(p.funding_collected for p in self.open_positions.values())
+                + sum(p.funding_collected for p in self.closed_positions))
+
+    def _total_costs(self) -> float:
+        return (sum(p.entry_cost for p in self.open_positions.values())
+                + sum(p.entry_cost for p in self.closed_positions))
 
     def _send_daily_rollup(self):
         total = self._total_pnl()
@@ -296,8 +344,9 @@ class FundingArbPaperSim:
         uptime_h = (now - self.start_time).total_seconds() / 3600.0
 
         open_lines = [
-            f"  • {p.exchange} {p.symbol}: ${p.funding_collected:.4f} "
-            f"({p.cycles_collected} cycles, {p.entry_apy:.0f}% APY)"
+            f"  • {p.exchange} {p.symbol}: net ${p.net_pnl:+.4f} "
+            f"(funding ${p.funding_collected:.4f} − cost ${p.entry_cost:.4f}, "
+            f"{p.cycles_collected} cycles, {p.entry_apy:.0f}% APY)"
             for p in self.open_positions.values()
         ] or ["  (none)"]
 
@@ -307,15 +356,17 @@ class FundingArbPaperSim:
             (now - datetime.fromisoformat(p.close_time_iso)).total_seconds() < 86400
         ]
         closed_lines = [
-            f"  • {p.exchange} {p.symbol}: ${p.funding_collected:.4f} "
+            f"  • {p.exchange} {p.symbol}: net ${p.net_pnl:+.4f} "
             f"({p.close_reason})"
             for p in closed_today
         ] or ["  (none)"]
 
         msg = (
-            f"<b>📊 Funding Arb — Daily P&amp;L</b>\n"
-            f"24h P&amp;L: <b>${delta:+.4f}</b>\n"
-            f"Cumulative: ${total:.4f}\n"
+            f"<b>📊 Funding Arb — Daily P&amp;L (net of costs)</b>\n"
+            f"24h net P&amp;L: <b>${delta:+.4f}</b>\n"
+            f"Cumulative net: ${total:.4f}\n"
+            f"  (gross funding ${self._total_gross_funding():.4f} − "
+            f"costs ${self._total_costs():.4f})\n"
             f"Uptime: {uptime_h:.0f}h\n\n"
             f"<b>Open ({len(self.open_positions)}):</b>\n"
             + "\n".join(open_lines) + "\n\n"
@@ -340,6 +391,8 @@ class FundingArbPaperSim:
         return {
             'open_positions': len(self.open_positions),
             'closed_positions': len(self.closed_positions),
-            'total_pnl': round(self._total_pnl(), 4),
+            'total_pnl': round(self._total_pnl(), 4),          # NET of costs
+            'total_gross_funding': round(self._total_gross_funding(), 4),
+            'total_costs': round(self._total_costs(), 4),
             'positions': [asdict(p) for p in self.open_positions.values()],
         }

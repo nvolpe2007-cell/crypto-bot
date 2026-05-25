@@ -624,6 +624,39 @@ class PaperTrader:
         print("=" * 50)
 
 
+# ── Entry-funnel instrumentation ────────────────────────────────────────────────
+
+class _FunnelStats:
+    """Exception-safe counter for the entry funnel.
+
+    Tracks where actionable signals die between strategy.evaluate() and order
+    execution, so we can see whether the bot is starved at the source (signals
+    are all HOLD) or killed by a specific downstream gate. Counts are per
+    heartbeat interval (reset each heartbeat). Adds no trading behavior — it only
+    counts — so it is safe to leave on permanently.
+    """
+
+    def __init__(self):
+        self._c: Dict[str, int] = {}
+
+    def bump(self, key: str, n: int = 1):
+        self._c[key] = self._c.get(key, 0) + n
+
+    def render(self) -> str:
+        seen  = self._c.get('signals_seen', 0)
+        hold  = self._c.get('hold', 0)
+        act   = self._c.get('actionable', 0)
+        execd = self._c.get('exec:long', 0) + self._c.get('exec:short', 0)
+        skips = {k.split(':', 1)[1]: v for k, v in sorted(self._c.items())
+                 if k.startswith('skip:')}
+        skip_str = ' '.join(f"{k}={v}" for k, v in skips.items()) or 'none'
+        return (f"seen={seen} hold={hold} actionable={act} "
+                f"executed={execd} | skips: {skip_str}")
+
+    def reset(self):
+        self._c.clear()
+
+
 # ── Main paper trading session ─────────────────────────────────────────────────
 
 async def run_paper_trading_session(exchange: ExchangeConnection,
@@ -678,6 +711,43 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     short_checklist = build_short_checklist()
     macro_provider = MacroDataProvider()
     macro_provider.start()
+
+    # ── Funding-rate arbitrage (market-neutral, runs alongside the scalper) ──────
+    # Scans Binance/Bybit funding every minute → state.json (this also feeds the
+    # microstructure funding edge + kill filters, which are otherwise starved in
+    # this entry point) and paper-trades a cost-aware delta-neutral cash-and-carry
+    # sim. Best-effort: any failure here is isolated and never touches the main
+    # trading loop. Disable with FUNDING_ARB_ENABLED=0.
+    _funding_tasks: List[asyncio.Task] = []
+    if os.getenv('FUNDING_ARB_ENABLED', '1') == '1':
+        try:
+            from arbitrage.funding_scanner import FundingScanner
+            from arbitrage.funding_arb_paper import FundingArbPaperSim
+            from .state import read_state as _read_state, write_state as _write_state
+
+            _funding_scanner = FundingScanner(notifier=None)
+            _funding_arb_sim = FundingArbPaperSim(scanner=_funding_scanner, notifier=notifier)
+
+            async def _merge_funding_state():
+                while True:
+                    await asyncio.sleep(65)
+                    try:
+                        st = _read_state()
+                        st['funding_opportunities'] = _funding_scanner.get_state()
+                        st['funding_arb'] = _funding_arb_sim.get_summary()
+                        _write_state(st)
+                    except Exception as _exc:
+                        logger.warning(f"[FUNDING] state merge failed: {_exc}")
+
+            _funding_tasks = [
+                asyncio.create_task(_funding_scanner.start()),
+                asyncio.create_task(_funding_arb_sim.start()),
+                asyncio.create_task(_merge_funding_state()),
+            ]
+            logger.info("[FUNDING] scanner + cost-aware delta-neutral arb sim started")
+        except Exception as _exc:
+            logger.warning(f"[FUNDING] disabled ({_exc})")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
@@ -695,6 +765,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     session_start_equity = trader.initial_capital
 
     iteration = 0
+    funnel = _FunnelStats()   # entry-funnel diagnostics, logged each heartbeat
     prices:   Dict[str, float] = {}
     indicators:       Dict[str, dict]   = {}
     recent_trades:    Deque[dict]        = deque(maxlen=50)
@@ -1357,6 +1428,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 pos      = trader.account.positions.get(symbol)
                 pos_side = pos.side if pos else None
 
+                # ── Funnel: classify this signal (source-level) ────────────────
+                funnel.bump('signals_seen')
+                if sig.signal == Signal.HOLD:
+                    funnel.bump('hold')
+                elif pos is None:
+                    funnel.bump('actionable')   # tradeable entry signal, no position
+
                 # ── Entry: minimum confidence gate ─────────────────────────────
                 min_conf = _adapt['min_confidence']
 
@@ -1386,6 +1464,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     )
                     cl_result = long_checklist.run(long_ctx)
                     if not cl_result.passed:
+                        funnel.bump('skip:checklist')
                         logger.info(f"[SKIP BUY] {symbol} — {cl_result.reason_summary()}")
                         logger.debug(f"[CHECKLIST BUY] {symbol} {cl_result.trace()}")
                         continue
@@ -1398,6 +1477,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     # Position size from confidence + equity (fallback if gate disabled)
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
+                        funnel.bump('skip:size')
                         continue
 
                     if vol_monitor:
@@ -1425,6 +1505,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"macro={reasoning.is_macro_driven}"
                         )
                         if reasoning.rejected:
+                            funnel.bump('skip:probgate')
                             logger.info(f"[SKIP BUY] {symbol} — prob gate: {reasoning.rejection_reason}")
                             if notifier:
                                 notifier.send_trade_reasoning(
@@ -1441,10 +1522,12 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
                                     f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
                         if size_usd < 1.50:
+                            funnel.bump('skip:size')
                             logger.info(f"[SKIP BUY] {symbol} — tier-scaled size below floor")
                             continue
                     # Apply correlation block — but allow macro-driven same-direction trades
                     if _corr_blocked_long and not (reasoning and reasoning.is_macro_driven):
+                        funnel.bump('skip:corr')
                         logger.info(f"[SKIP BUY] {symbol} — correlated long already open")
                         continue
                     elif _corr_blocked_long and reasoning and reasoning.is_macro_driven:
@@ -1453,6 +1536,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
                     if position:
+                        funnel.bump('exec:long')
                         # Tag entry pathway and snapshot market context for the journal
                         position.entry_path = _entry_path_tag
                         if reasoning:
@@ -1498,6 +1582,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     )
                     cl_result = short_checklist.run(short_ctx)
                     if not cl_result.passed:
+                        funnel.bump('skip:checklist')
                         logger.info(f"[SKIP SELL] {symbol} — {cl_result.reason_summary()}")
                         logger.debug(f"[CHECKLIST SELL] {symbol} {cl_result.trace()}")
                         continue
@@ -1508,6 +1593,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
+                        funnel.bump('skip:size')
                         continue
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
@@ -1531,6 +1617,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"macro={reasoning.is_macro_driven}"
                         )
                         if reasoning.rejected:
+                            funnel.bump('skip:probgate')
                             logger.info(f"[SKIP SELL] {symbol} — prob gate: {reasoning.rejection_reason}")
                             if notifier:
                                 notifier.send_trade_reasoning(
@@ -1545,9 +1632,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
                                     f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
                         if size_usd < 1.50:
+                            funnel.bump('skip:size')
                             logger.info(f"[SKIP SELL] {symbol} — tier-scaled size below floor")
                             continue
                     if _corr_blocked_short and not (reasoning and reasoning.is_macro_driven):
+                        funnel.bump('skip:corr')
                         logger.info(f"[SKIP SELL] {symbol} — correlated short already open")
                         continue
                     elif _corr_blocked_short and reasoning and reasoning.is_macro_driven:
@@ -1556,6 +1645,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
                     if position:
+                        funnel.bump('exec:short')
                         position.entry_path = _entry_path_tag
                         if reasoning:
                             position.prob_win = reasoning.combined_p
@@ -1665,6 +1755,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f}"
                 )
+                # Entry funnel — where signals died since the last heartbeat
+                logger.info(f"[FUNNEL] {funnel.render()}")
+                funnel.reset()
                 # Persist open positions so a crash/restart can resume
                 _save_open_positions(trader)
 
@@ -1778,6 +1871,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     trader.running = False
     logger.info("Paper trading session ended")
     learner.log_summary()
+
+    # Stop funding-arb background tasks (best-effort)
+    for _t in _funding_tasks:
+        _t.cancel()
 
     # Shutdown notification — best-effort (systemd may have already SIGKILL'd us)
     if notifier:
