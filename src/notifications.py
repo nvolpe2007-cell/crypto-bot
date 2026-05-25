@@ -2,12 +2,21 @@
 Telegram Notifications — plain-English trade alerts.
 """
 
+import html
 import logging
 import requests
 from typing import Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+def _esc(text) -> str:
+    """Escape <, >, & in dynamic text so it can't break Telegram HTML parsing.
+    Apply to any data-derived string interpolated into an HTML message (the
+    static <b>/<i> tags in the templates are written by us and must NOT be escaped)."""
+    return html.escape(str(text), quote=False)
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -151,6 +160,20 @@ class TelegramNotifier:
                 json={"chat_id": self.chat_id, "text": message, "parse_mode": parse_mode},
                 timeout=10,
             )
+            # A 400 with parse_mode set is almost always an entity-parse error from
+            # an unescaped <, >, or & in dynamic text. Don't lose the alert — log
+            # Telegram's actual reason and resend as plain text.
+            if response.status_code == 400 and parse_mode:
+                try:
+                    desc = response.json().get("description", response.text[:200])
+                except Exception:
+                    desc = response.text[:200]
+                logger.warning(f"Telegram 400 (parse_mode={parse_mode}): {desc} — retrying as plain text")
+                response = requests.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message},
+                    timeout=10,
+                )
             response.raise_for_status()
             return True
         except Exception as e:
@@ -189,10 +212,10 @@ class TelegramNotifier:
         for edge in reasoning.edges:
             mark = "✓" if edge.present else "·"
             p_str = f"p={edge.p_win:.2f}" if edge.present else "—"
-            lines.append(f"  {mark} <b>{edge.name}</b> {p_str}  {edge.note}")
+            lines.append(f"  {mark} <b>{_esc(edge.name)}</b> {p_str}  {_esc(edge.note)}")
 
         if reasoning.rejected and reasoning.rejection_reason:
-            lines += ["", f"<b>Reject:</b> {reasoning.rejection_reason}"]
+            lines += ["", f"<b>Reject:</b> {_esc(reasoning.rejection_reason)}"]
 
         return self.send_message("\n".join(lines))
 
