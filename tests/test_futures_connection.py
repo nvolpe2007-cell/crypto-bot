@@ -134,8 +134,9 @@ class TestFuturesRetryHelper:
         fn = AsyncMock(side_effect=[ccxt.NetworkError("x"), ccxt.NetworkError("y"), "ok"])
         await conn._retry(fn, retries=3, label='test')
         calls = asyncio.sleep.call_args_list
-        assert calls[0] == call(2)   # 2**1
-        assert calls[1] == call(4)   # 2**2
+        # Base delays are 2**1=2 and 2**2=4; jitter adds up to 1s, so check the floor
+        assert 2 <= calls[0].args[0] < 3   # 2**1
+        assert 4 <= calls[1].args[0] < 5   # 2**2
 
     async def test_no_sleep_after_final_attempt(self):
         conn = _make_conn()

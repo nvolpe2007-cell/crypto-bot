@@ -31,7 +31,8 @@ class _FakeExchange:
 
 
 _ccxt_async = types.ModuleType("ccxt.async_support")
-_ccxt_async.kraken = lambda **kw: _FakeExchange()
+_ccxt_async.kraken = lambda *args, **kw: _FakeExchange()
+_ccxt_async.krakenfutures = lambda *args, **kw: _FakeExchange()
 
 # Exception hierarchy mirroring real ccxt so exchange.py's _RETRYABLE tuple
 # resolves to the same classes that test code raises.
