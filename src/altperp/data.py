@@ -84,7 +84,7 @@ class BybitData:
 
     async def funding_history(self, symbol: str, limit: int = config.FUNDING_HISTORY_LEN) -> List[float]:
         """Last `limit` settled funding rates (most recent first → returned oldest first)."""
-        res = await self._get("/v5/market/history-fund-rate",
+        res = await self._get("/v5/market/funding/history",
                               {"category": "linear", "symbol": symbol, "limit": limit})
         if not res:
             return []

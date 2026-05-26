@@ -191,7 +191,7 @@ async def fetch_history(coin: str, days: int = 90) -> List[Dict]:
     dc = BybitData()
     try:
         klines = await dc.klines(coin, interval="240", limit=min(days * 6, 1000))
-        fhist = await dc._get("/v5/market/history-fund-rate",
+        fhist = await dc._get("/v5/market/funding/history",
                               {"category": "linear", "symbol": coin, "limit": 200})
         funds = []
         if fhist:
