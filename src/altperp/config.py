@@ -36,6 +36,13 @@ KRAKEN_SYMBOL_MAP = {
     "ARBUSDT": "PF_ARBUSD",
 }
 
+# ── Mean-reversion strategy (covers the RANGING regime) ──────────────────────
+# Fade Bollinger-style extremes back to the mean. Only routed in RANGING.
+MR_LOOKBACK = 20               # SMA/stdev window (4h bars)
+MR_Z_ENTRY = 2.0               # enter when price is ±2σ from the mean
+MR_STOP_PCT = 0.025            # hard stop 2.5% beyond entry
+MR_TIME_STOP_HOURS = 24        # bail if it hasn't reverted
+
 # ── Trend-following strategy (covers the TRENDING regimes) ───────────────────
 # Donchian breakout entry + ATR chandelier trailing stop ("let winners run, cut
 # losers fast"). Crypto's most durable directional edge per the research.

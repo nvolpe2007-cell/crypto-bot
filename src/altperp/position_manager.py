@@ -46,6 +46,7 @@ class Position:
     fees_paid: float = 0.0
     last_price: float = 0.0
     atr_at_entry: float = 0.0      # for trend chandelier trailing stop
+    target_price: float = 0.0      # for mean-reversion (revert-to-mean target)
 
     def unrealized(self, price: float) -> float:
         live_qty = self.qty * self.remaining_fraction
@@ -122,6 +123,9 @@ class PositionManager:
             pos.trail_active = True
             pos.trail_anchor = fill.price
             pos.atr_at_entry = getattr(setup, "atr", 0.0) or 0.0
+        # Mean-reversion positions carry a revert-to-mean target.
+        elif pos.setup_type.startswith("mr"):
+            pos.target_price = getattr(setup, "target_price", 0.0) or 0.0
 
         self.equity -= fill.fee
         pos.fees_paid += fill.fee

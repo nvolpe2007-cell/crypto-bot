@@ -28,11 +28,35 @@ class ExitAction:
 def check_exit(pos, price: float, funding_rate: Optional[float],
                oi_4hr_change: Optional[float], now: Optional[datetime] = None) -> Optional[ExitAction]:
     now = now or datetime.now(timezone.utc)
-    if getattr(pos, "setup_type", "").startswith("trend"):
+    st = getattr(pos, "setup_type", "")
+    if st.startswith("trend"):
         return _check_trend(pos, price)
+    if st.startswith("mr"):
+        return _check_mr(pos, price, now)
     if pos.direction == "short":
         return _check_short(pos, price, funding_rate, now)
     return _check_long(pos, price, oi_4hr_change, now)
+
+
+def _check_mr(pos, price, now) -> Optional[ExitAction]:
+    """Mean-reversion: target = revert to the mean; hard stop beyond entry; time
+    stop if it doesn't revert."""
+    entry = pos.entry_price
+    rem = pos.remaining_fraction
+    if pos.direction == "long":
+        if price <= entry * (1 - config.MR_STOP_PCT):
+            return ExitAction("full", rem, "STOP")
+        if pos.target_price and price >= pos.target_price:
+            return ExitAction("full", rem, "MR_TP")
+    else:  # short
+        if price >= entry * (1 + config.MR_STOP_PCT):
+            return ExitAction("full", rem, "STOP")
+        if pos.target_price and price <= pos.target_price:
+            return ExitAction("full", rem, "MR_TP")
+    age_h = (now - pos.opened_at).total_seconds() / 3600.0
+    if age_h >= config.MR_TIME_STOP_HOURS:
+        return ExitAction("full", rem, "TIME_STOP")
+    return None
 
 
 def _check_trend(pos, price) -> Optional[ExitAction]:

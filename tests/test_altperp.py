@@ -90,31 +90,43 @@ def test_concurrent_and_per_coin_limits(tmp_path):
     assert not ok3 and why3 == "max_concurrent"
 
 
-def test_runner_evaluate_and_act_opens_short(tmp_path):
+def test_runner_routes_fade_in_volatile(tmp_path):
     from src.altperp.runner import evaluate_and_act
+    from src.altperp import regime as rg
     pm, db = _pm(tmp_path)
-    # Mock market that should trigger a fade short with CVD confirmation
-    flat_klines = [{"close": 100.0 + (i % 2) * 0.1, "volume": 1000.0} for i in range(60)]
+    # VOLATILE regime: flat closes but huge bar ranges → fade is eligible
+    vol_klines = [{"ts": i * 14400000, "open": 100.0, "high": 108.0, "low": 92.0,
+                   "close": 100.0 + (i % 2) * 0.1, "volume": 1000.0} for i in range(60)]
     market = {
-        "price": 100.0,
-        "funding_rate": 0.0007,                       # >= short threshold
-        "funding_history": [0.0002] * 6,              # calm history → spike + eligible
-        "oi_points": [{"ts": 1, "oi": 90}, {"ts": 2, "oi": 100}, {"ts": 3, "oi": 132}],  # +32%
-        "perp_trades": [{"side": "Buy", "size": 80}, {"side": "Sell", "size": 10}],       # perp buying
-        "spot_trades": [{"side": "Sell", "size": 50}],                                    # spot selling
-        "orderbook": {"bids": [[99, 5], [98, 6], [97, 5]], "asks": [[101, 5], [102, 6]]},
-        "klines": flat_klines,
+        "price": 100.0, "funding_rate": 0.0007, "funding_history": [0.0002] * 6,
+        "oi_points": [{"ts": 1, "oi": 90}, {"ts": 2, "oi": 100}, {"ts": 3, "oi": 132}],
+        "perp_trades": [{"side": "Buy", "size": 80}, {"side": "Sell", "size": 10}],
+        "spot_trades": [{"side": "Sell", "size": 50}],
+        "orderbook": {"bids": [[99, 5], [98, 6]], "asks": [[101, 5], [102, 6]]},
+        "klines": vol_klines,
     }
-    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)  # clear of post-funding block
-    setup = evaluate_and_act("SOLUSDT", market, pm, btc_uptrend_ok=True, now=now, db_path=db)
-    assert setup.should_enter and setup.direction == "short", setup
-    assert "SOLUSDT" in pm.positions
-    # a signal_log row was written with trade_fired=1
-    import sqlite3
-    con = sqlite3.connect(db)
-    row = con.execute("SELECT tier1_triggered, trade_fired, setup_type FROM signal_log").fetchone()
-    con.close()
-    assert row == (1, 1, "fade_short"), row
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    reg, routed = evaluate_and_act("SOLUSDT", market, pm, btc_uptrend_ok=True, now=now, db_path=db)
+    assert reg.regime == rg.VOLATILE, reg
+    assert routed.active_strategy == "fade", routed
+    assert "SOLUSDT" in pm.positions and pm.positions["SOLUSDT"].direction == "short"
+
+
+def test_runner_routes_trend_in_uptrend(tmp_path):
+    from src.altperp.runner import evaluate_and_act
+    from src.altperp import regime as rg
+    pm, db = _pm(tmp_path)
+    kl = [{"ts": i * 14400000, "open": 100 + i * 2, "high": 101 + i * 2,
+           "low": 99 + i * 2, "close": 100 + i * 2, "volume": 1000} for i in range(60)]
+    market = {"price": kl[-1]["close"], "funding_rate": 0.0001,
+              "funding_history": [0.0001] * 6,
+              "oi_points": [{"ts": 1, "oi": 100}, {"ts": 2, "oi": 101}, {"ts": 3, "oi": 102}],
+              "perp_trades": [], "spot_trades": [], "orderbook": {}, "klines": kl}
+    now = datetime(2026, 5, 26, 12, 0, tzinfo=timezone.utc)
+    reg, routed = evaluate_and_act("SOLUSDT", market, pm, btc_uptrend_ok=True, now=now, db_path=db)
+    assert reg.regime == rg.TRENDING_UP, reg
+    assert routed.active_strategy == "trend", routed
+    assert pm.positions["SOLUSDT"].setup_type == "trend_long"
 
 
 def test_trend_follower_lifecycle(tmp_path):

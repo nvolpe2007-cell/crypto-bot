@@ -15,7 +15,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from . import config, database, time_utils
+from . import config, database, time_utils, regime as rg, router, trend, mean_reversion
 from .signals import (funding_signal, oi_signal, cvd_signal,
                       liq_proximity_signal, trend_signal)
 from .math_utils import is_volume_spike
@@ -30,49 +30,79 @@ logger = logging.getLogger(__name__)
 
 def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
                      btc_uptrend_ok: bool, now: datetime, db_path: Optional[str] = None):
-    """Evaluate one coin and act (manage/open). Logs the evaluation regardless.
-    Pure w.r.t. I/O except the DB log + pm side effects — unit-testable with a
-    mock `market` dict."""
+    """Regime-routed evaluation for one coin. Classify regime → ask the matched
+    strategy → route → act. Manages an open position regardless of regime. Logs
+    every evaluation. Unit-testable with a mock `market` dict."""
     price = market["price"]
+    klines = market.get("klines", [])
     f = funding_signal(market["funding_rate"], market.get("funding_history", []))
     oi = oi_signal(market.get("oi_points", []), price)
     cvd = cvd_signal(market.get("perp_trades", []), market.get("spot_trades", []))
     liq = liq_proximity_signal(market.get("orderbook") or {}, price)
-    trend = trend_signal(market.get("klines", []))
-
-    vols = [c["volume"] for c in market.get("klines", [])]
+    tsig = trend_signal(klines)
+    vols = [c["volume"] for c in klines]
     vol_spike = is_volume_spike(vols[-1], vols[-21:-1], config.VOLUME_SPIKE_MULTIPLIER) \
         if len(vols) > 1 else False
     mins = time_utils.get_minutes_to_next_funding_reset(now)
     post_block = time_utils.in_post_funding_block(now)
 
-    setup = evaluate_confluence(coin, f, oi, cvd, liq, trend, vol_spike,
-                                btc_uptrend_ok, mins, post_block)
-
+    reg = rg.classify(klines)
     fired = 0
-    if coin in pm.positions:
-        pm.on_tick(coin, price, market["funding_rate"], oi.get("oi_4hr_change"), now)
-    elif setup.should_enter:
-        ok, reason = pm.can_open(coin, now)
-        if ok:
-            plan = compute_size(pm.equity, price, setup.direction, setup.setup_type, setup.size_multiplier)
-            if plan:
-                pm.open_position(setup, plan, price, now)
-                fired = 1
-        else:
-            logger.debug("[ALTPERP] %s setup but can't open: %s", coin, reason)
+    routed = None
 
+    if coin in pm.positions:
+        # Manage the open position's exits regardless of current regime.
+        pm.on_tick(coin, price, market["funding_rate"], oi.get("oi_4hr_change"), now)
+    else:
+        # Build candidate decisions only for strategies eligible in this regime.
+        elig = router.eligible_strategies(reg.regime)
+        decisions = {}
+        if "trend" in elig:
+            ts = trend.evaluate(coin, klines, reg)
+            if ts.should_enter:
+                decisions["trend"] = ts
+        if "mean_reversion" in elig:
+            ms = mean_reversion.evaluate(coin, klines, reg)
+            if ms.should_enter:
+                decisions["mean_reversion"] = ms
+        if "fade" in elig or "flush" in elig:
+            cs = evaluate_confluence(coin, f, oi, cvd, liq, tsig, vol_spike,
+                                     btc_uptrend_ok, mins, post_block)
+            if cs.should_enter and cs.setup_type == "fade_short":
+                decisions["fade"] = cs
+            elif cs.should_enter and cs.setup_type == "flush_long":
+                decisions["flush"] = cs
+
+        routed = router.route(reg.regime, decisions)
+        if routed.decision:
+            setup = routed.decision
+            ok, why = pm.can_open(coin, now)
+            if ok:
+                eff_mult = setup.size_multiplier * routed.size_scale
+                stop_frac = getattr(setup, "stop_frac", None)
+                plan = compute_size(pm.equity, price, setup.direction,
+                                    setup.setup_type, eff_mult, stop_frac=stop_frac)
+                if plan:
+                    pm.open_position(setup, plan, price, now)
+                    fired = 1
+            else:
+                logger.debug("[ALTPERP] %s routed %s but can't open: %s",
+                             coin, routed.active_strategy, why)
+
+    log_setup = routed.active_strategy if (routed and routed.active_strategy) else f"regime:{reg.regime}"
     database.log_signal({
         "coin": coin, "price": price,
         "funding_rate": f["funding_rate"], "funding_rate_48hr_avg": f["funding_48hr_avg"],
         "oi_current": oi["oi_current_usd"], "oi_4hr_change_pct": oi["oi_4hr_change"],
         "oi_8hr_change_pct": oi["oi_8hr_change"],
         "perp_cvd_4hr": cvd["perp_cvd"], "spot_cvd_4hr": cvd["spot_cvd"],
-        "cvd_divergence": int(setup.cvd_confirmed), "liq_proximity": int(setup.liq_proximity),
-        "tier1_triggered": int(setup.tier1_ok), "tier2_score": setup.tier2_score,
-        "minutes_to_funding_reset": mins, "setup_type": setup.setup_type, "trade_fired": fired,
+        "cvd_divergence": int(cvd.get("bearish_divergence") or cvd.get("bullish_divergence")),
+        "liq_proximity": int(liq.get("short_proximity") or liq.get("long_proximity")),
+        "tier1_triggered": int(bool(routed and routed.decision)),
+        "tier2_score": 0, "minutes_to_funding_reset": mins,
+        "setup_type": log_setup, "trade_fired": fired,
     }, db_path=db_path)
-    return setup
+    return reg, routed
 
 
 async def _fetch_market(dc, coin: str) -> Optional[Dict]:
