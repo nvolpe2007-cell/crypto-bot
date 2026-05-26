@@ -572,6 +572,50 @@ class TestCircuitBreakerUnit:
         assert cb.is_open
 
 
+# ── CircuitBreakerOpen.remaining_seconds ──────────────────────────────────────
+
+class TestCircuitBreakerOpenException:
+    def test_default_remaining_seconds_is_zero(self):
+        """Direct construction without remaining_seconds defaults to 0."""
+        exc = CircuitBreakerOpen("test message")
+        assert exc.remaining_seconds == 0.0
+
+    def test_remaining_seconds_can_be_set(self):
+        exc = CircuitBreakerOpen("test", remaining_seconds=42.5)
+        assert exc.remaining_seconds == 42.5
+
+    def test_check_populates_remaining_seconds(self):
+        """check() should raise with remaining_seconds > 0 while circuit is open."""
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=120)
+        cb.record_failure()
+        try:
+            cb.check()
+            pytest.fail("CircuitBreakerOpen not raised")
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds > 0
+            assert exc.remaining_seconds <= 120.0
+
+    def test_remaining_seconds_decreases_with_time(self, monkeypatch):
+        """remaining_seconds reflects time elapsed since the circuit opened."""
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=100)
+        cb.record_failure()
+
+        # Advance monotonic clock by 30s
+        original_monotonic = time.monotonic
+        monkeypatch.setattr(time, "monotonic", lambda: original_monotonic() + 30)
+
+        try:
+            cb.check()
+            pytest.fail("CircuitBreakerOpen not raised")
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds <= 70.0  # 100 - 30 = ~70s left
+
+    def test_exception_is_subclass_of_exception(self):
+        """CircuitBreakerOpen must be catchable by bare `except Exception`."""
+        exc = CircuitBreakerOpen("test", remaining_seconds=5.0)
+        assert isinstance(exc, Exception)
+
+
 # ── _retry circuit-breaker integration ───────────────────────────────────────
 
 def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> ExchangeConnection:

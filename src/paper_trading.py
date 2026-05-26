@@ -24,7 +24,7 @@ import pandas_ta as _pta
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
 from .microstructure_strategy import MicrostructureStrategy, MicrostructureSignal
-from .exchange import ExchangeConnection
+from .exchange import ExchangeConnection, CircuitBreakerOpen
 from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
@@ -1124,6 +1124,19 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 if ohlcv:
                     ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                     logger.info(f"[CACHE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+            except CircuitBreakerOpen as e:
+                wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                logger.error(f"[CACHE] Exchange circuit breaker open during seed — stopping early ({wait:.0f}s remaining): {e}")
+                if notifier:
+                    try:
+                        notifier.send_message(
+                            f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                            f"Data seed interrupted — cooldown {wait:.0f}s.\n"
+                            f"Bot will trade on stale/incomplete cache until exchange recovers."
+                        )
+                    except Exception:
+                        pass
+                break  # no point seeding other symbols while the circuit is open
             except Exception as e:
                 logger.warning(f"[CACHE] seed failed for {sym}: {e}")
 
@@ -1186,6 +1199,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 ret = float(df_tmp['close'].pct_change().iloc[-1])
                                 if not pd.isna(ret):
                                     symbol_returns[sym].append(ret)
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(
+                            f"[CACHE] Exchange circuit breaker open — pausing refresher "
+                            f"{wait:.0f}s (symbol={sym})"
+                        )
+                        if notifier:
+                            try:
+                                notifier.send_message(
+                                    f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                                    f"OHLCV refresh paused {wait:.0f}s — trading on stale data."
+                                )
+                            except Exception:
+                                pass
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; refresher will retry next cycle
                     except Exception as e:
                         logger.debug(f"[CACHE] refresh failed for {sym}: {e}")
             except asyncio.TimeoutError:
@@ -1195,6 +1224,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[CACHE] Circuit open (fallback path) — sleeping {wait:.0f}s")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; will resume next cycle
                     except Exception as e:
                         logger.warning(f"[CACHE] fallback refresh failed for {sym}: {e}")
             except asyncio.CancelledError:

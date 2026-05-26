@@ -25,7 +25,16 @@ class CircuitBreakerOpen(Exception):
     The bot should treat this as a signal to pause all trading until the exchange
     recovers. The circuit resets automatically after `cooldown_seconds`, or
     immediately when the next call succeeds.
+
+    Attributes:
+        remaining_seconds: Approximate seconds until the circuit half-opens and
+            allows one call through. Callers can sleep for this duration before
+            retrying rather than hammering the exchange.
     """
+
+    def __init__(self, msg: str, remaining_seconds: float = 0.0):
+        super().__init__(msg)
+        self.remaining_seconds = remaining_seconds
 
 
 class CircuitBreaker:
@@ -81,7 +90,8 @@ class CircuitBreaker:
             remaining = self._open_until - time.monotonic()
             raise CircuitBreakerOpen(
                 f"Exchange circuit breaker open — pausing for {remaining:.0f}s more "
-                f"after {self._failures} consecutive failures"
+                f"after {self._failures} consecutive failures",
+                remaining_seconds=remaining,
             )
         if self._open_until is not None:
             # Cooldown just expired — half-open, allow call through
