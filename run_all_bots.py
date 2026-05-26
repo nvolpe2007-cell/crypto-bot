@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
 Master Bot Runner
-Launches all bots in parallel:
-- Scalping bot (advanced EMA/RSI)
-- DEX arbitrage
-- Stablecoin triangular arb
-- Funding rate arb
+Launches the scalping bot (src.bot.ScalpingBot → paper_trading session, which
+also runs the funding-arb arms) plus the dashboard. DEX/stablecoin arb are
+wired but disabled below (Binance/Bybit geo-blocked for US).
 """
 
 import sys
@@ -45,7 +43,8 @@ from src.bot import ScalpingBot
 from src.dashboard import run_dashboard
 from arbitrage.dex_arb import DEXArbitrageBot, Chain
 from arbitrage.stablecoin_arb import StablecoinArbBot
-from arbitrage.funding_rate_arb import FundingRateArbBot
+# NOTE: funding-rate arb runs inside the paper_trading session (two cost-aware
+# arms), not here — the old standalone FundingRateArbBot stub was removed.
 
 
 class MasterBotRunner:
@@ -59,7 +58,6 @@ class MasterBotRunner:
         self.scalping_bot = None
         self.dex_arb_bot = None
         self.stablecoin_arb_bot = None
-        self.funding_arb_bot = None
 
     async def start(self):
         """Start all bots"""
@@ -100,16 +98,6 @@ class MasterBotRunner:
             )
             asyncio.create_task(self.stablecoin_arb_bot.start())
 
-        # Start funding rate arb
-        if self.config.get("funding_arb", {}).get("enabled", True):
-            logger.info("Starting funding rate arb bot...")
-            self.funding_arb_bot = FundingRateArbBot(
-                exchanges=self.config.get("funding_arb", {}).get("exchanges", ["bybit"]),
-                min_annual_rate=self.config.get("funding_arb", {}).get("min_apy", 15.0),
-                max_position_usd=self.config.get("funding_arb", {}).get("max_position", 500)
-            )
-            asyncio.create_task(self.funding_arb_bot.start())
-
         logger.info("All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
 
         # Start dashboard server alongside bots
@@ -128,8 +116,6 @@ class MasterBotRunner:
             await self.dex_arb_bot.stop()
         if self.stablecoin_arb_bot:
             await self.stablecoin_arb_bot.stop()
-        if self.funding_arb_bot:
-            await self.funding_arb_bot.stop()
 
         logger.info("All bots stopped.")
 
@@ -145,10 +131,10 @@ def main():
     else:
         config = {}
 
-    # Arb bots disabled — Binance/Bybit are geo-blocked for US users
+    # DEX/stablecoin arb disabled — Binance/Bybit are geo-blocked for US users.
+    # (Funding arb runs inside the paper_trading session, gated by its own env var.)
     config.setdefault("dex_arb", {})["enabled"] = False
     config.setdefault("stablecoin_arb", {})["enabled"] = False
-    config.setdefault("funding_arb", {})["enabled"] = False
 
     runner = MasterBotRunner(config)
 
