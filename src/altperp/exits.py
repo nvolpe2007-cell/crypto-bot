@@ -28,9 +28,28 @@ class ExitAction:
 def check_exit(pos, price: float, funding_rate: Optional[float],
                oi_4hr_change: Optional[float], now: Optional[datetime] = None) -> Optional[ExitAction]:
     now = now or datetime.now(timezone.utc)
+    if getattr(pos, "setup_type", "").startswith("trend"):
+        return _check_trend(pos, price)
     if pos.direction == "short":
         return _check_short(pos, price, funding_rate, now)
     return _check_long(pos, price, oi_4hr_change, now)
+
+
+def _check_trend(pos, price) -> Optional[ExitAction]:
+    """ATR chandelier trailing stop — ride the trend, exit only when it breaks.
+    No fixed TP / time stop: trend edge comes from letting winners run."""
+    stop_dist = config.TREND_ATR_STOP_MULT * (pos.atr_at_entry or 0.0)
+    if stop_dist <= 0:
+        return None
+    if pos.direction == "long":
+        pos.trail_anchor = price if pos.trail_anchor is None else max(pos.trail_anchor, price)
+        if price <= pos.trail_anchor - stop_dist:
+            return ExitAction("full", pos.remaining_fraction, "TREND_STOP")
+    else:  # short trend
+        pos.trail_anchor = price if pos.trail_anchor is None else min(pos.trail_anchor, price)
+        if price >= pos.trail_anchor + stop_dist:
+            return ExitAction("full", pos.remaining_fraction, "TREND_STOP")
+    return None
 
 
 def _check_short(pos, price, funding_rate, now) -> Optional[ExitAction]:

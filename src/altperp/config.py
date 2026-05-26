@@ -36,6 +36,23 @@ KRAKEN_SYMBOL_MAP = {
     "ARBUSDT": "PF_ARBUSD",
 }
 
+# ── Trend-following strategy (covers the TRENDING regimes) ───────────────────
+# Donchian breakout entry + ATR chandelier trailing stop ("let winners run, cut
+# losers fast"). Crypto's most durable directional edge per the research.
+TREND_BREAKOUT_BARS = 20       # enter on a new N-bar high (long) / low (short)
+TREND_ATR_STOP_MULT = 3.0      # trailing stop = 3×ATR from the peak/trough since entry
+TREND_MIN_ATR_PCT = 0.010      # need at least this much vol to bother trend-trading
+
+# ── Regime classification (for the all-weather router) ───────────────────────
+# Measured on 4h klines. The router maps each regime to the strategy that has an
+# edge there, and sits out / shrinks where none does. "All-weather" = coverage
+# across regimes, NOT forcing a trade every bar.
+REGIME_ATR_PERIOD = 14
+REGIME_VOLATILE_ATR_PCT = 0.040    # 4h ATR/price >= 4% → VOLATILE
+REGIME_CALM_ATR_PCT = 0.015        # <= 1.5% → CALM (thin pickings; mostly sit out)
+REGIME_CRASH_RETURN_PCT = -0.15    # <= -15% over lookback → CRASH
+REGIME_CRASH_LOOKBACK = 6          # bars (6×4h = 24h)
+
 # ── Trend / regime filter (MANDATORY per research — BIS crypto-carry) ─────────
 # The #1 failure mode is fading shorts into a sustained uptrend (funding stays
 # extreme for weeks while price rips). Block shorts in a confirmed uptrend, and

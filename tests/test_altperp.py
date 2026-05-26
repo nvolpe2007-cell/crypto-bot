@@ -117,6 +117,46 @@ def test_runner_evaluate_and_act_opens_short(tmp_path):
     assert row == (1, 1, "fade_short"), row
 
 
+def test_trend_follower_lifecycle(tmp_path):
+    from src.altperp.trend import TrendSetup
+    pm, db = _pm(tmp_path)
+    setup = TrendSetup(coin="SOLUSDT", direction="long", setup_type="trend_long",
+                       size_multiplier=1.0, stop_frac=0.06, atr=2.0,
+                       context={"regime": "TRENDING_UP"})
+    plan = compute_size(pm.equity, 100.0, "long", "trend_long", 1.0, stop_frac=setup.stop_frac)
+    pos = pm.open_position(setup, plan, price=100.0, now=T0)
+    assert pos.trail_active and pos.atr_at_entry == 2.0  # trend trails from entry
+    entry = pos.entry_price
+
+    # Ride up — no exit, anchor climbs
+    pm.on_tick("SOLUSDT", 110.0, None, None, T0 + timedelta(hours=8))
+    assert "SOLUSDT" in pm.positions and pm.positions["SOLUSDT"].trail_anchor == 110.0
+
+    # Pull back past 3×ATR (6) below the 110 peak → TREND_STOP, banked a winner
+    pm.on_tick("SOLUSDT", 103.0, None, None, T0 + timedelta(hours=12))
+    assert "SOLUSDT" not in pm.positions
+    assert pm.equity > 1000.0, pm.equity
+    import sqlite3
+    con = sqlite3.connect(db)
+    reason = con.execute("SELECT exit_reason FROM trades").fetchone()[0]
+    con.close()
+    assert reason == "TREND_STOP", reason
+
+
+def test_regime_router_wiring(tmp_path):
+    from src.altperp import regime as rg
+    from src.altperp.router import route
+    from src.altperp.trend import evaluate as eval_trend
+    # build a clean uptrend → classify → router routes to trend → trend fires
+    kl = [{"ts": i, "open": 100 + i, "high": 101 + i, "low": 99 + i,
+           "close": 100 + i, "volume": 1000} for i in range(60)]
+    reg = rg.classify(kl)
+    assert reg.regime == rg.TRENDING_UP
+    tsetup = eval_trend("SOLUSDT", kl, reg)
+    rd = route(reg.regime, {"trend": tsetup if tsetup.should_enter else None})
+    assert rd.active_strategy == "trend" and rd.size_scale == 1.0, rd
+
+
 def test_circuit_breaker_daily_drawdown(tmp_path):
     pm, _ = _pm(tmp_path)
     pm.equity = 940.0  # -6% vs day_start 1000

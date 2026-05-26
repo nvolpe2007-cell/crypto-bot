@@ -40,11 +40,17 @@ def compute_size(equity: float,
                  price: float,
                  direction: str,
                  setup_type: str,
-                 size_multiplier: float) -> Optional[SizePlan]:
-    """Return a SizePlan, or None if inputs are unusable / size rounds to zero."""
+                 size_multiplier: float,
+                 stop_frac: float = None) -> Optional[SizePlan]:
+    """Return a SizePlan, or None if inputs are unusable / size rounds to zero.
+
+    `stop_frac` override is used by the trend strategy (ATR-based stop distance);
+    fade/flush use the fixed per-setup stops.
+    """
     if equity <= 0 or price <= 0 or size_multiplier <= 0:
         return None
-    stop_frac = stop_distance_frac(direction, setup_type)
+    if stop_frac is None:
+        stop_frac = stop_distance_frac(direction, setup_type)
     if stop_frac <= 0:
         return None
 

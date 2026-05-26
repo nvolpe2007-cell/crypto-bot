@@ -55,6 +55,21 @@ def is_volume_spike(last_volume: float, recent_volumes: List[float], multiplier:
     return last_volume >= multiplier * avg
 
 
+def atr(klines: List[Dict], period: int = 14) -> Optional[float]:
+    """Average True Range (price units) over the last `period` bars.
+    klines: [{high, low, close}, ...] oldest→newest."""
+    if not klines or len(klines) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(klines)):
+        h, l = klines[i]["high"], klines[i]["low"]
+        pc = klines[i - 1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+
 def ema(values: List[float], period: int) -> Optional[List[float]]:
     """Exponential moving average series (same length as values). None if too short."""
     vals = [v for v in values if v is not None]

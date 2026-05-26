@@ -45,6 +45,7 @@ class Position:
     realized_pnl: float = 0.0      # gross realized PnL (before fees)
     fees_paid: float = 0.0
     last_price: float = 0.0
+    atr_at_entry: float = 0.0      # for trend chandelier trailing stop
 
     def unrealized(self, price: float) -> float:
         live_qty = self.qty * self.remaining_fraction
@@ -116,6 +117,12 @@ class PositionManager:
             cvd_confirmed=setup.cvd_confirmed, liq_proximity=setup.liq_proximity,
             tier2_active=setup.tier2_score > 0,
         )
+        # Trend positions trail from entry (chandelier) and need ATR for the stop.
+        if pos.setup_type.startswith("trend"):
+            pos.trail_active = True
+            pos.trail_anchor = fill.price
+            pos.atr_at_entry = getattr(setup, "atr", 0.0) or 0.0
+
         self.equity -= fill.fee
         pos.fees_paid += fill.fee
 
