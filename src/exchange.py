@@ -148,7 +148,7 @@ class ExchangeConnection:
         logger.info(f"Exchange initialized (sandbox={sandbox})")
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
-                     label: str = '?', **kwargs):
+                     label: str = '?', call_timeout: float = 30.0, **kwargs):
         """Call coro_fn(*args, **kwargs) with exponential-backoff retry.
 
         Retries only on _RETRYABLE (NetworkError, RequestTimeout,
@@ -158,18 +158,41 @@ class ExchangeConnection:
         RateLimitExceeded uses a 30s minimum wait because Kraken's rate-limit
         window is typically 30+ seconds — hammering it sooner wastes retries.
 
+        call_timeout: Per-call wall-clock timeout in seconds (default 30).
+            If a ccxt network call stalls for longer than this, it is cancelled
+            and treated as a transient ccxt.RequestTimeout — the call is retried
+            with normal exponential backoff.  Pass None to disable (not
+            recommended in production; a hung call blocks the entire event loop).
+
         Raises CircuitBreakerOpen if the circuit is currently open (too many
         consecutive total-failures across all calls on this connection).
 
-        Raises the last seen _RETRYABLE exception when all attempts are exhausted.
+        Raises the last seen _RETRYABLE exception (or ccxt.RequestTimeout on
+        hang) when all attempts are exhausted.
         """
         self._circuit.check()  # raises CircuitBreakerOpen if open
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
-                result = await coro_fn(*args, **kwargs)
+                coro = coro_fn(*args, **kwargs)
+                if call_timeout is not None:
+                    result = await asyncio.wait_for(coro, timeout=call_timeout)
+                else:
+                    result = await coro
                 self._circuit.record_success()
                 return result
+            except asyncio.TimeoutError:
+                # A hung ccxt call — convert to RequestTimeout so callers and
+                # the retry/circuit logic see a uniform exception type.
+                msg = (
+                    f"{label} timed out after {call_timeout:.0f}s "
+                    f"(attempt {attempt}/{retries})"
+                )
+                logger.warning(msg)
+                last_exc = ccxt.RequestTimeout(msg)
+                if attempt < retries:
+                    wait = 2 ** attempt + random.uniform(0, 1)
+                    await asyncio.sleep(wait)
             except _RETRYABLE as exc:
                 last_exc = exc
                 logger.warning(
@@ -278,13 +301,21 @@ class ExchangeConnection:
         )
 
     async def create_order(self, symbol: str, order_type: str, side: str,
-                           amount: float, price: Optional[float] = None) -> Dict:
+                           amount: float, price: Optional[float] = None,
+                           order_timeout: float = 30.0) -> Dict:
         """Place an order.
 
         No automatic retry: order creation is NOT idempotent.  A
         RequestTimeout could mean the exchange already accepted the order —
         retrying blindly would create a duplicate position.  Callers must
         handle exceptions explicitly and reconcile via get_open_orders().
+
+        order_timeout: Per-call wall-clock timeout in seconds (default 30).
+            If the exchange connection stalls, asyncio.wait_for cancels the call
+            and raises ccxt.RequestTimeout.  Callers should treat this the same
+            as a normal RequestTimeout — the order may or may not have been
+            placed; always reconcile via get_open_orders() before retrying.
+            Pass None to disable (not recommended in production).
         """
         params = {'symbol': symbol, 'type': order_type,
                   'side': side, 'amount': amount}
@@ -293,7 +324,17 @@ class ExchangeConnection:
 
         logger.info(f"Placing {order_type} {side} order for "
                     f"{amount} {symbol} at {price or 'market'}")
-        return await self.exchange.create_order(**params)
+        coro = self.exchange.create_order(**params)
+        try:
+            if order_timeout is not None:
+                return await asyncio.wait_for(coro, timeout=order_timeout)
+            return await coro
+        except asyncio.TimeoutError:
+            raise ccxt.RequestTimeout(
+                f"create_order({symbol} {side} {amount}) timed out after "
+                f"{order_timeout:.0f}s — order state unknown; "
+                "reconcile via get_open_orders() before retrying"
+            )
 
     async def cancel_order(self, order_id: str, symbol: str,
                            retries: int = 3) -> Dict:
@@ -363,21 +404,39 @@ class KrakenFuturesConnection:
         return self.SPOT_TO_PERP.get(spot_symbol, spot_symbol)
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
-                     label: str = '?', **kwargs):
+                     label: str = '?', call_timeout: float = 30.0, **kwargs):
         """Identical retry + circuit-breaker semantics to ExchangeConnection._retry.
 
         Retries only _RETRYABLE errors with exponential backoff.
         RateLimitExceeded uses a 30s minimum wait (Kraken's reset window).
         Non-transient errors (auth, bad params) propagate immediately.
         Raises CircuitBreakerOpen if the circuit is open.
+
+        call_timeout: Per-call wall-clock timeout in seconds (default 30).
+            Hung ccxt calls are cancelled and re-raised as ccxt.RequestTimeout.
+            Pass None to disable.
         """
         self._circuit.check()
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
-                result = await coro_fn(*args, **kwargs)
+                coro = coro_fn(*args, **kwargs)
+                if call_timeout is not None:
+                    result = await asyncio.wait_for(coro, timeout=call_timeout)
+                else:
+                    result = await coro
                 self._circuit.record_success()
                 return result
+            except asyncio.TimeoutError:
+                msg = (
+                    f"{label} timed out after {call_timeout:.0f}s "
+                    f"(attempt {attempt}/{retries})"
+                )
+                logger.warning(msg)
+                last_exc = ccxt.RequestTimeout(msg)
+                if attempt < retries:
+                    wait = 2 ** attempt + random.uniform(0, 1)
+                    await asyncio.sleep(wait)
             except _RETRYABLE as exc:
                 last_exc = exc
                 logger.warning(
@@ -476,14 +535,30 @@ class KrakenFuturesConnection:
 
     async def create_order(self, symbol: str, order_type: str, side: str,
                            amount: float, price: Optional[float] = None,
-                           leverage: int = 1) -> Dict:
-        """Place a futures order. No retry — order creation is not idempotent."""
+                           leverage: int = 1, order_timeout: float = 30.0) -> Dict:
+        """Place a futures order. No retry — order creation is not idempotent.
+
+        order_timeout: Per-call wall-clock timeout in seconds (default 30).
+            On hang, asyncio.wait_for raises ccxt.RequestTimeout.  Callers
+            must reconcile via get_open_positions() before retrying.
+            Pass None to disable.
+        """
         perp = self.perp_symbol(symbol)
         params = {}
         if leverage > 1:
             params['leverage'] = leverage
         logger.info(f"Placing {order_type} {side} order: {amount} {perp} @ {price or 'market'} (lev={leverage}x)")
-        return await self.exchange.create_order(perp, order_type, side, amount, price, params)
+        coro = self.exchange.create_order(perp, order_type, side, amount, price, params)
+        try:
+            if order_timeout is not None:
+                return await asyncio.wait_for(coro, timeout=order_timeout)
+            return await coro
+        except asyncio.TimeoutError:
+            raise ccxt.RequestTimeout(
+                f"futures.create_order({perp} {side} {amount}) timed out after "
+                f"{order_timeout:.0f}s — order state unknown; "
+                "reconcile via get_open_positions() before retrying"
+            )
 
     async def cancel_order(self, order_id: str, symbol: str,
                            retries: int = 3) -> Dict:

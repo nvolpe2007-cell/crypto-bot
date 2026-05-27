@@ -948,3 +948,275 @@ class TestCircuitBreakerEscalation:
         assert cb.consecutive_open_count == 0
         self._trip_and_force_close(cb)
         assert cb.consecutive_open_count == 1
+
+
+# ── Per-call timeout (asyncio.wait_for) ──────────────────────────────────────
+
+
+class TestRetryHangTimeout:
+    """
+    _retry wraps every ccxt call with asyncio.wait_for(coro, timeout=call_timeout).
+
+    If the exchange server accepts a TCP connection but never sends a response
+    (hung call), asyncio.TimeoutError is raised, converted to ccxt.RequestTimeout,
+    and retried with normal exponential back-off — identical to a regular
+    RequestTimeout from ccxt.  After all retries are exhausted, the circuit
+    breaker records a failure, just as it would for a network error.
+
+    This prevents the event loop from being frozen indefinitely while an open
+    position sits unmonitored.
+
+    NOTE: Hanging functions must use asyncio.Event().wait() rather than
+    asyncio.sleep() because the autouse fixture patches asyncio.sleep to a
+    no-op.  asyncio.Event().wait() blocks on the event loop without using
+    asyncio.sleep, so asyncio.wait_for's call_later-based timer fires correctly.
+    """
+
+    async def test_hanging_call_is_retried_then_raises_request_timeout(self):
+        """A call that always hangs exhausts retries and raises ccxt.RequestTimeout."""
+        conn = _make_conn()
+        call_count = 0
+
+        async def hanging(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.Event().wait()  # blocks until cancelled by wait_for
+
+        with pytest.raises(ccxt.RequestTimeout):
+            await conn._retry(hanging, retries=2, label='hang', call_timeout=0.001)
+
+        assert call_count == 2  # one attempt + one retry
+
+    async def test_timeout_triggers_circuit_breaker_after_exhaustion(self):
+        """Hang exhausts retries → circuit breaker records a failure."""
+        conn = _make_conn_with_circuit(threshold=1, cooldown=60)
+        call_count = 0
+
+        async def hanging(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.Event().wait()
+
+        with pytest.raises((ccxt.RequestTimeout, CircuitBreakerOpen)):
+            await conn._retry(hanging, retries=1, label='hang', call_timeout=0.001)
+
+        assert conn._circuit.is_open
+
+    async def test_timeout_raises_ccxt_request_timeout_not_asyncio_timeout(self):
+        """Callers see ccxt.RequestTimeout, not the internal asyncio.TimeoutError."""
+        conn = _make_conn()
+
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        exc_raised = None
+        try:
+            await conn._retry(hanging, retries=1, label='hang', call_timeout=0.001)
+        except Exception as e:
+            exc_raised = e
+
+        assert exc_raised is not None
+        assert isinstance(exc_raised, ccxt.RequestTimeout), (
+            f"Expected ccxt.RequestTimeout, got {type(exc_raised)}"
+        )
+
+    async def test_successful_call_within_timeout_returns_normally(self):
+        """A call that completes before the timeout succeeds without incident."""
+        conn = _make_conn()
+        fn = AsyncMock(return_value={"data": "ok"})
+        result = await conn._retry(fn, retries=1, label='fast', call_timeout=5.0)
+        assert result == {"data": "ok"}
+        assert fn.call_count == 1
+
+    async def test_call_timeout_none_disables_guard(self):
+        """call_timeout=None removes asyncio.wait_for — normal behavior unchanged."""
+        conn = _make_conn()
+        fn = AsyncMock(return_value=42)
+        result = await conn._retry(fn, retries=1, label='t', call_timeout=None)
+        assert result == 42
+        assert fn.call_count == 1
+
+    async def test_mixed_network_error_then_hang_all_count_as_retries(self):
+        """One NetworkError followed by a hang both use retry slots correctly."""
+        conn = _make_conn()
+        call_count = 0
+
+        async def mixed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ccxt.NetworkError("transient blip")
+            await asyncio.Event().wait()  # second attempt hangs
+
+        with pytest.raises((ccxt.NetworkError, ccxt.RequestTimeout)):
+            await conn._retry(mixed, retries=2, label='mixed', call_timeout=0.001)
+
+        assert call_count == 2
+
+    async def test_hang_then_success_resets_circuit_breaker(self):
+        """A hung call that eventually succeeds (on retry) resets the breaker."""
+        conn = _make_conn_with_circuit(threshold=3, cooldown=60)
+        call_count = 0
+
+        async def hang_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                await asyncio.Event().wait()  # hang on first attempt
+            return "recovered"
+
+        result = await conn._retry(hang_once, retries=2, label='hang-once',
+                                   call_timeout=0.001)
+        assert result == "recovered"
+        assert conn._circuit.failure_count == 0  # reset on success
+
+    async def test_args_and_kwargs_passed_through_with_timeout(self):
+        """call_timeout is consumed by _retry and NOT forwarded to coro_fn."""
+        conn = _make_conn()
+        fn = AsyncMock(return_value="data")
+        await conn._retry(fn, "sym", timeframe="1m", retries=1,
+                          label='t', call_timeout=5.0)
+        fn.assert_called_once_with("sym", timeframe="1m")
+
+
+class TestCreateOrderTimeout:
+    """
+    create_order wraps the ccxt call with asyncio.wait_for(coro, order_timeout).
+
+    A hung order placement is the worst case scenario: the exchange may or may
+    not have accepted the order, but the bot has no confirmation.  The timeout
+    converts the hang to ccxt.RequestTimeout so the caller can reconcile via
+    get_open_orders() before deciding whether to retry.
+    """
+
+    async def test_hanging_create_order_raises_request_timeout(self):
+        """A hung create_order is cancelled and raises ccxt.RequestTimeout."""
+        conn = _make_conn()
+
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        conn.exchange.create_order = hanging
+
+        with pytest.raises(ccxt.RequestTimeout, match="timed out"):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001,
+                                    order_timeout=0.001)
+
+    async def test_create_order_completes_within_timeout(self):
+        """Normal order placement is unaffected by the timeout guard."""
+        conn = _make_conn()
+        order = {'id': 'abc123', 'status': 'open'}
+        conn.exchange.create_order = AsyncMock(return_value=order)
+        result = await conn.create_order('BTC/USD', 'market', 'buy', 0.001,
+                                         order_timeout=5.0)
+        assert result == order
+
+    async def test_create_order_timeout_none_disables_guard(self):
+        """order_timeout=None disables asyncio.wait_for — normal flow."""
+        conn = _make_conn()
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'x'})
+        result = await conn.create_order('BTC/USD', 'market', 'buy', 0.001,
+                                         order_timeout=None)
+        assert result is not None
+
+    async def test_ccxt_request_timeout_from_exchange_still_propagates(self):
+        """A ccxt.RequestTimeout raised by the exchange (not a hang) passes through."""
+        conn = _make_conn()
+        conn.exchange.create_order = AsyncMock(
+            side_effect=ccxt.RequestTimeout("exchange rejected")
+        )
+        with pytest.raises(ccxt.RequestTimeout):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        # Still called exactly once — no retry on order creation
+        assert conn.exchange.create_order.call_count == 1
+
+    async def test_timeout_message_describes_unknown_order_state(self):
+        """The RequestTimeout message explicitly warns the order state is unknown."""
+        conn = _make_conn()
+
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        conn.exchange.create_order = hanging
+
+        try:
+            await conn.create_order('BTC/USD', 'buy', 'buy', 0.001,
+                                    order_timeout=0.001)
+            pytest.fail("Should have raised")
+        except ccxt.RequestTimeout as exc:
+            assert "timed out" in str(exc).lower() or "unknown" in str(exc).lower()
+
+
+# ── KrakenFuturesConnection per-call timeout ──────────────────────────────────
+
+
+class TestFuturesRetryHangTimeout:
+    """KrakenFuturesConnection._retry has the same call_timeout behaviour."""
+
+    async def test_hanging_call_retried_and_raises_request_timeout(self):
+        conn = _make_futures_conn()
+        call_count = 0
+
+        async def hanging(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.Event().wait()
+
+        with pytest.raises(ccxt.RequestTimeout):
+            await conn._retry(hanging, retries=2, label='hang', call_timeout=0.001)
+
+        assert call_count == 2
+
+    async def test_futures_timeout_trips_circuit_breaker(self):
+        conn = _make_futures_conn(threshold=1, cooldown=60)
+
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        with pytest.raises((ccxt.RequestTimeout, CircuitBreakerOpen)):
+            await conn._retry(hanging, retries=1, label='hang', call_timeout=0.001)
+
+        assert conn._circuit.is_open
+
+    async def test_futures_successful_call_within_timeout(self):
+        conn = _make_futures_conn()
+        fn = AsyncMock(return_value={"fundingRate": 0.0001})
+        result = await conn._retry(fn, retries=1, label='fast', call_timeout=5.0)
+        assert result == {"fundingRate": 0.0001}
+
+    async def test_futures_call_timeout_none_disables_guard(self):
+        conn = _make_futures_conn()
+        fn = AsyncMock(return_value=99)
+        result = await conn._retry(fn, retries=1, label='t', call_timeout=None)
+        assert result == 99
+
+
+class TestFuturesCreateOrderTimeout:
+    """KrakenFuturesConnection.create_order has the same order_timeout behaviour."""
+
+    async def test_hanging_futures_create_order_raises_request_timeout(self):
+        conn = _make_futures_conn()
+
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        conn.exchange.create_order = hanging
+
+        with pytest.raises(ccxt.RequestTimeout, match="timed out"):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.01,
+                                    order_timeout=0.001)
+
+    async def test_futures_create_order_completes_within_timeout(self):
+        conn = _make_futures_conn()
+        order = {'id': 'fut123', 'status': 'open'}
+        conn.exchange.create_order = AsyncMock(return_value=order)
+        result = await conn.create_order('BTC/USD', 'market', 'buy', 0.01,
+                                          order_timeout=5.0)
+        assert result == order
+
+    async def test_futures_create_order_timeout_none_disables_guard(self):
+        conn = _make_futures_conn()
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'x'})
+        result = await conn.create_order('BTC/USD', 'market', 'buy', 0.01,
+                                          order_timeout=None)
+        assert result is not None
