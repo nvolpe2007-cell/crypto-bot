@@ -97,7 +97,7 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
                     ctx = _ai_context(f, oi, cvd, liq, tsig, fdyn, micro, reg, mins, btc_uptrend_ok)
                     ai_decision = brain.decide(coin, setup, ctx, now)
                     if ai_decision.confirmed and ai_decision.confidence >= config.AI_CONFIDENCE_FLOOR:
-                        eff_mult = ai_decision.size_multiplier * routed.size_scale
+                        eff_mult = _bounded_ai_mult(setup.setup_type, ai_decision.size_multiplier) * routed.size_scale
                     else:
                         proceed = False
                         logger.info("[ALTPERP] %s AI gate-keeper blocked %s (action=%s conf=%s): %s",
@@ -136,6 +136,14 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
         "taker_divergence": int(micro["taker_divergence"]),
     }, db_path=db_path)
     return reg, routed
+
+
+def _bounded_ai_mult(setup_type: str, ai_mult: float) -> float:
+    """Bound the AI's size multiplier by the structural cap for the setup. Flush
+    longs are higher-risk and NEVER boosted (spec + confluence.py) — cap at 1.0;
+    fades may reach MAX_SIZE_BOOST. (ai_mult is already clamped to [0.5, 1.5].)"""
+    cap = 1.0 if setup_type == "flush_long" else config.MAX_SIZE_BOOST
+    return min(ai_mult, cap)
 
 
 def _ai_context(f, oi, cvd, liq, tsig, fdyn, micro, reg, mins, btc_ok) -> Dict:

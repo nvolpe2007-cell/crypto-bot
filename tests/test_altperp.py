@@ -296,6 +296,22 @@ def test_runner_ai_below_confidence_floor_blocks(tmp_path):
     assert "SOLUSDT" not in pm.positions
 
 
+def test_bounded_ai_mult_caps_flush_long():
+    from src.altperp.runner import _bounded_ai_mult
+    # flush longs are higher-risk → never boosted, even if the AI asks for more
+    assert _bounded_ai_mult("flush_long", 1.5) == 1.0
+    assert _bounded_ai_mult("flush_long", 0.5) == 0.5
+    # fades may reach the structural cap
+    assert _bounded_ai_mult("fade_short", 1.5) == config.MAX_SIZE_BOOST
+    assert _bounded_ai_mult("fade_short", 0.5) == 0.5
+
+
+def test_scenario_gate_behaviour():
+    # the scenario harness asserts gate behaviour across calm/froth/flip/uptrend/flush
+    from src.altperp import scenarios
+    scenarios._selftest()  # raises AssertionError on any regression
+
+
 def test_circuit_breaker_daily_drawdown(tmp_path):
     pm, _ = _pm(tmp_path)
     pm.equity = 940.0  # -6% vs day_start 1000

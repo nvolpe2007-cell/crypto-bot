@@ -174,7 +174,7 @@ def _parse(resp) -> AIDecision:
             inp = block.input or {}
             return AIDecision(
                 action=str(inp.get("action", "veto")).lower(),
-                confidence=int(inp.get("confidence", 0) or 0),
+                confidence=max(0, min(10, int(inp.get("confidence", 0) or 0))),
                 size_multiplier=float(inp.get("size_multiplier", 1.0) or 1.0),
                 key_signal=str(inp.get("key_signal", "")),
                 invalidation=str(inp.get("invalidation", "")),
