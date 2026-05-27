@@ -1027,6 +1027,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     last_entry_bar:     Dict[str, float] = {}   # bar-ts of last entry attempt
     last_ws_price_time: Dict[str, float] = {}   # when WS price last refreshed
     last_heartbeat:     float            = 0.0  # for periodic status log
+    last_account_report: float           = 0.0  # for periodic Telegram P&L report
     # Backtests showed 25/33 signal-flip exits hit a 4% win rate — a single
     # opposing bar is mostly noise. Require N consecutive flips before exiting.
     opposing_streak:    Dict[str, int]   = {}
@@ -1039,6 +1040,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     WS_PRICE_STALENESS_SEC    = 12.0    # skip entry if WS price older than this
     CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
     HEARTBEAT_INTERVAL_SEC    = 60.0
+    # Periodic account report to Telegram (made/lost + total money). Default hourly.
+    ACCOUNT_REPORT_INTERVAL_SEC = float(os.getenv('ACCOUNT_REPORT_HOURS', '1.0')) * 3600
+    # Push skipped/rejected-signal reasoning to Telegram? Default off → log only.
+    # (This was the source of the "only tells me when it skips" noise.)
+    NOTIFY_SKIPS              = os.getenv('NOTIFY_SKIPS', '0') == '1'
 
     # Daily summary scheduler — fires once when UTC date rolls over
     session_start_utc_date    = datetime.now(timezone.utc).date()
@@ -1613,7 +1619,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         if reasoning.rejected:
                             funnel.bump('skip:probgate')
                             logger.info(f"[SKIP BUY] {symbol} — prob gate: {reasoning.rejection_reason}")
-                            if notifier:
+                            if notifier and NOTIFY_SKIPS:
                                 notifier.send_trade_reasoning(
                                     symbol, "LONG", current_price, reasoning, size_usd, _entry_path_tag
                                 )
@@ -1725,7 +1731,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         if reasoning.rejected:
                             funnel.bump('skip:probgate')
                             logger.info(f"[SKIP SELL] {symbol} — prob gate: {reasoning.rejection_reason}")
-                            if notifier:
+                            if notifier and NOTIFY_SKIPS:
                                 notifier.send_trade_reasoning(
                                     symbol, "SHORT", current_price, reasoning, size_usd, _entry_path_tag
                                 )
@@ -1866,6 +1872,46 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 funnel.reset()
                 # Persist open positions so a crash/restart can resume
                 _save_open_positions(trader)
+
+            # Periodic account report to Telegram — made/lost + total money.
+            # Combines the directional paper account with both funding-arb arms
+            # (read from shared state). Fires on its own cadence (default hourly).
+            if notifier and (now_hb - last_account_report >= ACCOUNT_REPORT_INTERVAL_SEC):
+                last_account_report = now_hb
+                try:
+                    s_rep = trader.get_account_summary()
+                    wr_rep = (s_rep['winning_trades'] / s_rep['closed_trades'] * 100) \
+                        if s_rep['closed_trades'] else 0.0
+                    fa_pnl = fam_pnl = 0.0
+                    try:
+                        from .state import read_state as _rs
+                        _st = _rs() or {}
+                        fa_pnl = float((_st.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
+                        fam_pnl = float((_st.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
+                    except Exception:
+                        pass
+                    dir_pnl, dir_eq = s_rep['total_pnl'], s_rep['total_equity']
+                    combined = dir_pnl + fa_pnl + fam_pnl
+                    total_money = dir_eq + fa_pnl + fam_pnl
+                    open_syms = ', '.join(trader.account.positions.keys()) or 'none'
+                    mark = '🟢' if combined >= 0 else '🔴'
+                    verb = 'up' if combined >= 0 else 'down'
+                    notifier.send_message(
+                        f"📊 <b>Account Report</b> (paper)\n"
+                        f"💰 Total money: <b>${total_money:,.2f}</b>\n"
+                        f"{mark} Net P&amp;L: <b>${combined:+,.2f}</b> ({verb} since start)\n\n"
+                        f"• Directional book: ${dir_eq:,.2f} equity "
+                        f"(P&amp;L ${dir_pnl:+,.2f} / {s_rep['pnl_pct']:+.2f}%, "
+                        f"{s_rep['closed_trades']} trades, {wr_rep:.0f}% WR)\n"
+                        f"• Funding Arb (majors): ${fam_pnl:+,.2f}\n"
+                        f"• Funding Arb (aggressive): ${fa_pnl:+,.2f}\n"
+                        f"• Open positions: {open_syms}"
+                    )
+                    logger.info(f"[ACCOUNT REPORT] sent — total=${total_money:.2f} "
+                                f"netPnL=${combined:+.2f} (dir={dir_pnl:+.2f} "
+                                f"majors={fam_pnl:+.2f} aggr={fa_pnl:+.2f})")
+                except Exception as e:
+                    logger.warning(f"[ACCOUNT REPORT] failed: {e}")
 
             # Daily summary — fires once when UTC date rolls over
             today_utc = datetime.now(timezone.utc).date()
