@@ -66,6 +66,42 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 """
 
+# Every AI brain consultation (only fires when the structural gate passes), whether
+# it confirmed or vetoed — the dataset for "what confidence cutoff predicts profit".
+_AI_DECISIONS_DDL = """
+CREATE TABLE IF NOT EXISTS ai_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME,
+    coin TEXT,
+    gate_setup_type TEXT,
+    action TEXT,
+    confidence INTEGER,
+    size_multiplier REAL,
+    key_signal TEXT,
+    invalidation TEXT,
+    urgency TEXT,
+    reasoning TEXT,
+    model TEXT,
+    latency_ms INTEGER,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    trade_fired INTEGER,
+    error TEXT
+);
+"""
+
+# New signal_log columns added after the original schema shipped. _ensure_columns
+# ALTERs them onto any pre-existing DB (CREATE TABLE IF NOT EXISTS won't add cols).
+_SIGNAL_LOG_EXTRA_COLS = {
+    "funding_velocity": "REAL",
+    "funding_24h_change": "REAL",
+    "basis": "REAL",
+    "basis_compression": "REAL",
+    "taker_ratio_short": "REAL",
+    "taker_ratio_long": "REAL",
+    "taker_divergence": "INTEGER",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -84,11 +120,21 @@ def _conn(db_path: Optional[str] = None):
         con.close()
 
 
+def _ensure_columns(con, table: str, cols: Dict[str, str]):
+    """Idempotently ALTER-add any missing columns (SQLite has no ADD COLUMN IF NOT EXISTS)."""
+    existing = {r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, decl in cols.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db(db_path: Optional[str] = None):
-    """Create tables if they don't exist. Safe to call on every startup."""
+    """Create tables if they don't exist + migrate new columns. Safe every startup."""
     with _conn(db_path) as con:
         con.execute(_SIGNAL_LOG_DDL)
         con.execute(_TRADES_DDL)
+        con.execute(_AI_DECISIONS_DDL)
+        _ensure_columns(con, "signal_log", _SIGNAL_LOG_EXTRA_COLS)
 
 
 def log_signal(row: Dict, db_path: Optional[str] = None) -> int:
@@ -99,6 +145,9 @@ def log_signal(row: Dict, db_path: Optional[str] = None) -> int:
         "perp_cvd_4hr", "spot_cvd_4hr", "cvd_divergence", "liq_proximity",
         "tier1_triggered", "tier2_score", "minutes_to_funding_reset",
         "setup_type", "trade_fired",
+        # signals #4/#7/#9/#10 (AI context)
+        "funding_velocity", "funding_24h_change", "basis", "basis_compression",
+        "taker_ratio_short", "taker_ratio_long", "taker_divergence",
     ]
     row = dict(row)
     row.setdefault("timestamp", _now())
@@ -125,6 +174,25 @@ def open_trade(row: Dict, db_path: Optional[str] = None) -> int:
     with _conn(db_path) as con:
         cur = con.execute(
             f"INSERT INTO trades ({','.join(fields)}) "
+            f"VALUES ({','.join('?' for _ in fields)})",
+            values,
+        )
+        return cur.lastrowid
+
+
+def log_ai_decision(row: Dict, db_path: Optional[str] = None) -> int:
+    """Insert one AI brain consultation (confirm or veto). Missing keys → None."""
+    fields = [
+        "timestamp", "coin", "gate_setup_type", "action", "confidence",
+        "size_multiplier", "key_signal", "invalidation", "urgency", "reasoning",
+        "model", "latency_ms", "input_tokens", "output_tokens", "trade_fired", "error",
+    ]
+    row = dict(row)
+    row.setdefault("timestamp", _now())
+    values = [row.get(f) for f in fields]
+    with _conn(db_path) as con:
+        cur = con.execute(
+            f"INSERT INTO ai_decisions ({','.join(fields)}) "
             f"VALUES ({','.join('?' for _ in fields)})",
             values,
         )

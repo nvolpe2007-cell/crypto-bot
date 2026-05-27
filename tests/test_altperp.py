@@ -169,6 +169,133 @@ def test_regime_router_wiring(tmp_path):
     assert rd.active_strategy == "trend" and rd.size_scale == 1.0, rd
 
 
+# ── AI brain (gate-keeper) ────────────────────────────────────────────────────
+
+class _Block:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _Usage:
+    def __init__(self, i, o):
+        self.input_tokens, self.output_tokens = i, o
+
+
+class _Resp:
+    def __init__(self, blocks, usage=None):
+        self.content, self.usage = blocks, usage
+
+
+class _FakeClient:
+    """Mimics anthropic.Anthropic: .messages.create() → tool_use response."""
+    def __init__(self, tool_input):
+        self._inp = tool_input
+        self.messages = self
+        self.kw = None
+
+    def create(self, **kw):
+        self.kw = kw
+        return _Resp([_Block(type="tool_use", name="submit_trade_decision", input=self._inp)],
+                     _Usage(1200, 90))
+
+
+class _RaisingClient:
+    def __init__(self):
+        self.messages = self
+
+    def create(self, **kw):
+        raise RuntimeError("api down")
+
+
+class _StubBrain:
+    """Stands in for AIBrain in runner tests — returns a fixed decision."""
+    def __init__(self, decision):
+        self._d = decision
+        self.ctx = None
+
+    def decide(self, coin, setup, ctx, now):
+        self.ctx = ctx
+        return self._d
+
+
+def _fade_market():
+    vol_klines = [{"ts": i * 14400000, "open": 100.0, "high": 108.0, "low": 92.0,
+                   "close": 100.0 + (i % 2) * 0.1, "volume": 1000.0} for i in range(60)]
+    return {
+        "price": 100.0, "funding_rate": 0.0007, "funding_history": [0.0002] * 6,
+        "oi_points": [{"ts": 1, "oi": 90}, {"ts": 2, "oi": 100}, {"ts": 3, "oi": 132}],
+        "perp_trades": [{"side": "Buy", "size": 80}, {"side": "Sell", "size": 10}],
+        "spot_trades": [{"side": "Sell", "size": 50}],
+        "orderbook": {"bids": [[99, 5], [98, 6]], "asks": [[101, 5], [102, 6]]},
+        "klines": vol_klines,
+    }
+
+
+def test_ai_brain_parses_and_clamps_size():
+    from src.altperp.ai_brain import AIBrain
+    client = _FakeClient({"action": "confirm", "confidence": 9, "size_multiplier": 2.0,
+                          "key_signal": "velocity flip down", "invalidation": "funding < 0.02%",
+                          "urgency": "enter_now", "reasoning": "fragile leveraged top"})
+    brain = AIBrain(client=client, model="test-model")
+    d = brain.decide("SOLUSDT", _short_setup(), {"regime": "VOLATILE"}, T0)
+    assert d.confirmed and d.confidence == 9
+    # model said 2.0; hard cap is the structural MAX_SIZE_BOOST
+    assert d.size_multiplier == config.MAX_SIZE_BOOST
+    assert d.input_tokens == 1200 and d.model == "test-model"
+    # forced tool + cached system prompt
+    assert client.kw["tool_choice"] == {"type": "tool", "name": "submit_trade_decision"}
+    assert client.kw["system"][0]["cache_control"]["type"] == "ephemeral"
+
+
+def test_ai_brain_fail_closed_on_error():
+    from src.altperp.ai_brain import AIBrain
+    d = AIBrain(client=_RaisingClient()).decide("SOLUSDT", _short_setup(), {}, T0)
+    assert not d.confirmed and d.action == "veto" and d.error
+
+
+def test_runner_ai_veto_blocks_trade(tmp_path):
+    import sqlite3
+    from src.altperp.runner import evaluate_and_act
+    from src.altperp.ai_brain import AIDecision
+    pm, db = _pm(tmp_path)
+    brain = _StubBrain(AIDecision(action="veto", confidence=2, key_signal="still rising",
+                                  reasoning="funding still climbing, crowd growing"))
+    reg, routed = evaluate_and_act("SOLUSDT", _fade_market(), pm, True, T0, db_path=db, brain=brain)
+    assert routed.active_strategy == "fade"          # gate passed
+    assert "SOLUSDT" not in pm.positions             # but AI vetoed → no trade
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT action, trade_fired FROM ai_decisions").fetchone()
+    con.close()
+    assert row == ("veto", 0)
+
+
+def test_runner_ai_confirm_opens_trade(tmp_path):
+    import sqlite3
+    from src.altperp.runner import evaluate_and_act
+    from src.altperp.ai_brain import AIDecision
+    pm, db = _pm(tmp_path)
+    brain = _StubBrain(AIDecision(action="confirm", confidence=8, size_multiplier=0.5,
+                                  key_signal="taker distribution"))
+    evaluate_and_act("SOLUSDT", _fade_market(), pm, True, T0, db_path=db, brain=brain)
+    assert "SOLUSDT" in pm.positions and pm.positions["SOLUSDT"].direction == "short"
+    # AI received the enriched context
+    assert brain.ctx["regime"] == "VOLATILE" and "funding_dynamics" in brain.ctx
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT action, trade_fired FROM ai_decisions").fetchone()
+    con.close()
+    assert row == ("confirm", 1)
+
+
+def test_runner_ai_below_confidence_floor_blocks(tmp_path):
+    from src.altperp.runner import evaluate_and_act
+    from src.altperp.ai_brain import AIDecision
+    pm, db = _pm(tmp_path)
+    # confirm, but below the default floor (6) → treated as no-go
+    brain = _StubBrain(AIDecision(action="confirm", confidence=3, size_multiplier=1.0))
+    evaluate_and_act("SOLUSDT", _fade_market(), pm, True, T0, db_path=db, brain=brain)
+    assert "SOLUSDT" not in pm.positions
+
+
 def test_circuit_breaker_daily_drawdown(tmp_path):
     pm, _ = _pm(tmp_path)
     pm.equity = 940.0  # -6% vs day_start 1000

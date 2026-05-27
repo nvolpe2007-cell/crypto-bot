@@ -17,7 +17,8 @@ from typing import Dict, Optional
 
 from . import config, database, time_utils, regime as rg, router, trend, mean_reversion
 from .signals import (funding_signal, oi_signal, cvd_signal,
-                      liq_proximity_signal, trend_signal)
+                      liq_proximity_signal, trend_signal,
+                      funding_dynamics_signal, microstructure_signal)
 from .math_utils import is_volume_spike
 from .confluence import evaluate as evaluate_confluence
 from .position_sizing import compute_size
@@ -29,10 +30,16 @@ logger = logging.getLogger(__name__)
 
 
 def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
-                     btc_uptrend_ok: bool, now: datetime, db_path: Optional[str] = None):
+                     btc_uptrend_ok: bool, now: datetime, db_path: Optional[str] = None,
+                     brain=None):
     """Regime-routed evaluation for one coin. Classify regime → ask the matched
     strategy → route → act. Manages an open position regardless of regime. Logs
-    every evaluation. Unit-testable with a mock `market` dict."""
+    every evaluation. Unit-testable with a mock `market` dict.
+
+    `brain`: optional AIBrain. When provided, fade/flush setups that pass the
+    structural gate are submitted to it as a gate-keeper (confirm/veto/size); it
+    can never open a setup the gate rejected. When None, the rule engine decides
+    alone (the original behavior — used by the offline tests)."""
     price = market["price"]
     klines = market.get("klines", [])
     f = funding_signal(market["funding_rate"], market.get("funding_history", []))
@@ -40,6 +47,9 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
     cvd = cvd_signal(market.get("perp_trades", []), market.get("spot_trades", []))
     liq = liq_proximity_signal(market.get("orderbook") or {}, price)
     tsig = trend_signal(klines)
+    fdyn = funding_dynamics_signal(market["funding_rate"], market.get("funding_history", []))
+    micro = microstructure_signal(market.get("perp_trades", []), klines,
+                                  market.get("spot_klines", []))
     vols = [c["volume"] for c in klines]
     vol_spike = is_volume_spike(vols[-1], vols[-21:-1], config.VOLUME_SPIKE_MULTIPLIER) \
         if len(vols) > 1 else False
@@ -79,12 +89,29 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
             ok, why = pm.can_open(coin, now)
             if ok:
                 eff_mult = setup.size_multiplier * routed.size_scale
-                stop_frac = getattr(setup, "stop_frac", None)
-                plan = compute_size(pm.equity, price, setup.direction,
-                                    setup.setup_type, eff_mult, stop_frac=stop_frac)
-                if plan:
-                    pm.open_position(setup, plan, price, now)
-                    fired = 1
+                proceed = True
+                ai_decision = None
+                # AI gate-keeper: only for the two spec setups. The structural gate
+                # already passed; the brain confirms/vetoes and (re)sizes within the cap.
+                if brain is not None and setup.setup_type in ("fade_short", "flush_long"):
+                    ctx = _ai_context(f, oi, cvd, liq, tsig, fdyn, micro, reg, mins, btc_uptrend_ok)
+                    ai_decision = brain.decide(coin, setup, ctx, now)
+                    if ai_decision.confirmed and ai_decision.confidence >= config.AI_CONFIDENCE_FLOOR:
+                        eff_mult = ai_decision.size_multiplier * routed.size_scale
+                    else:
+                        proceed = False
+                        logger.info("[ALTPERP] %s AI gate-keeper blocked %s (action=%s conf=%s): %s",
+                                    coin, setup.setup_type, ai_decision.action,
+                                    ai_decision.confidence, ai_decision.key_signal or ai_decision.reasoning[:80])
+                if proceed:
+                    stop_frac = getattr(setup, "stop_frac", None)
+                    plan = compute_size(pm.equity, price, setup.direction,
+                                        setup.setup_type, eff_mult, stop_frac=stop_frac)
+                    if plan:
+                        pm.open_position(setup, plan, price, now)
+                        fired = 1
+                if ai_decision is not None:
+                    _log_ai_decision(coin, setup, ai_decision, fired, db_path)
             else:
                 logger.debug("[ALTPERP] %s routed %s but can't open: %s",
                              coin, routed.active_strategy, why)
@@ -101,8 +128,69 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
         "tier1_triggered": int(bool(routed and routed.decision)),
         "tier2_score": 0, "minutes_to_funding_reset": mins,
         "setup_type": log_setup, "trade_fired": fired,
+        "funding_velocity": fdyn["funding_velocity"],
+        "funding_24h_change": fdyn["funding_24h_change"],
+        "basis": micro["basis"], "basis_compression": micro["basis_compression"],
+        "taker_ratio_short": micro["taker_ratio_short"],
+        "taker_ratio_long": micro["taker_ratio_long"],
+        "taker_divergence": int(micro["taker_divergence"]),
     }, db_path=db_path)
     return reg, routed
+
+
+def _ai_context(f, oi, cvd, liq, tsig, fdyn, micro, reg, mins, btc_ok) -> Dict:
+    """Assemble the full signal picture for the AI brain (JSON-serializable).
+    Funding shown as %/8h for readability."""
+    def pct(x):
+        return round(x * 100, 4) if isinstance(x, (int, float)) else None
+    return {
+        "regime": reg.regime,
+        "funding": {
+            "rate_pct_8h": pct(f["funding_rate"]),
+            "avg_48h_pct_8h": pct(f["funding_48hr_avg"]),
+            "short_eligible": f["short_eligible"], "long_eligible": f["long_eligible"],
+            "is_spike": f["is_spike"], "collapsed": f["funding_collapsed"],
+        },
+        "funding_dynamics": {
+            "velocity_pct_8h": pct(fdyn["funding_velocity"]),
+            "rising": fdyn["funding_rising"],
+            "velocity_flip_down": fdyn["velocity_flip_down"],
+            "change_24h_pct_8h": pct(fdyn["funding_24h_change"]),
+            "trend_24h_rising": fdyn["funding_24h_rising"],
+        },
+        "open_interest": {
+            "change_4h_pct": pct(oi["oi_4hr_change"]), "change_8h_pct": pct(oi["oi_8hr_change"]),
+            "short_spike": oi["short_spike"], "long_flush": oi["long_flush"],
+        },
+        "cvd": cvd,
+        "liquidity_clusters": liq,
+        "microstructure": {
+            "taker_ratio_short": micro["taker_ratio_short"],
+            "taker_ratio_long": micro["taker_ratio_long"],
+            "taker_divergence": micro["taker_divergence"],
+            "basis_pct": pct(micro["basis"]),
+            "basis_compressing": micro["basis_compressing"],
+        },
+        "trend": {"strong_uptrend": tsig.get("strong_uptrend"),
+                  "strong_downtrend": tsig.get("strong_downtrend"), "slope": tsig.get("slope")},
+        "btc_trend_ok_for_long": btc_ok,
+        "minutes_to_funding_reset": mins,
+    }
+
+
+def _log_ai_decision(coin, setup, d, fired, db_path):
+    try:
+        database.log_ai_decision({
+            "coin": coin, "gate_setup_type": setup.setup_type,
+            "action": d.action, "confidence": d.confidence,
+            "size_multiplier": d.size_multiplier, "key_signal": d.key_signal,
+            "invalidation": d.invalidation, "urgency": d.urgency, "reasoning": d.reasoning,
+            "model": d.model, "latency_ms": d.latency_ms,
+            "input_tokens": d.input_tokens, "output_tokens": d.output_tokens,
+            "trade_fired": fired, "error": d.error,
+        }, db_path=db_path)
+    except Exception as e:
+        logger.debug("[ALTPERP] %s ai_decision log failed: %s", coin, e)
 
 
 async def _fetch_market(dc, coin: str) -> Optional[Dict]:
@@ -119,6 +207,7 @@ async def _fetch_market(dc, coin: str) -> Optional[Dict]:
         "spot_trades": await dc.recent_trades(coin, category="spot"),
         "orderbook": await dc.orderbook(coin),
         "klines": await dc.klines(coin, interval="240", limit=60),
+        "spot_klines": await dc.klines(coin, interval="240", limit=60, category="spot"),
     }
 
 
@@ -151,6 +240,13 @@ async def run(notifier=None):
         await dc.close()
         return
 
+    brain = None
+    if config.AI_BRAIN_ENABLED:
+        from .ai_brain import AIBrain
+        brain = AIBrain()
+        logger.info("[ALTPERP] AI gate-keeper enabled — model=%s, confidence floor=%d",
+                    config.AI_MODEL, config.AI_CONFIDENCE_FLOOR)
+
     last_summary_day = datetime.now(timezone.utc).date()
     try:
         while True:
@@ -167,7 +263,7 @@ async def run(notifier=None):
                 try:
                     market = await _fetch_market(dc, coin)
                     if market:
-                        evaluate_and_act(coin, market, pm, btc_uptrend_ok, now)
+                        evaluate_and_act(coin, market, pm, btc_uptrend_ok, now, brain=brain)
                 except Exception as e:
                     logger.warning("[ALTPERP] %s loop error: %s", coin, e)
                     alerter.error(coin, e)

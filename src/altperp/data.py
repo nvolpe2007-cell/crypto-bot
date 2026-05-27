@@ -139,11 +139,13 @@ class BybitData:
         }
 
     # ── Klines (volume / candles) ──────────────────────────────────────────────
-    async def klines(self, symbol: str, interval: str = "240", limit: int = 21) -> List[Dict]:
+    async def klines(self, symbol: str, interval: str = "240", limit: int = 21,
+                     category: str = "linear") -> List[Dict]:
         """OHLCV candles (oldest→newest). interval in minutes ('240'=4h) or 'D'.
+        category 'linear' = perp, 'spot' = spot (for basis vs perp).
         Each: {ts, open, high, low, close, volume}."""
         res = await self._get("/v5/market/kline",
-                              {"category": "linear", "symbol": symbol,
+                              {"category": category, "symbol": symbol,
                                "interval": interval, "limit": limit})
         if not res:
             return []

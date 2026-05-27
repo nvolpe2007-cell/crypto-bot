@@ -152,6 +152,34 @@ RECENT_TRADE_LIMIT = 1000              # Bybit recent-trade max
 BYBIT_RATE_LIMIT_PER_SEC = 8           # stay under the 10 req/s market-data cap
 PAPER_STARTING_EQUITY = float(os.getenv("ALTPERP_EQUITY", "1000"))
 
+# ── Funding dynamics (signals #7 velocity, #4 24h-trend) — AI CONTEXT ONLY ────
+# These are NOT new hard gates (the gate stays funding-extreme + OI). They enrich
+# the AI brain's reasoning and the signal log. Funding history is 8h-settled, so
+# "velocity" is measured per 8h step (documented granularity, not per-hour).
+FUNDING_24H_STEPS = 3                   # settled steps spanning ~24h (3 × 8h)
+
+# ── Microstructure (signals #9 taker cross-window, #10 basis compression) ─────
+# Also AI-context only. Taker ratio is computed from the already-fetched recent
+# trades (Bybit returns newest-first): most-recent slice vs the full window — a
+# documented approximation of "1m vs 1h" (windows scale with trade frequency).
+TAKER_SHORT_FRAC = 0.20                 # most-recent 20% of trades = "now"
+TAKER_MIN_TRADES = 30                   # need this many trades for a meaningful read
+TAKER_DIVERGENCE_GAP = 0.10             # short-window buy-ratio ≥ long by 10pp → distribution
+BASIS_LOOKBACK_BARS = 6                 # 4h bars over which to measure basis compression (24h)
+BASIS_COMPRESSION_MIN = 0.001           # premium must shrink ≥0.1% to count as compressing
+
+# ── AI brain (gate-keeper decision layer) ─────────────────────────────────────
+# The Claude API reasons over the full signal picture AFTER the structural gate
+# passes. It can CONFIRM/VETO and set size within [AI_MIN_SIZE_MULT, MAX_SIZE_BOOST];
+# it CANNOT open a setup the gate rejected. Fail-closed: any API error → veto.
+AI_BRAIN_ENABLED = os.getenv("ALTPERP_AI_ENABLED", "1") == "1"
+AI_MODEL = os.getenv("ALTPERP_AI_MODEL", "claude-sonnet-4-6")
+AI_CONFIDENCE_FLOOR = int(os.getenv("ALTPERP_AI_CONF_FLOOR", "6"))  # spec: 8 (phase-2 live), 7 (phase-3)
+AI_MIN_SIZE_MULT = 0.5                  # AI can de-risk down to half base
+AI_MAX_TOKENS = 1024
+AI_TIMEOUT_SECS = 30
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
 # ── Storage ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv(
     "ALTPERP_DB",
@@ -174,4 +202,10 @@ def validate() -> list:
         problems.append("stops must be positive")
     if not TARGET_COINS:
         problems.append("TARGET_COINS is empty")
+    if not (1 <= AI_CONFIDENCE_FLOOR <= 10):
+        problems.append(f"AI_CONFIDENCE_FLOOR {AI_CONFIDENCE_FLOOR} not in 1..10")
+    if AI_MIN_SIZE_MULT > MAX_SIZE_BOOST:
+        problems.append("AI_MIN_SIZE_MULT > MAX_SIZE_BOOST")
+    if AI_BRAIN_ENABLED and not PAPER_TRADING and not ANTHROPIC_API_KEY:
+        problems.append("AI_BRAIN_ENABLED + LIVE but ANTHROPIC_API_KEY is empty (would veto every trade)")
     return problems

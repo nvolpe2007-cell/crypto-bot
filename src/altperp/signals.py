@@ -144,6 +144,91 @@ def trend_signal(klines: List[Dict]) -> Dict:
     return out
 
 
+def funding_dynamics_signal(current_rate: float, funding_history: List[float]) -> Dict:
+    """Signals #7 (velocity) + #4 (24h trend) — AI CONTEXT ONLY, not a hard gate.
+
+    funding_history is oldest→newest settled 8h rates. `current_rate` is the
+    live/predicted rate (fresher than the last settled). Velocity is per-8h-step.
+
+    The #7 insight: funding rising for hours then velocity flipping down means the
+    leveraged crowd has STOPPED growing — fuel running out — the moment to fade.
+    """
+    h = [x for x in (funding_history or []) if x is not None]
+    last = h[-1] if h else None
+    prev = h[-2] if len(h) >= 2 else None
+    # Freshest velocity: live rate vs last settled. Prior-step velocity for the flip.
+    vel_now = (current_rate - last) if (current_rate is not None and last is not None) else None
+    vel_prev = (last - prev) if (last is not None and prev is not None) else None
+    rising = bool(vel_now is not None and vel_now > 0)
+    velocity_flip_down = bool(vel_prev is not None and vel_prev > 0 and
+                              vel_now is not None and vel_now <= 0)
+    # 24h trend over ~3 settled steps (fall back to whatever history exists)
+    if len(h) >= config.FUNDING_24H_STEPS + 1:
+        change_24h = h[-1] - h[-1 - config.FUNDING_24H_STEPS]
+    elif len(h) >= 2:
+        change_24h = h[-1] - h[0]
+    else:
+        change_24h = None
+    return {
+        "funding_velocity": vel_now,
+        "funding_velocity_prev": vel_prev,
+        "funding_rising": rising,
+        "velocity_flip_down": velocity_flip_down,
+        "funding_24h_change": change_24h,
+        "funding_24h_rising": bool(change_24h is not None and change_24h > 0),
+    }
+
+
+def _taker_buy_ratio(trades: List[Dict]):
+    buy = sum(float(t.get("size", 0) or 0) for t in trades
+              if str(t.get("side", "")).lower() in ("buy", "b"))
+    sell = sum(float(t.get("size", 0) or 0) for t in trades
+               if str(t.get("side", "")).lower() in ("sell", "s"))
+    tot = buy + sell
+    return (buy / tot) if tot > 0 else None
+
+
+def microstructure_signal(perp_trades: List[Dict],
+                          perp_klines: List[Dict],
+                          spot_klines: List[Dict]) -> Dict:
+    """Signals #9 (taker cross-window) + #10 (basis compression) — AI CONTEXT ONLY.
+
+    Taker: Bybit recent-trade is newest-first, so trades[:short_n] is "now". A
+    short-window buy ratio well above the full-window ratio = aggressive buying
+    into a broader selling tape = distribution (smart money selling into FOMO).
+
+    Basis: per-bar (perp_close − spot_close)/spot_close. Positive basis that is
+    SHRINKING while price holds = stealth long-unwind before it shows in price.
+    """
+    out = {
+        "taker_ratio_short": None, "taker_ratio_long": None, "taker_divergence": False,
+        "basis": None, "basis_compression": None, "basis_compressing": False,
+    }
+    trades = perp_trades or []
+    n = len(trades)
+    if n >= config.TAKER_MIN_TRADES:
+        short_n = max(10, int(n * config.TAKER_SHORT_FRAC))
+        rs = _taker_buy_ratio(trades[:short_n])   # newest-first → most recent slice
+        rl = _taker_buy_ratio(trades)
+        out["taker_ratio_short"], out["taker_ratio_long"] = rs, rl
+        if rs is not None and rl is not None:
+            out["taker_divergence"] = bool(rs >= 0.5 and (rs - rl) >= config.TAKER_DIVERGENCE_GAP)
+
+    if perp_klines and spot_klines:
+        spot_by_ts = {c["ts"]: c["close"] for c in spot_klines}
+        series = [(c["ts"], (c["close"] - spot_by_ts[c["ts"]]) / spot_by_ts[c["ts"]])
+                  for c in perp_klines
+                  if c["ts"] in spot_by_ts and spot_by_ts[c["ts"]] > 0]
+        if len(series) >= config.BASIS_LOOKBACK_BARS + 1:
+            basis_now = series[-1][1]
+            basis_past = series[-1 - config.BASIS_LOOKBACK_BARS][1]
+            out["basis"] = basis_now
+            out["basis_compression"] = basis_past - basis_now   # >0 ⇒ premium shrinking
+            out["basis_compressing"] = bool(
+                basis_now > 0 and (basis_past - basis_now) >= config.BASIS_COMPRESSION_MIN)
+    return out
+
+
 def _selftest():
     # Funding: 0.07%/8h with a calm 0.02% history → eligible short + spike
     f = funding_signal(0.0007, [0.0002, 0.0002, 0.0003, 0.0002, 0.0002, 0.0003])
@@ -180,6 +265,25 @@ def _selftest():
     falling = [{"close": 200 - i} for i in range(60)]
     td = trend_signal(falling)
     assert td["strong_downtrend"] is True and td["strong_uptrend"] is False, td
+
+    # Funding dynamics: rose 0.02→0.04→0.06 then current dips to 0.055 → flip down
+    fd = funding_dynamics_signal(0.00055, [0.0002, 0.0004, 0.0006])
+    assert fd["velocity_flip_down"] is True and fd["funding_24h_rising"] is True, fd
+    # Still rising: current above last settled
+    fr = funding_dynamics_signal(0.0008, [0.0002, 0.0004, 0.0006])
+    assert fr["funding_rising"] is True and fr["velocity_flip_down"] is False, fr
+
+    # Microstructure taker divergence: recent slice (newest 20% = 10 trades) buy-heavy
+    # vs bulk mostly sells. 12 buys then 28 sells → short slice all buys → ratio 1.0.
+    tr = [{"side": "Buy", "size": 5}] * 12 + [{"side": "Sell", "size": 5}] * 28
+    ms = microstructure_signal(tr, [], [])
+    assert ms["taker_ratio_short"] == 1.0 and ms["taker_divergence"] is True, ms
+
+    # Basis compression: perp premium 0.5%→0.1% over 6 bars while price holds
+    perp_k = [{"ts": i, "close": 100.0} for i in range(8)]
+    spot_k = [{"ts": i, "close": 100.0 / (1 + (0.005 - i * 0.0006))} for i in range(8)]
+    mb = microstructure_signal([], perp_k, spot_k)
+    assert mb["basis_compressing"] is True and mb["basis_compression"] > 0, mb
     print("signals selftest OK")
 
 
