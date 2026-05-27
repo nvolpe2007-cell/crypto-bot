@@ -1861,11 +1861,24 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 s_hb = trader.get_account_summary()
                 wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
                 open_syms = ','.join(trader.account.positions.keys()) or 'none'
+                # Fold in the funding-arb arms (shared state) for running combined totals
+                _fa_hb = _fam_hb = 0.0
+                try:
+                    from .state import read_state as _rs_hb
+                    _st_hb = _rs_hb() or {}
+                    _fa_hb = float((_st_hb.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
+                    _fam_hb = float((_st_hb.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
+                except Exception:
+                    pass
+                _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb
+                _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
-                    f"open={open_syms} min_conf={_adapt['min_confidence']:.0f}"
+                    f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
+                    f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
+                    f"(arb maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
