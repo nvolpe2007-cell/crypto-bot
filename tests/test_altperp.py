@@ -312,6 +312,12 @@ def test_scenario_gate_behaviour():
     scenarios._selftest()  # raises AssertionError on any regression
 
 
+def test_all_weather_backtest_runs():
+    # trend rides a move to a chandelier stop; MR reverts to target — both net-positive
+    from src.altperp import backtest_all
+    backtest_all._selftest()  # raises AssertionError on any regression
+
+
 def test_circuit_breaker_daily_drawdown(tmp_path):
     pm, _ = _pm(tmp_path)
     pm.equity = 940.0  # -6% vs day_start 1000
