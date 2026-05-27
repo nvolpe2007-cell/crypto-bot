@@ -468,6 +468,16 @@ class TelegramNotifier:
     def send_error(self, error_message: str):
         return self.send_message(f"⚠️ <b>Bot Error</b>\n{error_message}")
 
+    async def send(self, msg: str) -> None:
+        """Async wrapper around send_message(), required by TaskSupervisor.
+
+        TaskSupervisor calls ``await notifier.send(msg)`` when a supervised
+        task crashes or gives up.  Without this method, _safe_notify() raises
+        AttributeError on every crash, which is silently swallowed at DEBUG
+        level, meaning crash alerts never reach Telegram.
+        """
+        self.send_message(msg)
+
     def test_connection(self) -> bool:
         return self.send_message(
             "✅ <b>Bot connected!</b>\n\n"

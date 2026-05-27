@@ -1086,15 +1086,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 sma20   = float(df['volume'].rolling(20).mean().iloc[-2])  # exclude current
                 if sma20 > 0 and cur_vol > sma20 * 10.0:
                     return f"WHALE_PRINT ({cur_vol/sma20:.1f}× SMA20)"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] whale-print check failed for {sym}: {e}")
         # Book imbalance — opposing side stacked → cascade/squeeze risk
         try:
             book_reason = ofi_calc.book_imbalance_blocks(sym, side)
             if book_reason:
                 return book_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] book-imbalance check failed for {sym}: {e}")
         # CVD divergence — price and order flow disagreeing
         try:
             tracker = strategy._cvd_trackers.get(sym) if strategy else None
@@ -1102,8 +1102,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 div_reason = tracker.divergence_blocks(side)
                 if div_reason:
                     return div_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] CVD-divergence check failed for {sym}: {e}")
         # Microprice unfair — paying a markup over depth-weighted fair value
         try:
             last_price = float(df['close'].iloc[-1]) if len(df) else 0.0
@@ -1111,15 +1111,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 mp_reason = ofi_calc.microprice_blocks(sym, side, last_price)
                 if mp_reason:
                     return mp_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] microprice check failed for {sym}: {e}")
         # Wick rejection — clustered rejections forming a ceiling (long) or floor (short)
         try:
             rej_reason = detect_rejection(df, side=side)
             if rej_reason:
                 return rej_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] wick-rejection check failed for {sym}: {e}")
         return None
 
     async def _seed_cache():
@@ -1350,8 +1350,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 best_ask = float(asks_raw[0][0])
                                 if best_ask > best_bid > 0:
                                     trader.live_spreads[symbol] = best_ask - best_bid
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"[OFI] spread parse failed for {symbol}: {e}")
                 except Exception as e:
                     logger.debug(f"[OFI] order book fetch failed for {symbol}: {e}")
 

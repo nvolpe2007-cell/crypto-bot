@@ -481,6 +481,55 @@ class TestEntryReasons:
         assert not any("funding" in r.lower() for r in reasons)
 
 
+# ── TelegramNotifier.send (async wrapper used by TaskSupervisor) ──────────────
+
+class TestSendAsync:
+    """TelegramNotifier.send() is the async interface consumed by TaskSupervisor.
+
+    Without it, _safe_notify() raises AttributeError on every task crash,
+    which is silently swallowed, and crash alerts never reach Telegram.
+    """
+
+    async def test_send_is_awaitable(self):
+        """send() must be an awaitable coroutine so TaskSupervisor can await it."""
+        notifier = _disabled()
+        import inspect
+        assert inspect.iscoroutinefunction(notifier.send), (
+            "TelegramNotifier.send must be an async method for TaskSupervisor compatibility"
+        )
+
+    async def test_send_delegates_to_send_message(self):
+        """send() should call send_message() with the same message."""
+        notifier = _enabled()
+        sent: list[str] = []
+
+        def _capture(url, json=None, timeout=None):
+            sent.append(json["text"])
+            r = MagicMock()
+            r.raise_for_status = MagicMock()
+            return r
+
+        with patch("requests.post", side_effect=_capture):
+            await notifier.send("supervisor alert")
+
+        assert sent == ["supervisor alert"]
+
+    async def test_send_disabled_does_not_make_http_request(self):
+        """Disabled notifier's send() should not make HTTP calls."""
+        notifier = _disabled()
+        with patch("requests.post") as mock_post:
+            await notifier.send("no-op")
+        mock_post.assert_not_called()
+
+    async def test_send_http_error_does_not_raise(self):
+        """send() must not propagate HTTP errors (TaskSupervisor wraps it in try/except
+        but we should be defensive here too via send_message's own error handling)."""
+        notifier = _enabled()
+        with patch("requests.post", side_effect=Exception("network down")):
+            # Should not raise — send_message swallows it, so send() does too.
+            await notifier.send("crash notification")
+
+
 # ── TelegramNotifier.send_message ─────────────────────────────────────────────
 
 class TestSendMessage:
