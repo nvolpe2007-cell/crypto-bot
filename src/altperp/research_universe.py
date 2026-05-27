@@ -104,6 +104,55 @@ def run(coins, closes, fund, start, end, q: float) -> Dict:
             "rebals": rebals, "U": len(coins), "k": k}
 
 
+MAKER_FEE = 0.0002   # ~0.02%/fill maker, no slippage (you provide liquidity).
+                     # ASSUMES maker orders fill at rebalance — optimistic; flagged.
+SMOOTH_BARS = 21     # ~3.5d trailing mean to de-noise the funding rank
+REBAL_BARS = 42      # weekly (7d × 6 bars/day) — vs every 2 bars (8h) in the naive run
+
+
+def _smoothed_funding(fund, coins, smooth_bars):
+    out = []
+    for i in range(len(fund)):
+        lo = max(0, i - smooth_bars + 1)
+        window = fund[lo:i + 1]
+        out.append({c: sum(w[c] for w in window) / len(window) for c in coins})
+    return out
+
+
+def run_harvest(coins, closes, fund, sm_fund, start, end, q, rebal_bars=REBAL_BARS,
+                fee=MAKER_FEE) -> Dict:
+    """Low-turnover harvest: rank on SMOOTHED funding, rebalance every `rebal_bars`,
+    maker fee. Funding still accrues every 8h on the held basket."""
+    U = len(coins)
+    k = max(1, int(q * U))
+    w = {c: 0.0 for c in coins}
+    pnl_funding = pnl_price = costs = 0.0
+    rebals = 0
+    for i in range(start, end - 1):
+        if (i - start) % rebal_bars == 0:
+            ranked = sorted(coins, key=lambda c: sm_fund[i][c])
+            longs, shorts = ranked[:k], ranked[-k:]
+            target = {c: 0.0 for c in coins}
+            for c in longs:
+                target[c] = GROSS_PER_SIDE / k
+            for c in shorts:
+                target[c] = -GROSS_PER_SIDE / k
+            turn = sum(abs(target[c] - w[c]) for c in coins)
+            if turn > 0:
+                costs += turn * fee
+                rebals += 1
+            w = target
+        if i % 2 == 0:
+            pnl_funding += sum(-fund[i][c] * w[c] for c in coins)
+        for c in coins:
+            if w[c]:
+                pnl_price += w[c] * (closes[i + 1][c] / closes[i][c] - 1)
+    costs += sum(abs(w[c]) for c in coins) * fee
+    net = pnl_funding + pnl_price - costs
+    return {"net": net, "funding": pnl_funding, "price": pnl_price, "costs": costs,
+            "rebals": rebals, "U": len(coins), "k": k}
+
+
 def _fmt(r):
     return (f"net=${r['net']:+9.2f}  [funding ${r['funding']:+8.2f} + "
             f"price ${r['price']:+9.2f} - costs ${r['costs']:7.2f}]  "
@@ -123,13 +172,23 @@ def _backtest():
     for q in (0.10, 0.20, 0.33):
         print(f"  q={q:.2f}: {_fmt(run(coins, closes, fund, 0, n, q))}")
 
-    print("\nQuantile picked on IN-SAMPLE, judged OUT-OF-SAMPLE:")
-    isr = [(q, run(coins, closes, fund, 0, half, q)) for q in (0.10, 0.20, 0.33)]
+    sm = _smoothed_funding(fund, coins, SMOOTH_BARS)
+    print(f"\nHARVEST FIX (smoothed {SMOOTH_BARS}-bar rank + weekly rebalance + maker "
+          f"{MAKER_FEE*100:.2f}%), FULL window:")
+    for q in (0.10, 0.20, 0.33):
+        print(f"  q={q:.2f}: {_fmt(run_harvest(coins, closes, fund, sm, 0, n, q))}")
+
+    print("\nHARVEST — quantile picked IN-SAMPLE, judged OUT-OF-SAMPLE:")
+    isr = [(q, run_harvest(coins, closes, fund, sm, 0, half, q)) for q in (0.10, 0.20, 0.33)]
     isr.sort(key=lambda x: x[1]["net"], reverse=True)
     bestq = isr[0][0]
     for q, r in isr:
         print(f"  in-sample q={q:.2f}: {_fmt(r)}")
-    print(f"  OOS verdict @ best-IS q={bestq:.2f}: {_fmt(run(coins, closes, fund, half, n, bestq))}")
+    oos = run_harvest(coins, closes, fund, sm, half, n, bestq)
+    print(f"  OOS verdict @ best-IS q={bestq:.2f}: {_fmt(oos)}")
+    print("\nNOTE: maker fills are ASSUMED at rebalance (optimistic). 'funding' is the")
+    print("      mechanical carry; if net>0 and it's funding-driven (not the price term),")
+    print("      that's a market-neutral edge worth a forward paper test.")
 
 
 def main():
