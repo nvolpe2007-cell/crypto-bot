@@ -181,19 +181,19 @@ class TestGetBalance:
         trader.exchange.get_balance = AsyncMock(
             return_value={"USD": {"free": 427.50}}
         )
-        result = asyncio.get_event_loop().run_until_complete(trader.get_balance())
+        result = asyncio.run(trader.get_balance())
         assert result == pytest.approx(427.50)
 
     def test_returns_zero_on_exception(self):
         trader = _make_trader()
         trader.exchange.get_balance = AsyncMock(side_effect=RuntimeError("timeout"))
-        result = asyncio.get_event_loop().run_until_complete(trader.get_balance())
+        result = asyncio.run(trader.get_balance())
         assert result == 0.0
 
     def test_returns_zero_when_usd_missing(self):
         trader = _make_trader()
         trader.exchange.get_balance = AsyncMock(return_value={"BTC": {"free": 1.0}})
-        result = asyncio.get_event_loop().run_until_complete(trader.get_balance())
+        result = asyncio.run(trader.get_balance())
         assert result == 0.0
 
 
@@ -205,7 +205,7 @@ class TestReconcilePositions:
         trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
             {"symbol": "BTC/USD", "contracts": 0.001, "entryPrice": 50_000.0}
         ])
-        asyncio.get_event_loop().run_until_complete(trader.reconcile_positions())
+        asyncio.run(trader.reconcile_positions())
         assert "BTC/USD" in trader.positions
         pos = trader.positions["BTC/USD"]
         assert pos.entry_price == 50_000.0
@@ -216,7 +216,7 @@ class TestReconcilePositions:
         trader = _make_trader()
         trader.positions["ETH/USD"] = _open_position("ETH/USD")
         trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[])
-        asyncio.get_event_loop().run_until_complete(trader.reconcile_positions())
+        asyncio.run(trader.reconcile_positions())
         assert "ETH/USD" not in trader.positions
 
     def test_handles_fetch_exception_gracefully(self):
@@ -224,7 +224,7 @@ class TestReconcilePositions:
         trader.exchange.exchange.fetch_positions = AsyncMock(
             side_effect=RuntimeError("network error")
         )
-        asyncio.get_event_loop().run_until_complete(trader.reconcile_positions())
+        asyncio.run(trader.reconcile_positions())
         assert trader.positions == {}
 
     def test_ignores_zero_size_positions(self):
@@ -232,7 +232,7 @@ class TestReconcilePositions:
         trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
             {"symbol": "BTC/USD", "contracts": 0, "entryPrice": 50_000.0}
         ])
-        asyncio.get_event_loop().run_until_complete(trader.reconcile_positions())
+        asyncio.run(trader.reconcile_positions())
         assert "BTC/USD" not in trader.positions
 
     def test_ignores_unknown_symbol(self):
@@ -240,7 +240,7 @@ class TestReconcilePositions:
         trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
             {"symbol": "DOGE/USD", "contracts": 1000.0, "entryPrice": 0.15}
         ])
-        asyncio.get_event_loop().run_until_complete(trader.reconcile_positions())
+        asyncio.run(trader.reconcile_positions())
         assert "DOGE/USD" not in trader.positions
 
 
@@ -248,7 +248,7 @@ class TestReconcilePositions:
 
 class TestOpenLong:
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def test_successful_fill_records_position(self):
         trader = _make_trader()
@@ -345,7 +345,7 @@ class TestOpenLong:
 
 class TestCloseLong:
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
     def _setup_position(self, trader, symbol="BTC/USD",
                         entry_price=50_000.0, size=0.001, size_usd=50.0):
