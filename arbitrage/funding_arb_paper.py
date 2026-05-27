@@ -78,11 +78,25 @@ MAX_POSITION_USD   = float(os.getenv('FUNDING_ARB_MAX_SIZE', '1000'))
 MAX_TOTAL_NOTIONAL = float(os.getenv('FUNDING_ARB_MAX_TOTAL', '3000'))
 
 
-# Liquid majors for the conservative "honest" arm — names with deep spot+perp
-# markets where a positive-funding cash-and-carry is genuinely retail-executable.
-MAJOR_SYMBOLS = {
+# Liquid majors/mid-caps for the conservative "honest" arm — names with deep
+# spot+perp markets where a positive-funding cash-and-carry is genuinely retail-
+# executable. Widened from the original 10 majors to ~30 (research: the arm was
+# idle because positive-funding among only 10 majors rarely cleared the cost gate;
+# more liquid names = more chances WITHOUT relaxing any clean constraint — it's
+# still positive-funding-only, maker cost, and the per-coin delta-neutral structure
+# that has no price risk). The newer mid-caps have slightly shallower spot than the
+# top majors, so "believable" is marginally softer for those — an intended trade.
+# Override with FUNDING_ARB_MAJORS="BTC,ETH,..." (comma-separated base symbols).
+_DEFAULT_MAJORS = {
+    # original liquid majors
     'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ADA', 'AVAX', 'LINK', 'LTC',
+    # widened: established large/mid-caps with deep spot + perp on major venues
+    'DOT', 'TRX', 'BCH', 'NEAR', 'ATOM', 'UNI', 'APT', 'ARB', 'OP', 'FIL',
+    'ICP', 'INJ', 'SUI', 'AAVE', 'ETC', 'HBAR', 'XLM', 'RENDER', 'TIA', 'SEI',
 }
+_env_majors = os.getenv('FUNDING_ARB_MAJORS', '').strip()
+MAJOR_SYMBOLS = ({s.strip().upper() for s in _env_majors.split(',') if s.strip()}
+                 if _env_majors else _DEFAULT_MAJORS)
 
 
 def _base_symbol(symbol: str) -> str:
