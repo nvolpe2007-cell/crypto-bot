@@ -1130,6 +1130,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 if ohlcv:
                     ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                     logger.info(f"[CACHE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+                    # Compute initial regime so trades evaluated before the first WS
+                    # candle event don't all get logged as regime=UNKNOWN.
+                    result = regime_detector.detect(ohlcv_cache[sym])
+                    if result:
+                        regime_cache[sym] = result.to_dict()
+                        logger.info(f"[REGIME] {sym} seeded: {result.regime} "
+                                    f"conf={result.confidence:.2f} adx={result.adx:.1f}")
+                    else:
+                        logger.warning(f"[REGIME] {sym} seed detect() returned None "
+                                       f"(bars={len(ohlcv_cache[sym])}); regime will be UNKNOWN "
+                                       f"until a WS candle arrives")
             except CircuitBreakerOpen as e:
                 wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                 logger.error(f"[CACHE] Exchange circuit breaker open during seed — stopping early ({wait:.0f}s remaining): {e}")
@@ -1224,12 +1235,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     except Exception as e:
                         logger.debug(f"[CACHE] refresh failed for {sym}: {e}")
             except asyncio.TimeoutError:
-                # Fallback: refresh all
+                # Fallback: refresh all (no WS candles seen in 90s — WS may be silent).
+                # Refresh regime here too so the cache doesn't go permanently stale /
+                # empty when the WS event path isn't delivering candles.
                 for sym in symbols:
                     try:
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                            result = regime_detector.detect(ohlcv_cache[sym])
+                            if result:
+                                regime_cache[sym] = result.to_dict()
                     except CircuitBreakerOpen as e:
                         wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                         logger.warning(f"[CACHE] Circuit open (fallback path) — sleeping {wait:.0f}s")
