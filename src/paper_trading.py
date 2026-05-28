@@ -1896,24 +1896,28 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 s_hb = trader.get_account_summary()
                 wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
                 open_syms = ','.join(trader.account.positions.keys()) or 'none'
-                # Fold in the funding-arb arms (shared state) for running combined totals
-                _fa_hb = _fam_hb = 0.0
+                # Fold in the funding-arb arms (shared state) for running combined totals.
+                # Three arms now: aggressive (Binance/Bybit, fantasy baseline),
+                # majors (Binance/Bybit majors-only, also fantasy), kraken (the only
+                # arm whose +$X represents actually-capturable edge).
+                _fa_hb = _fam_hb = _fak_hb = 0.0
                 try:
                     from .state import read_state as _rs_hb
                     _st_hb = _rs_hb() or {}
-                    _fa_hb = float((_st_hb.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
+                    _fa_hb  = float((_st_hb.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
                     _fam_hb = float((_st_hb.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
+                    _fak_hb = float((_st_hb.get('funding_arb_kraken') or {}).get('total_pnl', 0.0) or 0.0)
                 except Exception:
                     pass
-                _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb
-                _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb
+                _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
+                _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
-                    f"(arb maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
+                    f"(arb kraken={_fak_hb:+.2f} maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
@@ -1930,17 +1934,18 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     s_rep = trader.get_account_summary()
                     wr_rep = (s_rep['winning_trades'] / s_rep['closed_trades'] * 100) \
                         if s_rep['closed_trades'] else 0.0
-                    fa_pnl = fam_pnl = 0.0
+                    fa_pnl = fam_pnl = fak_pnl = 0.0
                     try:
                         from .state import read_state as _rs
                         _st = _rs() or {}
-                        fa_pnl = float((_st.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
+                        fa_pnl  = float((_st.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
                         fam_pnl = float((_st.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
+                        fak_pnl = float((_st.get('funding_arb_kraken') or {}).get('total_pnl', 0.0) or 0.0)
                     except Exception:
                         pass
                     dir_pnl, dir_eq = s_rep['total_pnl'], s_rep['total_equity']
-                    combined = dir_pnl + fa_pnl + fam_pnl
-                    total_money = dir_eq + fa_pnl + fam_pnl
+                    combined = dir_pnl + fa_pnl + fam_pnl + fak_pnl
+                    total_money = dir_eq + fa_pnl + fam_pnl + fak_pnl
                     open_syms = ', '.join(trader.account.positions.keys()) or 'none'
                     mark = '🟢' if combined >= 0 else '🔴'
                     verb = 'up' if combined >= 0 else 'down'
@@ -1951,13 +1956,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         f"• Directional book: ${dir_eq:,.2f} equity "
                         f"(P&amp;L ${dir_pnl:+,.2f} / {s_rep['pnl_pct']:+.2f}%, "
                         f"{s_rep['closed_trades']} trades, {wr_rep:.0f}% WR)\n"
-                        f"• Funding Arb (majors): ${fam_pnl:+,.2f}\n"
-                        f"• Funding Arb (aggressive): ${fa_pnl:+,.2f}\n"
+                        f"• Funding Arb (Kraken, executable): ${fak_pnl:+,.2f}\n"
+                        f"• Funding Arb (majors, baseline): ${fam_pnl:+,.2f}\n"
+                        f"• Funding Arb (aggressive, baseline): ${fa_pnl:+,.2f}\n"
                         f"• Open positions: {open_syms}"
                     )
                     logger.info(f"[ACCOUNT REPORT] sent — total=${total_money:.2f} "
                                 f"netPnL=${combined:+.2f} (dir={dir_pnl:+.2f} "
-                                f"majors={fam_pnl:+.2f} aggr={fa_pnl:+.2f})")
+                                f"kraken={fak_pnl:+.2f} majors={fam_pnl:+.2f} aggr={fa_pnl:+.2f})")
                 except Exception as e:
                     logger.warning(f"[ACCOUNT REPORT] failed: {e}")
 

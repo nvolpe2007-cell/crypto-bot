@@ -72,9 +72,13 @@ class FundingScanner:
             except Exception as e:
                 logger.debug(f"Scan batch error: {e}")
 
-        # Sort by APY descending, keep top 20
+        # Sort by abs(APY) descending. Cap at 50 (was 20) so positive-funding
+        # opportunities aren't crowded off by high-|APY| negative-funding spikes
+        # — the source-restricted Kraken arm needs visibility into modest-APY
+        # positive-funding Kraken setups even when negative-funding mid-cap alts
+        # dominate the top of the ranking.
         results.sort(key=lambda x: abs(x.apy), reverse=True)
-        self.opportunities = results[:20]
+        self.opportunities = results[:50]
 
         # Funding alerts disabled — data still written to state for strategy use
 

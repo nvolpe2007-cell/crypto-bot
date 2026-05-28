@@ -56,11 +56,20 @@ ROLLUP_INTERVAL_SECONDS = float(os.getenv('FUNDING_ARB_ROLLUP_HOURS', '1.0')) * 
 
 # ── Cost model ───────────────────────────────────────────────────────────────
 # Cash-and-carry is FOUR taker fills round-trip: open(spot)+open(perp) and
-# close(spot)+close(perp). On Binance/Bybit, perp taker ≈0.04% + spot taker
-# ≈0.10% → ~0.28% of one leg's notional round-trip, before slippage. Ignoring
-# this is exactly the cost-blind mistake that produced the bot's old ~1% win
-# rate (see strategy_cost_expectancy_fix). We deduct it ONCE at entry and report
-# PnL net of it. Env-tunable; default leans conservative (taker, not maker).
+# close(spot)+close(perp). Ignoring this is exactly the cost-blind mistake that
+# produced the bot's old ~1% win rate (see strategy_cost_expectancy_fix). We
+# deduct it ONCE at entry and report PnL net of it.
+#
+# Per-arm reality (set via cost_frac=… or FUNDING_ARB_*_COST_FRAC env vars):
+#   • Aggressive arm (Binance/Bybit, RESEARCH BASELINE — rates not capturable
+#     for this account): 0.22% default. Reflects Binance/Bybit retail taker
+#     fees, which is the wrong basis for live execution. Kept as-is so the
+#     comparison ledger doesn't shift; treat the +$X figure as fantasy.
+#   • Majors arm (same source, SAME CAVEAT): 0.08% default. Honest-maker-cost
+#     on Binance/Bybit, but again rates aren't capturable here.
+#   • Kraken arm (the only ACTUALLY capturable arm): 0.64% default
+#     (FUNDING_ARB_KRAKEN_COST_FRAC). Honest Kraken retail: maker spot 0.25%
+#     ×2 + maker perp 0.02% ×2 + ~0.10% slippage. This is the one to trust.
 ROUND_TRIP_COST_FRAC = float(os.getenv('FUNDING_ARB_COST_FRAC', '0.0022'))  # 0.22%
 # Don't open unless funding at the entry rate clears round-trip cost within this
 # many 8h cycles — i.e. the position is expected to be net-positive well inside

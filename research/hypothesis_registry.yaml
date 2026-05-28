@@ -1,0 +1,281 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Hypothesis Registry — every strategy idea, its evidence, and its gate.
+#
+# Convention (from CLAUDE.md): costs dominate at this size; never loosen a gate
+# to force trades. Each entry must record what was actually MEASURED, not just
+# what was hoped — and the deployment gate is what the OOS evidence says, not
+# what the IS evidence says.
+#
+# Statuses:
+#   sit-out      — measured, no edge found; do not deploy capital
+#   paper-only   — running paper, collecting forward-walk data; do not flip live
+#   live-tiny    — live with hard caps, monitoring like a research instrument
+#   live         — proven OOS, deployed at size
+#   killed       — measured edge decayed / disproven; archived
+#
+# Schema: see schema.yaml. Add new entries at the bottom; never edit the
+# `evidence` block of an existing entry — append a follow-up entry instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+hypotheses:
+
+  - id: altperp-fade-short
+    name: Short-bias funding/OI fade on alt perps
+    family: altperp
+    hypothesis: >
+      When alt-perp funding goes extreme positive while OI spikes, the
+      leveraged-long crowd is overextended and a mean-reversion fade short
+      yields positive risk-adjusted returns (BIS "Crypto carry" 2024).
+    code: src/altperp/  (signals.py + confluence.py + exits.py)
+    backtest: src/altperp/backtest.py
+    evidence:
+      - date: 2026-05-26
+        script: src/altperp/backtest.py
+        window: 66-day SOL/AVAX/ARB
+        result: 0 trades — funding never reached 0.05% (calm tape)
+      - date: 2026-05-26
+        script: src/altperp/research_fade.py
+        window: Nov-2023 → Mar-2024 (alt euphoria)
+        result: >
+          SOL +$9.19 (PF 1.13, 53% win, n=15), AVAX -$11.15 (PF 0.90),
+          ARB -$40.89 (PF 0.74). Combined -$42.85. Even in froth, no robust
+          edge; SOL's marginal-positive is within noise.
+    deployment_gate:
+      requires: OOS Sharpe ≥ 1.0 on a fresh froth window (forward-walked, not
+        re-tested on Nov-2023)
+      blocked_by: no live froth has occurred since the strategy went live
+    status: paper-only
+    notes: |
+      Live in paper since altperp wiring (2026-05-27). AI gate-keeper layer
+      built but currently disabled (no ANTHROPIC_API_KEY on VPS).
+
+  - id: altperp-flush-long
+    name: Post-liquidation flush LONG on alt perps
+    family: altperp
+    hypothesis: >
+      A sudden OI flush (-20%+) on an alt perp marks a forced-liquidation
+      bottom; entering long catches the snap-back.
+    code: src/altperp/signals.py (OI_FLUSH_THRESHOLD)
+    evidence:
+      - date: 2026-05-26
+        result: unmeasurable historically — needs paid CoinGlass liq-heatmap
+          data to reconstruct; CVD also not in free trade archives
+    deployment_gate:
+      requires: forward-walk data from paper deployment (collecting now)
+      blocked_by: no historical evidence; depends on rare crash events
+    status: paper-only
+
+  - id: altperp-trend-donchian
+    name: Donchian breakout + ATR chandelier trend-following
+    family: altperp
+    hypothesis: >
+      Crypto's most durable directional edge is trend-following; a 20-bar
+      Donchian breakout entry with a 3×ATR chandelier trail captures regime
+      shifts while controlling whipsaw.
+    code: src/altperp/trend.py
+    backtest: src/altperp/backtest_all.py
+    evidence:
+      - date: 2026-05-26
+        window: 166d / 996 4h-bars SOL+AVAX+ARB (real VPS data)
+        result: >
+          SOL -6.6%, AVAX -5.8%, ARB +1.5%. 20-24% win rate, PF~0.4 = whipsaw;
+          all exits = stops.
+      - date: 2026-05-26
+        script: src/altperp/research_trend.py
+        method: walk-forward, 50/50 IS/OOS, parameter grid on IS only
+        result: >
+          IS-best (N=40, M=5, minATR=0.02) → IS +$15 but OOS -$39 (baseline OOS
+          -$79). Less-bad ≠ edge. Selectivity monotonically cuts losses →
+          optimal directional exposure ≈ 0.
+    deployment_gate:
+      requires: positive OOS PF on a different tape regime (none yet found)
+    status: sit-out
+    notes: |
+      Conclusion: this is NOT a tuning problem; the whipsaw is structural on
+      this data slice. Walk-forward verdict was clear.
+
+  - id: altperp-mean-reversion-bollinger
+    name: Bollinger z-score mean-reversion on alts
+    family: altperp
+    hypothesis: >
+      In RANGING regimes, ±2σ Bollinger extremes mean-revert.
+    code: src/altperp/mean_reversion.py
+    backtest: src/altperp/backtest_all.py
+    evidence:
+      - date: 2026-05-26
+        window: 166d SOL/AVAX/ARB
+        result: roughly breakeven (±0.5%/coin) — no significant edge after costs
+    deployment_gate:
+      requires: net-positive OOS PF
+    status: sit-out
+
+  - id: funding-arb-aggressive
+    name: Cash-and-carry funding arb — aggressive (Binance/Bybit, both sides)
+    family: funding-arb
+    hypothesis: >
+      Take any funding-extreme delta-neutral cash-and-carry that clears
+      modeled round-trip cost; collect funding while flat-delta.
+    code: arbitrage/funding_arb_paper.py (default arm)
+    evidence:
+      - date: 2026-05-25
+        result: +$2.85 cum over ~30 days at 0.22% modeled cost
+      - date: 2026-05-28
+        script: this session's audit
+        result: >
+          Rates pulled from Binance/Bybit which are GEO-BLOCKED for this
+          account. Opportunity is structurally non-capturable. Cost model
+          (0.22%) is calibrated to Binance/Bybit retail, also wrong for the
+          actual execution venue (Kraken). Reported +$2.85 is overstated by
+          3-10× when honest Kraken costs are applied.
+    deployment_gate:
+      requires: would need to actually be tradeable to deploy
+    status: paper-only
+    notes: |
+      Kept running as research/comparison baseline. Treat its +$X as fantasy
+      ledger; the kraken arm replaces it for any real-edge claim.
+
+  - id: funding-arb-majors-honest
+    name: Cash-and-carry funding arb — majors-only honest (Binance/Bybit majors)
+    family: funding-arb
+    hypothesis: >
+      Restricting to positive-funding liquid majors with maker-fee costs
+      surfaces only genuinely retail-executable opportunities — the arm
+      being idle = honest "no edge" signal.
+    code: arbitrage/funding_arb_paper.py (majors arm; widened 10→30 majors)
+    evidence:
+      - date: 2026-05-25
+        result: idle most of the time; +$0.00 cum
+      - date: 2026-05-28
+        result: same audit problem as aggressive arm — rates source is
+          Binance/Bybit, not executable from here.
+    deployment_gate:
+      requires: kraken-arm equivalent shows positive OOS edge
+    status: paper-only
+    notes: Research baseline, kept for comparison ledger.
+
+  - id: funding-arb-kraken
+    name: Cash-and-carry funding arb — Kraken-only honest (THE executable arm)
+    family: funding-arb
+    hypothesis: >
+      The only actually-capturable funding-arb opportunity for a US-geo-blocked
+      account is on Kraken Futures + Kraken spot. With honest Kraken retail
+      costs (0.64% round-trip: maker spot 0.25%×2 + maker perp 0.02%×2 + ~0.10%
+      slippage), positive funding on Kraken Futures clearing the cost floor
+      represents real edge.
+    code: arbitrage/funding_arb_paper.py + arbitrage/funding_scanner.py:_scan_kraken
+    evidence:
+      - date: 2026-05-28
+        script: this session
+        result: >
+          Wired live. APY floor ~70% given honest cost. Initial live probe:
+          BTC/ETH funding <10% APY (calm); SOL -17.9% (wrong side for
+          positive-only arm); top alts negative-funding 300-850% range.
+          Zero qualifying setups at launch — honest "no edge" signal.
+    deployment_gate:
+      requires: net-positive cum P&L over ≥30 days with ≥5 closed trades
+        on this arm specifically
+    status: paper-only
+    notes: |
+      This is the funding-arb edge to actually measure. If it stays idle
+      for months, the conclusion is the same as the rest of the directional
+      book: no edge in current tape, costs dominate.
+
+  - id: xs-funding-rv-3coin
+    name: Cross-sectional funding RV — short richest, long cheapest (3 coins)
+    family: market-neutral
+    hypothesis: >
+      Dollar-neutral pair: short the highest-funding coin, long the lowest;
+      harvest funding dispersion + relative reversion.
+    code: src/altperp/research_xsfunding.py
+    evidence:
+      - date: 2026-05-26
+        window: 166d cached SOL/AVAX/ARB
+        result: >
+          Funding capture only $7-24/166d; costs $100-624 at every dispersion
+          floor — costs dominate by 10×+. Only non-loser ($0.61) came from a
+          lucky +$93 reversion bet, not the carry. IS/OOS uninformative
+          (first half had ~0 dispersion).
+    deployment_gate:
+      requires: wider universe (this is a known structural fix)
+    status: killed
+    notes: 3-coin universe is fundamentally too narrow for cross-sectional carry.
+
+  - id: xs-funding-rv-wide-universe
+    name: Cross-sectional funding RV — wide universe (top-40 Bybit perps)
+    family: market-neutral
+    hypothesis: >
+      Same as xs-funding-rv-3coin but with 34 coins post-filter — wider
+      universe → harvestable dispersion.
+    code: src/altperp/research_universe.py
+    evidence:
+      - date: 2026-05-26
+        window: 166d, 34 coins post-filter
+        result: >
+          Funding capture +$114-264/166d (10× the 3-coin version, confirming
+          the dispersion thesis). BUT net -$940 to -$1856: costs $976-1191
+          (498 rebalances) swamp capture, and the price/reversion term was
+          negative (shorting high-funding coins did NOT outperform).
+      - date: 2026-05-26
+        script: harvest-fix (smoothed 21-bar rank + weekly rebalance + maker)
+        result: >
+          Costs $976 → $9 (~100× reduction). Cost fix WORKED. But revealed
+          new killer: with costs gone, P&L dominated by price/reversion term
+          which is unstable — IS +$200-309 (price +$300), OOS -$278 (price
+          -$309). Cross-sectional long-short is NOT truly market-neutral;
+          shorting hot coins = momentum risk that swamps carry.
+    deployment_gate:
+      requires: stable OOS price-term (none found — likely fundamentally negative)
+    status: killed
+    notes: |
+      Key insight: the pure funding carry is real but TINY (~$48-105/166d ≈
+      1.5-3%/yr optimistic-maker). The clean way to harvest funding without
+      price risk is PER-COIN delta-neutral cash-and-carry = the funding-arb
+      strategy. Cross-sectional adds relative-price risk and erodes any carry.
+
+  - id: scalper-microstructure-ofi-v2
+    name: OFI v2 + CVD + lead-lag confluence directional scalper
+    family: directional
+    hypothesis: >
+      Tick-level order-flow imbalance + cumulative volume delta + cross-asset
+      lead-lag, requiring confluence across all three, finds high-conviction
+      directional setups.
+    code: src/microstructure_strategy.py
+    evidence:
+      - date: 2026-04-29
+        result: >
+          228 trades on prior gate config: 0.9% win rate, -$20.14 net, 73.6%
+          fee drag. Pre-fix corpse — costs dominated tiny scalp targets.
+      - date: 2026-05-22 onwards
+        result: >
+          Strategy gates now reject the trades it used to take (atr_alive +
+          ProbabilityGate + cost-expectancy fix). Zero trades since fix
+          deployed; the bot is correctly idle in current low-vol tape.
+    deployment_gate:
+      requires: positive OOS edge from non-loosened gates on fresh data
+    status: paper-only
+    notes: |
+      Gate needs tick-level WS data but gets 2s REST snapshots, so it ~never
+      fires — by design until WS pipeline is fully wired.
+
+  - id: regime-conditional-sizing
+    name: Regime-aware position sizing
+    family: infrastructure
+    hypothesis: >
+      Trade only in regimes where each strategy has measurable edge; shrink
+      or sit out elsewhere.
+    code: src/regime_detector.py + src/altperp/regime.py
+    evidence:
+      - date: 2026-05-28
+        result: >
+          Regime detector was silently broken (regime cache never populated
+          → 228/228 trades logged regime=UNKNOWN). Fixed this session: seed
+          + timeout-fallback paths now both call detect() and populate the
+          cache. Verified live: BTC/ETH/SOL all classify RANGING with low
+          confidence in current tape.
+    deployment_gate:
+      requires: a working regime classifier (now achieved) + per-regime PF
+        measurements on each strategy (open)
+    status: infrastructure
+    notes: |
+      Not a strategy per se — an enabling layer. Now correct; future
+      strategies can condition on regime honestly.
