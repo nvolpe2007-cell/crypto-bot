@@ -803,6 +803,23 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 label="Funding Arb (majors)",
             )
 
+            # Arm 3 — Kraken-only honest: opportunities sourced from Kraken Futures
+            # ONLY (the only venue an account this side of the geo-block can
+            # actually trade), positive-funding-only (no spot-borrow risk), and
+            # cost calibrated to Kraken retail (~0.64% round-trip: maker spot
+            # 0.25% + maker perp 0.02% per side × 2 sides + ~0.10% slippage).
+            # This is the ONLY arm whose +$X figure represents capturable edge —
+            # the other two arms remain as Binance/Bybit research baselines.
+            _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0064'))
+            _funding_arb_kraken = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=True,
+                source_allowlist={'Kraken Futures'},
+                cost_frac=_kraken_cost,
+                state_file=_Path('data/funding_arb_kraken_state.json'),
+                label="Funding Arb (Kraken)",
+            )
+
             async def _merge_funding_state():
                 while True:
                     await asyncio.sleep(65)
@@ -811,6 +828,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         st['funding_opportunities'] = _funding_scanner.get_state()
                         st['funding_arb'] = _funding_arb_sim.get_summary()
                         st['funding_arb_majors'] = _funding_arb_majors.get_summary()
+                        st['funding_arb_kraken'] = _funding_arb_kraken.get_summary()
                         _write_state(st)
                     except Exception as _exc:
                         logger.warning(f"[FUNDING] state merge failed: {_exc}")
@@ -819,10 +837,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 asyncio.create_task(_funding_scanner.start()),
                 asyncio.create_task(_funding_arb_sim.start()),
                 asyncio.create_task(_funding_arb_majors.start()),
+                asyncio.create_task(_funding_arb_kraken.start()),
                 asyncio.create_task(_merge_funding_state()),
             ]
-            logger.info("[FUNDING] scanner + 2 delta-neutral arb arms "
-                        "(aggressive + majors-honest) started")
+            logger.info("[FUNDING] scanner + 3 delta-neutral arb arms "
+                        "(aggressive + majors-honest + kraken-executable) started")
         except Exception as _exc:
             logger.warning(f"[FUNDING] disabled ({_exc})")
 

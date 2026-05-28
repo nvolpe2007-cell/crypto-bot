@@ -1,7 +1,14 @@
 """
 Funding Rate Arbitrage Scanner
-Scans Bybit and Binance every minute for high funding rates.
+Scans Binance, Bybit, AND Kraken Futures every minute for high funding rates.
 Writes opportunities to state.json and sends Telegram alerts.
+
+Note: Binance/Bybit rates are 8-hourly; Kraken Futures funding is hourly. Kraken
+opportunities are normalised to an "8h-equivalent" rate at scan time so the
+downstream cash-and-carry sim can treat all sources uniformly.
+
+For a US-restricted account, Kraken Futures is the only one actually executable
+— Binance/Bybit serve as research baselines for comparison.
 """
 
 import asyncio
@@ -57,7 +64,7 @@ class FundingScanner:
 
     async def _scan(self):
         results = []
-        tasks = [self._scan_binance(), self._scan_bybit()]
+        tasks = [self._scan_binance(), self._scan_bybit(), self._scan_kraken()]
         for coro in asyncio.as_completed(tasks):
             try:
                 batch = await coro
@@ -144,6 +151,67 @@ class FundingScanner:
                 ))
         except Exception as e:
             logger.debug(f"Bybit funding error: {e}")
+        return results
+
+    async def _scan_kraken(self) -> List[FundingOpportunity]:
+        """Kraken Futures multi-collateral perps (PF_*).
+
+        Funding is settled hourly on Kraken Futures, not 8-hourly. The ticker's
+        `fundingRate` field is the absolute USD-per-contract-per-hour amount
+        (NOT a fractional rate). To get a percentage the same way Binance/Bybit
+        report it, we divide by `markPrice` — that yields `relativeFundingRate`
+        per the historical-rates endpoint. We then expose an 8h-equivalent rate
+        so the downstream sim, which assumes FUNDING_CYCLE_HOURS=8, computes
+        the correct dollar accrual via linear summation across 8 hourly fundings.
+        """
+        results = []
+        try:
+            async with self.session.get(
+                "https://futures.kraken.com/derivatives/api/v3/tickers",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    return results
+                data = await resp.json()
+
+            for t in data.get("tickers", []):
+                symbol = t.get("symbol", "")
+                # Multi-collateral perps only (PF_*USD). PI_/FI_ are inverse/dated.
+                if not symbol.startswith("PF_"):
+                    continue
+                if t.get("suspended"):
+                    continue
+                try:
+                    funding_usd_per_hour = float(t.get("fundingRate", 0))
+                    mark = float(t.get("markPrice", 0))
+                except (TypeError, ValueError):
+                    continue
+                if funding_usd_per_hour == 0 or mark <= 0:
+                    continue
+                # Convert absolute USD-per-contract-per-hour → fractional rate/hr.
+                rate_per_hour_frac = funding_usd_per_hour / mark
+                # Plausibility guard: anything above ~50%/yr per hour (5.7e-5) is
+                # almost certainly a stale/illiquid micro-cap data glitch — skip.
+                if abs(rate_per_hour_frac) > 0.001:   # >0.1%/hr = >876% APY
+                    continue
+                apy = rate_per_hour_frac * 24 * 365 * 100
+                if abs(apy) < MIN_SHOW_APY:
+                    continue
+                # 8h-equivalent fractional rate, then ×100 for percent (storage
+                # convention matches _scan_binance / _scan_bybit above).
+                rate_8h_pct = rate_per_hour_frac * 8 * 100
+                action = ("SHORT PERP + LONG SPOT" if rate_per_hour_frac > 0
+                          else "LONG PERP + SHORT SPOT")
+                results.append(FundingOpportunity(
+                    exchange="Kraken Futures",
+                    symbol=symbol,
+                    rate_8h=round(rate_8h_pct, 4),
+                    apy=round(apy, 2),
+                    action=action,
+                    timestamp=datetime.now(timezone.utc).isoformat()
+                ))
+        except Exception as e:
+            logger.debug(f"Kraken funding error: {e}")
         return results
 
     async def _send_alert(self, opp: FundingOpportunity):

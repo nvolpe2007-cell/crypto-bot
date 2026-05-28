@@ -100,9 +100,15 @@ MAJOR_SYMBOLS = ({s.strip().upper() for s in _env_majors.split(',') if s.strip()
 
 
 def _base_symbol(symbol: str) -> str:
-    """Strip the quote suffix from an exchange symbol → base asset.
-    'BTCUSDT' → 'BTC', 'ETHUSD' → 'ETH'."""
+    """Strip exchange prefix + quote suffix → base asset.
+
+    'BTCUSDT' → 'BTC' (Binance/Bybit)
+    'ETHUSD'  → 'ETH'
+    'PF_SOLUSD' → 'SOL' (Kraken Futures multi-collateral perp prefix)
+    """
     s = symbol.upper()
+    if s.startswith('PF_'):       # Kraken Futures multi-collateral perp
+        s = s[3:]
     for quote in ('USDT', 'USDC', 'USD'):
         if s.endswith(quote):
             return s[: -len(quote)]
@@ -150,6 +156,7 @@ class FundingArbPaperSim:
         cost_frac: float = ROUND_TRIP_COST_FRAC,
         positive_funding_only: bool = False,
         symbol_allowlist: Optional[set] = None,
+        source_allowlist: Optional[set] = None,
         state_file: Optional[Path] = None,
         label: str = "Funding Arb",
     ):
@@ -165,6 +172,10 @@ class FundingArbPaperSim:
         self.cost_frac = cost_frac
         self.positive_funding_only = positive_funding_only
         self.symbol_allowlist = symbol_allowlist   # set of BASE symbols, e.g. {'BTC','ETH'}
+        # Source allowlist restricts to opportunities from specific exchanges,
+        # e.g. {'Kraken Futures'} for an arm that only opens on actually-tradeable
+        # rates for a US-geo-blocked account.
+        self.source_allowlist = source_allowlist
         self.state_file = state_file or STATE_FILE
         self.label = label
 
@@ -226,8 +237,10 @@ class FundingArbPaperSim:
         mode = "positive-funding only" if self.positive_funding_only else "both sides"
         universe = ("majors " + "/".join(sorted(self.symbol_allowlist))
                     if self.symbol_allowlist else "all symbols")
+        sources = ("sources=" + ",".join(sorted(self.source_allowlist))
+                   if self.source_allowlist else "sources=all")
         logger.info(
-            f"[{self.label}] Started (paper). {mode}, {universe}. "
+            f"[{self.label}] Started (paper). {mode}, {universe}, {sources}. "
             f"floor~{self._apy_floor():.0f}% cap={self.max_entry_apy:.0f}% "
             f"cost={self.cost_frac*100:.2f}% max_positions={self.max_positions} "
             f"rollup={ROLLUP_INTERVAL_SECONDS/3600:.0f}h"
@@ -288,6 +301,12 @@ class FundingArbPaperSim:
                     break
                 key = f"{opp['exchange']}:{opp['symbol']}"
                 if key in self.open_positions:
+                    continue
+                # Source-restricted arm: only consider opportunities from
+                # allowlisted exchanges (e.g. {'Kraken Futures'} for an arm whose
+                # rates are actually capturable by this account).
+                if self.source_allowlist is not None and \
+                        opp['exchange'] not in self.source_allowlist:
                     continue
                 # Conservative arm: positive funding only (long spot / short perp
                 # → no spot borrow needed, so genuinely retail-executable).
