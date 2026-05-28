@@ -98,6 +98,25 @@ class MasterBotRunner:
             )
             asyncio.create_task(self.stablecoin_arb_bot.start())
 
+        # Start alt-perp confluence strategy (src/altperp/). PAPER-only by design
+        # — directional edge unproven per research (memory: altperp-strategy), so
+        # this is forward-walk data collection alongside the funding arb. The
+        # package's orders.py refuses to send live orders without a Kraken exec
+        # client; leave that gate in place until edge is measured.
+        altperp_cfg = self.config.get("altperp", {})
+        if altperp_cfg.get("enabled", False):
+            ai_on = bool(altperp_cfg.get("ai_brain_enabled", False))
+            # Set env BEFORE importing the runner — altperp.config reads these at
+            # module load time. setdefault so a hand-set .env value still wins.
+            _os.environ.setdefault("ALTPERP_AI_ENABLED", "1" if ai_on else "0")
+            _os.environ.setdefault("ALTPERP_PAPER", "1")
+            logger.info("Starting altperp strategy (paper, AI gate-keeper=%s)...",
+                        "on" if ai_on else "off")
+            from src.altperp.runner import run as altperp_run
+            from src.notifications import create_notifier_from_env
+            altperp_notifier = create_notifier_from_env()
+            asyncio.create_task(altperp_run(notifier=altperp_notifier))
+
         logger.info("All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
 
         # Start dashboard server alongside bots

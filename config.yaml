@@ -56,3 +56,18 @@ logging:
   level: INFO
   file: logs/bot.log
   save_trades: true
+
+# ── Alt-perp confluence strategy (src/altperp/) ───────────────────────────────
+# Bybit signals → Kraken Futures execution. PAPER-only by design — directional
+# edge is unproven per research (memory: altperp-strategy); deploying live here
+# is forward-walk data collection alongside the funding arb, not a live punt.
+# The package's orders.py raises if anyone tries to flip it to live without a
+# Kraken execution client wired up. Leave it that way until edge is measured.
+altperp:
+  enabled: true
+  # Claude-API gate-keeper layer that confirms / vetoes / sizes structural setups.
+  # OFF by default: without ANTHROPIC_API_KEY in .env the brain fail-closes and
+  # vetoes every trade, which defeats the point of collecting forward data.
+  # To enable: add ANTHROPIC_API_KEY to /opt/crypto-bot/.env, flip this to true,
+  # restart the service.
+  ai_brain_enabled: false
