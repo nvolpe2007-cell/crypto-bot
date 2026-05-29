@@ -25,7 +25,7 @@ from .live_trading import LiveTrader, run_live_trading_session, start_live_sessi
 from .dashboard import run_dashboard
 from .notifications import create_notifier_from_env
 from .market_sentiment import SentimentMonitor
-from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
+from .kraken_ws import KrakenPublicWS, KrakenPrivateWS, KrakenBookFeed, KrakenTradeFeed
 from .crypto_vol import CryptoVolMonitor
 from .state import read_state, write_state
 from .strategy_advisor import StrategyAdvisor
@@ -177,14 +177,24 @@ class ScalpingBot:
         notifier  = create_notifier_from_env()
         sentiment = SentimentMonitor(notifier=notifier)
         public_ws = KrakenPublicWS(self.symbols, ohlc_interval=1)
+        # Streaming L2 book + trade tape — wakes the microstructure scalper
+        # from REST-snapshot dormancy and provides taker-side flow for VPIN.
+        # Includes triangular-arb cross pairs so the scanner can evaluate
+        # USD→A→B→USD cycles using the same feed.
+        from .triangular_arb import REQUIRED_CROSS_PAIRS as _TRIARB_PAIRS
+        _book_syms = list(dict.fromkeys(list(self.symbols) + _TRIARB_PAIRS))
+        book_feed  = KrakenBookFeed(_book_syms, depth=10)
+        trade_feed = KrakenTradeFeed(self.symbols)
         vol_mon   = CryptoVolMonitor()
         journal   = TradeJournal()
         advisor   = StrategyAdvisor(notifier, journal)
         asyncio.create_task(supervised('sentiment',   sentiment.start, notifier=notifier))
         asyncio.create_task(supervised('public_ws',   public_ws.start, notifier=notifier))
+        asyncio.create_task(supervised('book_feed',   book_feed.start,  notifier=notifier))
+        asyncio.create_task(supervised('trade_feed',  trade_feed.start, notifier=notifier))
         asyncio.create_task(supervised('vol_monitor', vol_mon.start,   notifier=notifier))
         asyncio.create_task(supervised('advisor',     advisor.start,   notifier=notifier))
-        logger.info("WebSocket streams starting (public ticker + OHLC + IV monitor)")
+        logger.info("WebSocket streams starting (ticker + OHLC + book + trade tape + IV monitor)")
 
         try:
             await run_paper_trading_session(
@@ -197,6 +207,8 @@ class ScalpingBot:
                 sentiment_monitor=sentiment,
                 public_ws=public_ws,
                 vol_monitor=vol_mon,
+                book_feed=book_feed,
+                trade_feed=trade_feed,
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")

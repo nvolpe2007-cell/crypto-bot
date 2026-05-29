@@ -732,7 +732,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                      notifier: Optional[TelegramNotifier] = None,
                                      sentiment_monitor: Optional[SentimentMonitor] = None,
                                      public_ws: Optional[KrakenPublicWS] = None,
-                                     vol_monitor: Optional[CryptoVolMonitor] = None):
+                                     vol_monitor: Optional[CryptoVolMonitor] = None,
+                                     book_feed=None,
+                                     trade_feed=None):
 
     trader.running    = True
     trader._started_at = datetime.now(timezone.utc).isoformat()
@@ -774,6 +776,40 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
     spread_tracker  = SpreadTracker()
+    # VPIN toxic-flow monitor — fed by the WS v2 trade tape (taker side per
+    # Kraken docs). Hooked below if trade_feed is provided.
+    from .vpin_monitor import VPINMonitor, TOXIC_THRESHOLD as _VPIN_THRESH
+    vpin_monitor = VPINMonitor()
+    if trade_feed is not None and getattr(trade_feed, "_on_trade", None) is None:
+        trade_feed._on_trade = vpin_monitor.on_trade
+
+    # Triangular arbitrage scanner — observe-only paper sim of single-venue
+    # cycle opportunities (USD→A→B→USD). Logs every qualifying opportunity
+    # so we build a record of whether real edges exist before committing to
+    # execution code. Disabled when book_feed isn't wired.
+    _triarb_scanner = None
+    _triarb_task = None
+    if book_feed is not None and os.getenv("TRIARB_ENABLED", "1") == "1":
+        try:
+            from .triangular_arb import TriangularArbScanner, DEFAULT_CYCLES
+            _triarb_scanner = TriangularArbScanner(
+                cycles=DEFAULT_CYCLES,
+                get_book=lambda s: book_feed.get_top(s, depth=10),
+            )
+            async def _triarb_loop():
+                interval = float(os.getenv("TRIARB_SCAN_INTERVAL_SEC", "30"))
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        opps = _triarb_scanner.scan_once()
+                        if opps:
+                            logger.info(_triarb_scanner.format_log(opps))
+                    except Exception as e:
+                        logger.debug(f"[TRIARB] scan failed: {e}")
+            _triarb_task = asyncio.create_task(_triarb_loop())
+            logger.info(f"[TRIARB] scanner started, cycles={len(DEFAULT_CYCLES)}")
+        except Exception as e:
+            logger.warning(f"[TRIARB] disabled: {e}")
     macro_provider = MacroDataProvider()
     macro_provider.start()
 
@@ -1377,12 +1413,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 funding_rate = _get_funding_rate(symbol)
 
                 # ── Microstructure OFI v2 book update ─────────────────────────
-                # Fetch order book and feed it into OFI v2 + kill filters
+                # Prefer streaming WS book (sub-second updates); fall back to REST
+                # only when WS has no fresh data (<3s old). This wakes the
+                # microstructure scalper from REST-snapshot dormancy.
                 try:
-                    ob = await ofi_calc._exchange.exchange.fetch_order_book(symbol, limit=20)
-                    if ob:
-                        bids_raw = ob.get('bids', [])
-                        asks_raw = ob.get('asks', [])
+                    bids_raw: List = []
+                    asks_raw: List = []
+                    if book_feed is not None and book_feed.staleness(symbol) < 3.0:
+                        bids_raw, asks_raw = book_feed.get_top(symbol, depth=10)
+                    if not (bids_raw and asks_raw):
+                        ob = await ofi_calc._exchange.exchange.fetch_order_book(symbol, limit=20)
+                        if ob:
+                            bids_raw = ob.get('bids', [])
+                            asks_raw = ob.get('asks', [])
+                    if bids_raw and asks_raw:
                         strategy.update_book(symbol, bids_raw, asks_raw, time.time())
                         # Update volume SMA for whale filter
                         vol_sma20 = float(df['volume'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
@@ -1623,6 +1667,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         circuit_breaker_reason=None if cb_ok else cb_reason,
                         current_spread_pct=spread_tracker.current(symbol),
                         median_spread_pct=spread_tracker.median(symbol),
+                        vpin=vpin_monitor.current(symbol),
+                        vpin_threshold=_VPIN_THRESH,
                     )
                     cl_result = long_checklist.run(long_ctx)
                     if not cl_result.passed:
@@ -1743,6 +1789,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         circuit_breaker_reason=None if cb_ok else cb_reason,
                         current_spread_pct=spread_tracker.current(symbol),
                         median_spread_pct=spread_tracker.median(symbol),
+                        vpin=vpin_monitor.current(symbol),
+                        vpin_threshold=_VPIN_THRESH,
                     )
                     cl_result = short_checklist.run(short_ctx)
                     if not cl_result.passed:

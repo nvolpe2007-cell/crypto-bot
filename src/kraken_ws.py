@@ -329,3 +329,205 @@ class KrakenPrivateWS:
                 if currency:
                     self._balances[currency] = balance
                     logger.debug(f"[PrivateWS] balance update: {currency}={balance:.4f}")
+
+
+# ── Public L2 book feed ───────────────────────────────────────────────────────
+
+class KrakenBookFeed:
+    """Maintains a streaming L2 order book per symbol via Kraken WS v2.
+
+    The `book` channel delivers a full snapshot on subscribe, then incremental
+    update events containing only the changed levels. A delta with `qty == 0`
+    removes the level. We hold a `dict[price] -> qty` per side and sort+slice
+    on read. The output format matches ccxt's REST shape (`[[price, qty], ...]`),
+    so callers can swap REST for WS without touching consumer code.
+
+    This is the unlock for the dormant microstructure scalper: REST polls every
+    ~2s; WS updates push every book change, often dozens per second on majors.
+    """
+
+    def __init__(self, symbols: List[str], depth: int = 10):
+        self._symbols = symbols
+        self._depth   = depth
+        self._books: Dict[str, Dict[str, Dict[float, float]]] = {
+            s: {"bids": {}, "asks": {}} for s in symbols
+        }
+        self._last_update: Dict[str, float] = {}   # monotonic time per symbol
+        self._running = False
+
+    def get_top(self, symbol: str, depth: Optional[int] = None
+                ) -> tuple[List[List[float]], List[List[float]]]:
+        """Return current top-N (bids, asks) in REST-compatible shape.
+        Bids descending by price, asks ascending. Empty lists if no data yet."""
+        n = depth or self._depth
+        book = self._books.get(symbol)
+        if not book:
+            return [], []
+        bids = sorted(book["bids"].items(), key=lambda kv: -kv[0])[:n]
+        asks = sorted(book["asks"].items(), key=lambda kv:  kv[0])[:n]
+        return [[p, q] for p, q in bids], [[p, q] for p, q in asks]
+
+    def staleness(self, symbol: str) -> float:
+        """Seconds since the last update for this symbol. Inf if never seen."""
+        t = self._last_update.get(symbol)
+        if t is None:
+            return float("inf")
+        return time.monotonic() - t
+
+    def stop(self):
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        while self._running:
+            try:
+                await self._connect()
+            except Exception as e:
+                logger.warning(f"[BookFeed] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+            if self._running:
+                await asyncio.sleep(_RECONNECT_DELAY)
+
+    async def _connect(self):
+        logger.info(f"[BookFeed] connecting to {_PUBLIC_WS} (depth={self._depth})")
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(_PUBLIC_WS, heartbeat=30) as ws:
+                logger.info("[BookFeed] connected")
+                await ws.send_json({
+                    "method": "subscribe",
+                    "params": {
+                        "channel": "book",
+                        "symbol":  self._symbols,
+                        "depth":   self._depth,
+                        "snapshot": True,
+                    }
+                })
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self._handle(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    def _handle(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if data.get("channel") != "book":
+            return
+        msg_type = data.get("type", "")
+        for entry in data.get("data", []):
+            sym = entry.get("symbol")
+            if sym not in self._books:
+                continue
+            book = self._books[sym]
+            if msg_type == "snapshot":
+                book["bids"].clear()
+                book["asks"].clear()
+            for b in entry.get("bids", []) or []:
+                try:
+                    p = float(b.get("price")); q = float(b.get("qty"))
+                except Exception:
+                    continue
+                if q <= 0:
+                    book["bids"].pop(p, None)
+                else:
+                    book["bids"][p] = q
+            for a in entry.get("asks", []) or []:
+                try:
+                    p = float(a.get("price")); q = float(a.get("qty"))
+                except Exception:
+                    continue
+                if q <= 0:
+                    book["asks"].pop(p, None)
+                else:
+                    book["asks"][p] = q
+            self._last_update[sym] = time.monotonic()
+
+
+# ── Public trade tape feed (for VPIN / CVD) ───────────────────────────────────
+
+@dataclass
+class TradeTick:
+    symbol:    str
+    price:     float
+    qty:       float
+    side:      str      # "buy" or "sell" — the taker side per Kraken docs
+    timestamp: str      # RFC3339
+
+
+class KrakenTradeFeed:
+    """Streams the WS v2 `trade` channel — every matched trade with its taker
+    side. Used by VPIN / volume-bucketed flow toxicity. Consumers receive
+    TradeTick events via the provided callback (called synchronously inside
+    the WS message handler — keep callbacks cheap)."""
+
+    def __init__(self, symbols: List[str], on_trade: Optional[Callable[[TradeTick], None]] = None):
+        self._symbols  = symbols
+        self._on_trade = on_trade
+        self._last_update: Dict[str, float] = {}
+        self._running = False
+
+    def staleness(self, symbol: str) -> float:
+        t = self._last_update.get(symbol)
+        if t is None:
+            return float("inf")
+        return time.monotonic() - t
+
+    def stop(self):
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        while self._running:
+            try:
+                await self._connect()
+            except Exception as e:
+                logger.warning(f"[TradeFeed] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+            if self._running:
+                await asyncio.sleep(_RECONNECT_DELAY)
+
+    async def _connect(self):
+        logger.info(f"[TradeFeed] connecting to {_PUBLIC_WS}")
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(_PUBLIC_WS, heartbeat=30) as ws:
+                logger.info("[TradeFeed] connected")
+                await ws.send_json({
+                    "method": "subscribe",
+                    "params": {
+                        "channel": "trade",
+                        "symbol":  self._symbols,
+                    }
+                })
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self._handle(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+
+    def _handle(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+        if data.get("channel") != "trade":
+            return
+        for entry in data.get("data", []):
+            sym = entry.get("symbol")
+            if sym not in self._symbols:
+                continue
+            try:
+                tick = TradeTick(
+                    symbol=sym,
+                    price=float(entry.get("price", 0)),
+                    qty=float(entry.get("qty", 0)),
+                    side=str(entry.get("side", "")),
+                    timestamp=str(entry.get("timestamp", "")),
+                )
+            except Exception:
+                continue
+            self._last_update[sym] = time.monotonic()
+            if self._on_trade:
+                try:
+                    self._on_trade(tick)
+                except Exception as e:
+                    logger.debug(f"[TradeFeed] callback error: {e}")

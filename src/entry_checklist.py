@@ -56,6 +56,11 @@ class CheckContext:
     # fields are optional so older call sites (and tests) still work.
     current_spread_pct: Optional[float] = None
     median_spread_pct:  Optional[float] = None
+    # VPIN guard: caller passes the current VPIN reading (or None on warm-up).
+    # The _vpin_safe check rejects when VPIN exceeds VPIN_TOXIC_THRESHOLD —
+    # the tape is being adversely selected and entries get knife-caught.
+    vpin: Optional[float] = None
+    vpin_threshold: float = 0.55
 
 
 @dataclass
@@ -222,6 +227,19 @@ def _regime_short_block(ctx: CheckContext):
 SPREAD_MAX_MULT = 1.5
 
 
+def _vpin_safe(ctx: CheckContext):
+    """Hard veto: refuse to enter when order-flow toxicity (VPIN) is high.
+    VPIN > threshold means the recent volume bucket is heavily one-sided —
+    an informed trader is sweeping. Market-takers entering here get adversely
+    selected. Passes when no VPIN data is available yet (warm-up)."""
+    v = ctx.vpin
+    if v is None:
+        return True, "no vpin"
+    if v > ctx.vpin_threshold:
+        return False, f"vpin {v:.2f}>{ctx.vpin_threshold:.2f} toxic flow"
+    return True, f"vpin {v:.2f}"
+
+
 def _spread_normal(ctx: CheckContext):
     """Hard veto: refuse to enter when the current spread is anomalously wide
     relative to its rolling median. Wide spreads typically mean (a) a news
@@ -355,6 +373,7 @@ def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("kill_filter",       "hard", _kill_filter),
         Check("atr_alive",         "hard", _atr_alive),
         Check("spread_normal",     "hard", _spread_normal),
+        Check("vpin_safe",         "hard", _vpin_safe),
         Check("rsi_healthy",       "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",        "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",     "soft", _volume_strong,     weight=1.0),
@@ -376,6 +395,7 @@ def build_short_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("kill_filter",        "hard", _kill_filter),
         Check("atr_alive",          "hard", _atr_alive),
         Check("spread_normal",      "hard", _spread_normal),
+        Check("vpin_safe",          "hard", _vpin_safe),
         Check("rsi_healthy",        "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",         "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",      "soft", _volume_strong,     weight=1.0),
