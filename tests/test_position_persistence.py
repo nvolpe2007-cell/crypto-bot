@@ -466,3 +466,41 @@ class TestEdgeCases:
         assert p['symbol'] == 'BTC/USD'
         assert p['is_perp'] is True
         assert p['last_funding_ts'] is not None
+
+    def test_no_tmp_file_left_after_successful_save(self, clean_positions_file):
+        """Atomic write must clean up the .tmp file on success."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        assert not os.path.exists(clean_positions_file + '.tmp')
+        assert os.path.exists(clean_positions_file)
+
+    def test_original_file_not_corrupted_if_write_fails(self, clean_positions_file, monkeypatch):
+        """If json.dump raises, the pre-existing positions file must be unchanged."""
+        # Write a known-good snapshot first
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position(entry_price=50_000.0)
+        _save_open_positions(trader)
+        with open(clean_positions_file) as f:
+            good_data = f.read()
+
+        # Simulate a mid-write failure by making json.dump raise
+        import json as _json
+        original_dump = _json.dump
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr('json.dump', _boom)
+
+        trader2 = _fresh_trader()
+        trader2.account.positions['ETH/USD'] = _spot_position(entry_price=3_000.0)
+        _save_open_positions(trader2)  # should log error, not crash
+
+        monkeypatch.setattr('json.dump', original_dump)
+
+        # Original file must be intact
+        with open(clean_positions_file) as f:
+            after_data = f.read()
+        assert after_data == good_data

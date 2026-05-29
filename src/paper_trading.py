@@ -97,8 +97,10 @@ def _save_adaptations():
     try:
         os.makedirs('logs', exist_ok=True)
         _adapt['updated_at'] = datetime.now(timezone.utc).isoformat()
-        with open(_ADAPT_FILE, 'w') as f:
+        tmp = _ADAPT_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump(_adapt, f, indent=2)
+        os.replace(tmp, _ADAPT_FILE)
     except Exception as e:
         logger.error(f"[ADAPT] Save failed: {e}")
 
@@ -2226,13 +2228,15 @@ def _save_open_positions(trader):
                 'funding_accrued':  pos.funding_accrued,
                 'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
             })
-        with open(_POSITIONS_FILE, 'w') as f:
+        tmp = _POSITIONS_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump({
                 'saved_at': datetime.now(timezone.utc).isoformat(),
                 'cash':     trader.account.cash,
                 'total_pnl': trader.account.total_pnl,
                 'positions': out,
             }, f, indent=2)
+        os.replace(tmp, _POSITIONS_FILE)
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to save open positions to {_POSITIONS_FILE}: {e}")
 

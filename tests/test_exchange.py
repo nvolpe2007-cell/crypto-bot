@@ -331,6 +331,14 @@ class TestCreateOrder:
         _, kwargs = conn.exchange.create_order.call_args
         assert 'price' not in kwargs
 
+    async def test_limit_order_with_zero_price_passes_price(self):
+        """price=0.0 is falsy — must use `is not None` check, not truthiness, so it is forwarded."""
+        conn = _make_conn()
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'x'})
+        await conn.create_order('BTC/USD', 'limit', 'buy', 0.001, price=0.0)
+        _, kwargs = conn.exchange.create_order.call_args
+        assert kwargs.get('price') == 0.0
+
 
 # ── cancel_order ──────────────────────────────────────────────────────────────
 

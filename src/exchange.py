@@ -319,7 +319,7 @@ class ExchangeConnection:
         """
         params = {'symbol': symbol, 'type': order_type,
                   'side': side, 'amount': amount}
-        if price and order_type == 'limit':
+        if price is not None and order_type == 'limit':
             params['price'] = price
 
         logger.info(f"Placing {order_type} {side} order for "
