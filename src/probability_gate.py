@@ -36,8 +36,12 @@ logger = logging.getLogger(__name__)
 # combined_p to the empirical win rate in the trade journal, and the gate routes
 # its reject threshold + Kelly sizing through that calibrated probability.
 
-# Hard threshold: don't take trades below this combined probability
-MIN_PROBABILITY = float(os.getenv("PROB_GATE_MIN_P", "0.58"))
+# Hard threshold: don't take trades below this CALIBRATED probability.
+# Raised from 0.58 → 0.65 per "minimize losing trades" goal:
+# at 0.58 the gate accepts trades barely above a coin flip after costs;
+# 0.65 requires meaningful stacked confidence before risking capital.
+# See memory: user-goal-minimize-losers.
+MIN_PROBABILITY = float(os.getenv("PROB_GATE_MIN_P", "0.65"))
 
 # Quarter-Kelly target: when the trade's Kelly fraction reaches this, size = 1.0x
 # Below it, size is scaled down proportionally. Never scales up.
@@ -53,12 +57,23 @@ ENABLED = os.getenv("PROB_GATE_ENABLED", "1") == "1"
 MAX_TRADE_USD = float(os.getenv("PROB_GATE_MAX_TRADE_USD", "75"))
 
 # (tier_name, min_p, min_edges, target_usd, hold_minutes, trail_style)
+# Ordered HIGHEST → LOWEST; classifier picks the first qualifying tier.
 TIERS = [
     ("conviction", 0.80, 5, 75.0, 24 * 60, "ema50_4h"),
     ("position",   0.75, 4, 50.0, 12 * 60, "ema50_4h"),
     ("swing",      0.65, 3, 25.0,  4 * 60, "ema21_1h"),
     ("scalp",      0.58, 2,  5.0,       60, "atr_stop"),
 ]
+# Rank used by the tier floor (higher = more selective).
+_TIER_RANK = {"scalp": 0, "swing": 1, "position": 2, "conviction": 3}
+
+# Minimum tier the gate is willing to fire. Anything classified below this
+# is rejected even if its calibrated P clears MIN_PROBABILITY. Default
+# "swing" (rank 1) → requires at least 3 corroborating edges, which kills
+# the "high P from a single strong edge" trap that drives most losing
+# scalps. Set to "position" or "conviction" to be even stricter.
+MIN_TIER = os.getenv("PROB_GATE_MIN_TIER", "swing").lower()
+MIN_TIER_RANK = _TIER_RANK.get(MIN_TIER, 1)
 
 
 # ── Types ──────────────────────────────────────────────────────────────────
@@ -337,13 +352,18 @@ class ProbabilityGate:
     """
 
     def __init__(self, min_p: float = MIN_PROBABILITY, kelly_ref: float = KELLY_REF,
-                 calibrator=None):
+                 calibrator=None, min_tier: str = MIN_TIER):
         self.min_p = min_p
         self.kelly_ref = kelly_ref
         # Optional ProbabilityCalibrator (src/calibration.py). When attached and
         # active, the gate's reject threshold and Kelly sizing run on the
         # *calibrated* win probability instead of the raw stacked guess.
         self.calibrator = calibrator
+        # Tier floor: reject trades classified below this conviction level.
+        # Defaults to MIN_TIER ("swing") so the gate refuses single-edge
+        # high-P trades that historically dominated the loss column.
+        self.min_tier = min_tier.lower()
+        self.min_tier_rank = _TIER_RANK.get(self.min_tier, MIN_TIER_RANK)
 
     def evaluate(self,
                  sig,
@@ -388,15 +408,20 @@ class ProbabilityGate:
         size_scale = min(1.0, k_quarter / self.kelly_ref) if self.kelly_ref > 0 else 1.0
         size_scale = max(0.0, size_scale)
 
-        rejected = decision_p < self.min_p
+        macro_driven = any(e.present and e.name in ("gold", "contagion") for e in edges)
+        tier, target_usd, hold_min, trail = _classify_tier(decision_p, len(present_probs))
+
+        rejected = False
         reason = None
-        if rejected:
+        if decision_p < self.min_p:
+            rejected = True
             cal_note = f" (raw {combined_p:.2f}, calibrated)" if cal_active else ""
             reason = (f"P={decision_p:.2f}{cal_note} < min {self.min_p:.2f} "
                       f"(only {len(present_probs)} edges present)")
-
-        macro_driven = any(e.present and e.name in ("gold", "contagion") for e in edges)
-        tier, target_usd, hold_min, trail = _classify_tier(decision_p, len(present_probs))
+        elif _TIER_RANK.get(tier, 0) < self.min_tier_rank:
+            rejected = True
+            reason = (f"tier={tier} below floor={self.min_tier} "
+                      f"(P={decision_p:.2f}, {len(present_probs)} edges)")
 
         return TradeReasoning(
             direction="LONG" if is_buy else "SHORT",

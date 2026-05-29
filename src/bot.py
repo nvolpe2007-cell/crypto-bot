@@ -171,6 +171,7 @@ class ScalpingBot:
             take_profit_pct=risk_cfg.get('take_profit_pct', 3.0),
             perp_mode=is_perps,
             leverage=leverage,
+            allow_spot_shorts=False,
         )
 
         notifier  = create_notifier_from_env()

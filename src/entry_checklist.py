@@ -19,8 +19,10 @@ losing trade had).
 """
 
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, List, Literal, Optional
+from statistics import median
+from typing import Any, Callable, Deque, Dict, List, Literal, Optional
 
 CheckKind = Literal["hard", "soft"]
 
@@ -47,6 +49,13 @@ class CheckContext:
     sentiment_allows: bool                  # already evaluated by caller
     kill_filter_reason: Optional[str]       # output of _kill_filter_skip
     circuit_breaker_reason: Optional[str]   # None if can_enter
+    # Spread anomaly guard: caller passes current spread (as a fraction of price,
+    # e.g. 0.0008 = 8bp) and the rolling median over the last ~N samples. The
+    # _spread_normal check rejects when current is more than SPREAD_MAX_MULT ×
+    # median, which catches news spikes, whale events, and stop hunts. Both
+    # fields are optional so older call sites (and tests) still work.
+    current_spread_pct: Optional[float] = None
+    median_spread_pct:  Optional[float] = None
 
 
 @dataclass
@@ -207,6 +216,68 @@ def _regime_short_block(ctx: CheckContext):
     return True, ctx.regime_name
 
 
+# Multiplier above the rolling-median spread at which entries get vetoed.
+# 1.5× is the textbook setting from the algo-spread-monitor literature;
+# tightening to 1.3× or 1.2× refuses more trades during turbulent tape.
+SPREAD_MAX_MULT = 1.5
+
+
+def _spread_normal(ctx: CheckContext):
+    """Hard veto: refuse to enter when the current spread is anomalously wide
+    relative to its rolling median. Wide spreads typically mean (a) a news
+    spike just hit, (b) a whale is sweeping levels, or (c) a stop run is in
+    progress — all of which adversely select market-takers. Passes silently
+    when no baseline data is available (warm-up window)."""
+    cur = ctx.current_spread_pct
+    med = ctx.median_spread_pct
+    if cur is None or med is None or med <= 0:
+        return True, "no baseline"
+    mult = cur / med
+    if mult > SPREAD_MAX_MULT:
+        return False, f"spread {cur*100:.3f}% = {mult:.1f}× median {med*100:.3f}%"
+    return True, f"spread {cur*100:.3f}% ({mult:.2f}× median)"
+
+
+# ── SpreadTracker — caller side, populated each tick from live order books ──
+
+class SpreadTracker:
+    """Tiny per-symbol rolling buffer of spread-as-fraction-of-price.
+
+    Used by the paper_trading main loop: on every tick that observes a fresh
+    bid/ask, call tracker.push(symbol, spread/price). At checklist time,
+    tracker.median(symbol) feeds CheckContext.median_spread_pct.
+
+    Asyncio-single-threaded — no locks. maxlen of 60 ≈ last ~2 minutes when the
+    loop ticks every ~2s; long enough to be robust, short enough to react when
+    the tape regime changes.
+    """
+
+    def __init__(self, maxlen: int = 60):
+        self.maxlen = maxlen
+        self._buf: Dict[str, Deque[float]] = {}
+
+    def push(self, symbol: str, spread_pct: float) -> None:
+        if spread_pct is None or spread_pct <= 0:
+            return
+        buf = self._buf.get(symbol)
+        if buf is None:
+            buf = deque(maxlen=self.maxlen)
+            self._buf[symbol] = buf
+        buf.append(float(spread_pct))
+
+    def current(self, symbol: str) -> Optional[float]:
+        buf = self._buf.get(symbol)
+        if not buf:
+            return None
+        return buf[-1]
+
+    def median(self, symbol: str, min_samples: int = 10) -> Optional[float]:
+        buf = self._buf.get(symbol)
+        if not buf or len(buf) < min_samples:
+            return None
+        return median(buf)
+
+
 # ── Soft predicates ─────────────────────────────────────────────────────────
 
 def _rsi_healthy(ctx: CheckContext):
@@ -283,6 +354,7 @@ def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("sentiment",         "hard", _sentiment),
         Check("kill_filter",       "hard", _kill_filter),
         Check("atr_alive",         "hard", _atr_alive),
+        Check("spread_normal",     "hard", _spread_normal),
         Check("rsi_healthy",       "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",        "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",     "soft", _volume_strong,     weight=1.0),
@@ -303,6 +375,7 @@ def build_short_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("regime_short_block", "hard", _regime_short_block),
         Check("kill_filter",        "hard", _kill_filter),
         Check("atr_alive",          "hard", _atr_alive),
+        Check("spread_normal",      "hard", _spread_normal),
         Check("rsi_healthy",        "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",         "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",      "soft", _volume_strong,     weight=1.0),

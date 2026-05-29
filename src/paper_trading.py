@@ -47,6 +47,7 @@ from .daily_circuit import DailyCircuitBreaker
 from .trailing_stop import update_trailing_stop
 from .entry_checklist import (
     CheckContext,
+    SpreadTracker,
     build_long_checklist,
     build_short_checklist,
 )
@@ -354,12 +355,13 @@ class PaperAccount:
 class PaperTrader:
     def __init__(self, initial_capital: float = 100.0,
                  position_size: float = 50.0,     # kept for compat; scientific uses equity %
-                 fee_pct: float = 0.26,
+                 fee_pct: float = 0.40,
                  slippage_pct: float = 0.1,
                  stop_loss_pct: float = 2.0,
                  take_profit_pct: float = 3.0,
                  perp_mode: bool = False,
-                 leverage: float = 1.0):
+                 leverage: float = 1.0,
+                 allow_spot_shorts: bool = True):
         self.initial_capital  = initial_capital
         self.account          = PaperAccount(initial_capital=initial_capital, cash=initial_capital)
         self.position_size    = position_size
@@ -374,13 +376,16 @@ class PaperTrader:
         # ── Perp mode state ───────────────────────────────────────────────────
         self.perp_mode        = perp_mode
         self.leverage         = max(1.0, float(leverage)) if perp_mode else 1.0
-        # Fee correction: the 0.26% default is the Kraken SPOT taker fee. On
-        # Kraken FUTURES (perp mode) taker is ~0.05%. Applying the spot fee to
-        # perps overstated round-trip cost ~5× and was a primary cause of the
-        # ~1% win rate (cost dwarfed the per-trade target). Use the realistic
-        # futures fee when in perp mode.
+        # Fee defaults match Kraken Pro lowest tier ($0–10K 30d vol): 0.40% spot
+        # taker, 0.05% futures taker. Spot tier is what a $500 account actually
+        # pays; futures tier is what live perps would cost (US retail can't
+        # access Kraken Futures, but the funding-arb paper sim still uses it).
         if self.perp_mode:
             self.fee_pct = min(self.fee_pct, float(os.getenv('PERP_TAKER_FEE_PCT', '0.05')) / 100)
+        # US Kraken spot has no shorting/margin for retail. When this flag is
+        # False, execute_short refuses in spot mode so paper P&L reflects what
+        # the user could actually replicate on a Kraken Pro spot account.
+        self.allow_spot_shorts = bool(allow_spot_shorts)
         # Symbol → current 8h funding rate (fraction, e.g. 0.0001). Caller updates.
         self._funding_rates: Dict[str, float] = {}
         if perp_mode:
@@ -507,6 +512,9 @@ class PaperTrader:
 
     def execute_short(self, symbol: str, price: float, timestamp: datetime,
                       size_usd: float, signal: Optional[ScientificSignal] = None) -> Optional[PaperPosition]:
+        if not self.perp_mode and not self.allow_spot_shorts:
+            logger.info(f"[SKIP SHORT] {symbol} — Kraken Pro spot has no retail shorting")
+            return None
         size       = size_usd / price
         slip       = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 - slip)
@@ -765,6 +773,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     prob_gate   = ProbabilityGate(calibrator=calibrator) if PROB_GATE_ENABLED else None
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
+    spread_tracker  = SpreadTracker()
     macro_provider = MacroDataProvider()
     macro_provider.start()
 
@@ -1384,7 +1393,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 best_bid = float(bids_raw[0][0])
                                 best_ask = float(asks_raw[0][0])
                                 if best_ask > best_bid > 0:
-                                    trader.live_spreads[symbol] = best_ask - best_bid
+                                    spread_abs = best_ask - best_bid
+                                    trader.live_spreads[symbol] = spread_abs
+                                    mid = (best_ask + best_bid) / 2.0
+                                    if mid > 0:
+                                        spread_tracker.push(symbol, spread_abs / mid)
                             except Exception as e:
                                 logger.debug(f"[OFI] spread parse failed for {symbol}: {e}")
                 except Exception as e:
@@ -1608,6 +1621,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                           if sentiment_monitor else True),
                         kill_filter_reason=_kill_filter_skip(symbol, df, side='buy'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
+                        current_spread_pct=spread_tracker.current(symbol),
+                        median_spread_pct=spread_tracker.median(symbol),
                     )
                     cl_result = long_checklist.run(long_ctx)
                     if not cl_result.passed:
@@ -1726,6 +1741,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         sentiment_allows=True,   # no sentiment gate for shorts
                         kill_filter_reason=_kill_filter_skip(symbol, df, side='sell'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
+                        current_spread_pct=spread_tracker.current(symbol),
+                        median_spread_pct=spread_tracker.median(symbol),
                     )
                     cl_result = short_checklist.run(short_ctx)
                     if not cl_result.passed:
