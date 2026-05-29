@@ -1,0 +1,13 @@
+[Unit]
+Description=Run weekly_report every Friday at 10:00 America/New_York
+Requires=weekly_report.service
+
+[Timer]
+# 10:00 America/New_York; systemd handles DST automatically.
+OnCalendar=Fri 10:00 America/New_York
+# Catch up if the VPS was off when the trigger time passed.
+Persistent=true
+Unit=weekly_report.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Crypto bot weekly health report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/crypto-bot
+EnvironmentFile=/opt/crypto-bot/.env
+ExecStart=/opt/crypto-bot/venv/bin/python scripts/weekly_report.py
+StandardOutput=journal
+StandardError=journal
