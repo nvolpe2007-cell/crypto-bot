@@ -29,6 +29,7 @@ from src.entry_checklist import (
     _ws_fresh, _max_positions, _ofi_aligned, _sentiment,
     _kill_filter, _regime_short_block, _rsi_healthy, _adx_strong,
     _volume_strong, _atr_alive, _lead_lag_aligned, _funding_favorable,
+    _spread_normal, _vpin_safe, SpreadTracker, SPREAD_MAX_MULT,
 )
 
 
@@ -670,7 +671,7 @@ class TestBuildLongChecklist:
         cl = build_long_checklist()
         hard_names = {"min_confidence", "circuit_breaker", "cooldown", "bar_dedup",
                       "ws_fresh", "max_positions", "ofi_aligned", "sentiment",
-                      "kill_filter", "atr_alive"}
+                      "kill_filter", "atr_alive", "spread_normal", "vpin_safe"}
         for c in cl.checks:
             if c.name in hard_names:
                 assert c.kind == "hard", f"{c.name} should be hard"
@@ -754,3 +755,275 @@ class TestCheckExceptionIsolation:
         names = [r.name for r in result.results]
         assert "boom" in names
         assert "ok_check" in names
+
+
+# ── Hard check: spread_normal ─────────────────────────────────────────────────
+
+def _ctx_spread(
+    current_spread_pct: Optional[float],
+    median_spread_pct: Optional[float],
+) -> CheckContext:
+    """Build a CheckContext with spread fields set; all other fields pass by default."""
+    base = _ctx()
+    base.current_spread_pct = current_spread_pct
+    base.median_spread_pct = median_spread_pct
+    return base
+
+
+class TestSpreadNormal:
+    def test_passes_when_both_none(self):
+        ok, reason = _spread_normal(_ctx_spread(None, None))
+        assert ok is True
+        assert "baseline" in reason.lower()
+
+    def test_passes_when_current_none(self):
+        ok, _ = _spread_normal(_ctx_spread(None, 0.0005))
+        assert ok is True
+
+    def test_passes_when_median_none(self):
+        ok, _ = _spread_normal(_ctx_spread(0.001, None))
+        assert ok is True
+
+    def test_passes_when_median_zero(self):
+        ok, _ = _spread_normal(_ctx_spread(0.001, 0.0))
+        assert ok is True
+
+    def test_passes_when_spread_at_exactly_max_mult(self):
+        # current = SPREAD_MAX_MULT × median → mult == SPREAD_MAX_MULT → NOT > → passes
+        median = 0.001
+        current = median * SPREAD_MAX_MULT
+        ok, _ = _spread_normal(_ctx_spread(current, median))
+        assert ok is True
+
+    def test_passes_when_spread_well_within_normal(self):
+        ok, reason = _spread_normal(_ctx_spread(0.0008, 0.001))
+        assert ok is True
+        assert "spread" in reason.lower()
+
+    def test_fails_when_spread_just_above_max_mult(self):
+        median = 0.001
+        current = median * (SPREAD_MAX_MULT + 0.001)
+        ok, reason = _spread_normal(_ctx_spread(current, median))
+        assert ok is False
+        assert "spread" in reason.lower()
+
+    def test_fails_when_spread_massively_wide(self):
+        ok, reason = _spread_normal(_ctx_spread(0.05, 0.001))
+        assert ok is False
+        assert "×" in reason or "median" in reason.lower()
+
+    def test_reason_contains_spread_percentage(self):
+        _, reason = _spread_normal(_ctx_spread(0.002, 0.001))
+        assert "%" in reason
+
+    def test_reason_contains_multiplier(self):
+        # 0.003 / 0.001 = 3.0× → above SPREAD_MAX_MULT (1.5)
+        _, reason = _spread_normal(_ctx_spread(0.003, 0.001))
+        assert "×" in reason or "x" in reason.lower()
+
+    def test_passes_when_spread_slightly_below_mult(self):
+        median = 0.001
+        current = median * (SPREAD_MAX_MULT - 0.01)
+        ok, _ = _spread_normal(_ctx_spread(current, median))
+        assert ok is True
+
+    def test_long_checklist_includes_spread_normal_as_hard(self):
+        cl = build_long_checklist()
+        names_and_kinds = {c.name: c.kind for c in cl.checks}
+        assert "spread_normal" in names_and_kinds
+        assert names_and_kinds["spread_normal"] == "hard"
+
+    def test_short_checklist_includes_spread_normal_as_hard(self):
+        cl = build_short_checklist()
+        names_and_kinds = {c.name: c.kind for c in cl.checks}
+        assert "spread_normal" in names_and_kinds
+        assert names_and_kinds["spread_normal"] == "hard"
+
+    def test_wide_spread_vetoes_full_long_checklist(self):
+        cl = build_long_checklist()
+        ctx = _ctx()
+        ctx.current_spread_pct = 0.01    # 1% current
+        ctx.median_spread_pct  = 0.001   # 0.1% median → 10× — way above 1.5×
+        result = cl.run(ctx)
+        assert result.passed is False
+        assert "spread_normal" in result.failed_hard
+
+    def test_normal_spread_does_not_veto_long_checklist(self):
+        cl = build_long_checklist()
+        ctx = _ctx()
+        ctx.current_spread_pct = 0.001
+        ctx.median_spread_pct  = 0.001   # 1.0× — within limit
+        result = cl.run(ctx)
+        assert "spread_normal" not in result.failed_hard
+
+
+# ── Hard check: vpin_safe ─────────────────────────────────────────────────────
+
+def _ctx_vpin(
+    vpin: Optional[float],
+    vpin_threshold: float = 0.55,
+) -> CheckContext:
+    """Build a CheckContext with VPIN fields set; everything else passes."""
+    base = _ctx()
+    base.vpin = vpin
+    base.vpin_threshold = vpin_threshold
+    return base
+
+
+class TestVpinSafe:
+    def test_passes_when_vpin_none(self):
+        ok, reason = _vpin_safe(_ctx_vpin(None))
+        assert ok is True
+        assert "no vpin" in reason.lower()
+
+    def test_passes_when_vpin_well_below_threshold(self):
+        ok, reason = _vpin_safe(_ctx_vpin(0.3, vpin_threshold=0.55))
+        assert ok is True
+        assert "vpin" in reason.lower()
+
+    def test_passes_when_vpin_at_exactly_threshold(self):
+        # vpin == threshold → NOT > → passes
+        ok, _ = _vpin_safe(_ctx_vpin(0.55, vpin_threshold=0.55))
+        assert ok is True
+
+    def test_fails_when_vpin_just_above_threshold(self):
+        ok, reason = _vpin_safe(_ctx_vpin(0.551, vpin_threshold=0.55))
+        assert ok is False
+        assert "toxic" in reason.lower()
+
+    def test_fails_when_vpin_clearly_toxic(self):
+        ok, reason = _vpin_safe(_ctx_vpin(0.9, vpin_threshold=0.55))
+        assert ok is False
+        assert "0.90" in reason or "0.9" in reason
+
+    def test_reason_contains_vpin_value_when_passing(self):
+        _, reason = _vpin_safe(_ctx_vpin(0.4, vpin_threshold=0.55))
+        assert "0.40" in reason or "0.4" in reason
+
+    def test_reason_contains_threshold_when_failing(self):
+        _, reason = _vpin_safe(_ctx_vpin(0.7, vpin_threshold=0.55))
+        assert "0.55" in reason
+
+    def test_custom_threshold_respected(self):
+        ok, _ = _vpin_safe(_ctx_vpin(0.6, vpin_threshold=0.70))
+        assert ok is True  # 0.6 <= 0.70
+
+    def test_custom_threshold_blocks_at_higher_value(self):
+        ok, _ = _vpin_safe(_ctx_vpin(0.75, vpin_threshold=0.70))
+        assert ok is False
+
+    def test_long_checklist_includes_vpin_safe_as_hard(self):
+        cl = build_long_checklist()
+        names_and_kinds = {c.name: c.kind for c in cl.checks}
+        assert "vpin_safe" in names_and_kinds
+        assert names_and_kinds["vpin_safe"] == "hard"
+
+    def test_short_checklist_includes_vpin_safe_as_hard(self):
+        cl = build_short_checklist()
+        names_and_kinds = {c.name: c.kind for c in cl.checks}
+        assert "vpin_safe" in names_and_kinds
+        assert names_and_kinds["vpin_safe"] == "hard"
+
+    def test_toxic_vpin_vetoes_full_long_checklist(self):
+        cl = build_long_checklist()
+        ctx = _ctx()
+        ctx.vpin = 0.9
+        ctx.vpin_threshold = 0.55
+        result = cl.run(ctx)
+        assert result.passed is False
+        assert "vpin_safe" in result.failed_hard
+
+    def test_none_vpin_does_not_veto_long_checklist(self):
+        cl = build_long_checklist()
+        ctx = _ctx()
+        ctx.vpin = None
+        result = cl.run(ctx)
+        assert "vpin_safe" not in result.failed_hard
+
+
+# ── SpreadTracker ─────────────────────────────────────────────────────────────
+
+class TestSpreadTracker:
+    def test_empty_tracker_current_returns_none(self):
+        t = SpreadTracker()
+        assert t.current("BTC/USD") is None
+
+    def test_empty_tracker_median_returns_none(self):
+        t = SpreadTracker()
+        assert t.median("BTC/USD") is None
+
+    def test_push_and_current(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", 0.001)
+        assert t.current("BTC/USD") == pytest.approx(0.001)
+
+    def test_current_returns_last_pushed(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", 0.001)
+        t.push("BTC/USD", 0.002)
+        assert t.current("BTC/USD") == pytest.approx(0.002)
+
+    def test_symbols_are_independent(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", 0.001)
+        t.push("ETH/USD", 0.005)
+        assert t.current("BTC/USD") == pytest.approx(0.001)
+        assert t.current("ETH/USD") == pytest.approx(0.005)
+
+    def test_median_requires_min_samples(self):
+        t = SpreadTracker(maxlen=60)
+        for i in range(9):   # push 9 — below default min_samples=10
+            t.push("BTC/USD", 0.001)
+        assert t.median("BTC/USD") is None
+
+    def test_median_available_at_min_samples(self):
+        t = SpreadTracker(maxlen=60)
+        for _ in range(10):
+            t.push("BTC/USD", 0.001)
+        assert t.median("BTC/USD") == pytest.approx(0.001)
+
+    def test_median_is_correct_for_known_values(self):
+        t = SpreadTracker(maxlen=60)
+        values = [0.001, 0.002, 0.003, 0.004, 0.005,
+                  0.006, 0.007, 0.008, 0.009, 0.010]
+        for v in values:
+            t.push("BTC/USD", v)
+        # median of 10 values: average of 5th and 6th = (0.005+0.006)/2 = 0.0055
+        assert t.median("BTC/USD") == pytest.approx(0.0055)
+
+    def test_maxlen_evicts_oldest(self):
+        t = SpreadTracker(maxlen=5)
+        for _ in range(5):
+            t.push("BTC/USD", 0.001)
+        t.push("BTC/USD", 0.999)   # evicts oldest 0.001
+        assert t.current("BTC/USD") == pytest.approx(0.999)
+
+    def test_push_ignores_none(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", None)
+        assert t.current("BTC/USD") is None
+
+    def test_push_ignores_zero(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", 0.0)
+        assert t.current("BTC/USD") is None
+
+    def test_push_ignores_negative(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", -0.001)
+        assert t.current("BTC/USD") is None
+
+    def test_custom_min_samples(self):
+        t = SpreadTracker()
+        t.push("BTC/USD", 0.001)
+        t.push("BTC/USD", 0.002)
+        # min_samples=2 → median available after 2 pushes
+        assert t.median("BTC/USD", min_samples=2) is not None
+
+    def test_median_unknown_symbol_returns_none(self):
+        t = SpreadTracker()
+        assert t.median("XRP/USD") is None
+
+    def test_current_unknown_symbol_returns_none(self):
+        t = SpreadTracker()
+        assert t.current("XRP/USD") is None
