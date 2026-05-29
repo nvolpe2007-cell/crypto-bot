@@ -88,7 +88,7 @@ def load_recent_trades() -> List[dict]:
 
 # Match lines like: "2026-05-28 03:23:13,675 - ... - INFO - [SKIP BUY] BTC/USD — spread 0.123% = 1.8× median 0.069%"
 _LOG_LINE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(?:,\d+)?\s.*?(?P<body>\[(?:SKIP\s\w+|TRIARB|CALIB|FUNNEL)\].*)$"
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(?:,\d+)?\s.*?(?P<body>\[(?:SKIP\s\w+|TRIARB|CALIB|FUNNEL|DUAL-(?:FLIP|REJECT))\].*)$"
 )
 _SKIP_REASON = re.compile(r"\[SKIP\s\w+\][^—-]*[—-]\s*(?P<reason>.+?)(?:\s+\(|$)")
 
@@ -99,9 +99,12 @@ def scan_log_window() -> dict:
     triarb_edges: List[float] = []
     triarb_count = 0
     funnel_seen: Counter = Counter()
+    dual_flip = 0
+    dual_reject = 0
     if not BOT_LOG.exists():
         return {"skips": skips, "triarb_count": 0, "triarb_best_bps": None,
-                "triarb_total_pnl": 0.0, "funnel": funnel_seen}
+                "triarb_total_pnl": 0.0, "funnel": funnel_seen,
+                "dual_flip": 0, "dual_reject": 0}
 
     # bot.log can be hundreds of MB; we walk line-by-line and stop early if a line's
     # parsed timestamp is older than WINDOW_START AFTER having seen at least one
@@ -144,17 +147,25 @@ def scan_log_window() -> dict:
                         triarb_pnl += pnl
             elif body.startswith("[FUNNEL]"):
                 funnel_seen[body[:80]] += 1
+            elif body.startswith("[DUAL-FLIP]"):
+                dual_flip += 1
+            elif body.startswith("[DUAL-REJECT]"):
+                dual_reject += 1
     return {
         "skips": skips,
         "triarb_count": triarb_count,
         "triarb_best_bps": max(triarb_edges) if triarb_edges else None,
         "triarb_total_pnl": triarb_pnl,
         "funnel": funnel_seen,
+        "dual_flip": dual_flip,
+        "dual_reject": dual_reject,
     }
 
 
 def _bucket_skip(reason: str) -> str:
     r = reason.lower()
+    if "noisy tape" in r or "both directions pass" in r: return "dual_noisy"
+    if "no retail shorting" in r: return "spot_short_blocked"
     if "vpin" in r:       return "vpin_safe"
     if "spread" in r:     return "spread_normal"
     if "atr/px" in r or "atr_alive" in r: return "atr_alive"
@@ -221,6 +232,21 @@ def calibration_status(trades: List[dict]) -> dict:
     out["brier_cal"]      = float(((cal_arr - won_arr) ** 2).mean())
     out["brier_lift_pct"] = round((1 - out["brier_cal"] / out["brier_raw"]) * 100, 1) if out["brier_raw"] else None
     out["resolved_in_window"] = len(raw_probs)
+    # Degenerate-fit detection: when all observed outcomes are the same value
+    # (all losers or all winners), Brier improvement is trivially achievable by
+    # collapsing every prediction to that value. The calibrator has learned
+    # "predict X always" — not a real edge. Flag so the recs engine doesn't
+    # treat the +99% Brier headline as a green light to tighten.
+    win_rate_in_window = float(won_arr.mean())
+    out["win_rate_in_window"] = round(win_rate_in_window, 3)
+    cal_mean = float(cal_arr.mean())
+    cal_std  = float(cal_arr.std())
+    out["calibrator_degenerate"] = (
+        # Outcomes are all one-sided
+        (win_rate_in_window <= 0.05 or win_rate_in_window >= 0.95)
+        # AND the calibrator collapses inputs to a near-constant
+        and cal_std < 0.05
+    )
     return out
 
 
@@ -289,14 +315,25 @@ def recommendations(trades: List[dict], log_stats: dict, calib: dict, kraken: di
 
     # 3. Calibration
     if calib.get("active"):
-        lift = calib.get("brier_lift_pct")
-        if lift is not None:
-            if lift > 5:
-                recs.append(f"✅ Calibration helping: Brier improved {lift:+.1f}% vs raw. Safe to tighten `PROB_GATE_MIN_P` toward 0.70.")
-            elif lift < -2:
-                recs.append(f"⚠️ Calibration *hurting*: Brier {lift:+.1f}% worse than raw. The gate may be overfit to old trades — consider deleting `logs/calibration.json` so it refits on fresh data.")
-            else:
-                recs.append(f"Calibration in noise band ({lift:+.1f}% Brier change). Keep accumulating trades before tuning.")
+        if calib.get("calibrator_degenerate"):
+            wr = calib.get("win_rate_in_window", 0.0)
+            recs.append(
+                f"⚠️ Calibration is DEGENERATE — fit on one-sided outcomes "
+                f"(win_rate_in_window={wr*100:.0f}%). It now predicts ~constant for all inputs, "
+                f"which means the gate will reject everything regardless of setup quality. "
+                f"Do NOT tighten `PROB_GATE_MIN_P` based on the Brier number. "
+                f"Once fresh post-gate trades accumulate ≥40 resolved with mixed outcomes, "
+                f"delete `logs/calibration.json` to force a refit."
+            )
+        else:
+            lift = calib.get("brier_lift_pct")
+            if lift is not None:
+                if lift > 5:
+                    recs.append(f"✅ Calibration helping: Brier improved {lift:+.1f}% vs raw. Safe to tighten `PROB_GATE_MIN_P` toward 0.70.")
+                elif lift < -2:
+                    recs.append(f"⚠️ Calibration *hurting*: Brier {lift:+.1f}% worse than raw. The gate may be overfit to old trades — consider deleting `logs/calibration.json` so it refits on fresh data.")
+                else:
+                    recs.append(f"Calibration in noise band ({lift:+.1f}% Brier change). Keep accumulating trades before tuning.")
     else:
         recs.append(f"Calibration not active (n_fit={calib.get('n_fit', 0)}). Needs ~40 resolved trades; gate currently runs on RAW stacked probability.")
 
@@ -362,6 +399,12 @@ def render_report(trades: List[dict], log_stats: dict, calib: dict, kraken: dict
     lines.append(f"\n<b>3. Triangular arb</b>: {log_stats['triarb_count']} opps | "
                  f"best {(log_stats['triarb_best_bps'] or 0):+.1f}bps | "
                  f"paper P&amp;L ${log_stats['triarb_total_pnl']:+.4f}")
+
+    # 3b. Dual-direction probe activity
+    df = log_stats.get("dual_flip", 0)
+    dr = log_stats.get("dual_reject", 0)
+    if df or dr:
+        lines.append(f"\n<b>3b. Dual-direction probe</b>: {df} signal flips | {dr} noisy-tape rejects")
 
     # 4. Calibration
     if calib.get("active"):

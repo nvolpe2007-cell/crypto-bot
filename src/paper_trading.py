@@ -1642,6 +1642,59 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 # ── Entry: minimum confidence gate ─────────────────────────────
                 min_conf = _adapt['min_confidence']
 
+                # ── Dual-direction probe ───────────────────────────────────────
+                # The signal generator picks ONE direction per tick based on
+                # indicator alignment. Some setups have edges on both sides; the
+                # generator may pick the weaker one. Here we re-evaluate the
+                # OPPOSITE direction through the same prob gate. Three outcomes:
+                #   - opposite leads by ≥ DUAL_MARGIN  → flip the signal
+                #   - both within margin              → reject both (noisy tape)
+                #   - original leads or single-sided  → leave unchanged
+                # Cost: one extra prob_gate.evaluate call per tradeable tick.
+                if (prob_gate and pos is None and (sig.is_buy or sig.is_sell)
+                        and os.getenv("DUAL_DIRECTION_ENABLED", "1") == "1"):
+                    _dual_margin = float(os.getenv("DUAL_DIRECTION_MARGIN", "0.05"))
+                    _orig_buy = bool(sig.is_buy)
+                    try:
+                        _orig = prob_gate.evaluate(
+                            sig, is_buy=_orig_buy, entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=_orig_buy),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        _opp = prob_gate.evaluate(
+                            sig, is_buy=(not _orig_buy), entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=(not _orig_buy)),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        _delta = _opp.calibrated_p - _orig.calibrated_p
+                        if _delta > _dual_margin and not _opp.rejected:
+                            logger.info(
+                                f"[DUAL-FLIP] {symbol} "
+                                f"{'BUY' if _orig_buy else 'SELL'}→"
+                                f"{'SELL' if _orig_buy else 'BUY'} "
+                                f"orig P={_orig.calibrated_p:.2f} opp P={_opp.calibrated_p:.2f}"
+                            )
+                            sig.is_buy  = (not _orig_buy)
+                            sig.is_sell = _orig_buy
+                        elif (not _orig.rejected and not _opp.rejected
+                              and abs(_delta) <= _dual_margin):
+                            # Both directions clear the gate within margin →
+                            # contradictory edges → reject the whole bar.
+                            logger.info(
+                                f"[DUAL-REJECT] {symbol} both directions pass within "
+                                f"±{_dual_margin:.2f} (long P={_orig.calibrated_p if _orig_buy else _opp.calibrated_p:.2f}, "
+                                f"short P={_opp.calibrated_p if _orig_buy else _orig.calibrated_p:.2f}) — noisy tape"
+                            )
+                            funnel.bump('skip:dual_noisy')
+                            sig.is_buy = False
+                            sig.is_sell = False
+                    except Exception as _e:
+                        logger.debug(f"[DUAL] probe failed for {symbol}: {_e}")
+
                 # ── LONG ENTRY ──────────────────────────────────────────────────
                 if sig.is_buy and pos is None:
                     try:
