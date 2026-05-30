@@ -54,6 +54,14 @@ MIN_SAMPLES   = int(os.getenv('CALIB_MIN_SAMPLES', '40'))    # below this → in
 FULL_TRUST_N  = int(os.getenv('CALIB_FULL_TRUST_N', '200'))  # n at which shrink → 1.0
 REFIT_EVERY   = int(os.getenv('CALIB_REFIT_EVERY', '25'))    # refit after this many new records
 
+# Only calibrate on records whose probability-model version is at least this.
+# The gate's combiner changed (noisy-OR → log-odds, probability_gate.PROB_MODEL_VERSION),
+# so legacy v0/v1 prob_win values come from a different distribution and would
+# poison the fit (e.g. the May-2026 audit's 228 trades clustered prob_win ~0.80
+# at a 0.9% win rate → would map everything to reject-all and freeze the gate).
+# Keep this in lock-step with PROB_MODEL_VERSION.
+MIN_MODEL_VERSION = int(os.getenv('CALIB_MIN_MODEL_VERSION', '2'))
+
 # Output is clipped to the same band the gate's _stack() uses, so calibration
 # can never produce a probability the rest of the system treats as impossible.
 _P_FLOOR = 0.50
@@ -240,9 +248,19 @@ class ProbabilityCalibrator:
         return report
 
     def fit_from_journal(self, journal) -> CalibrationReport:
+        # Exclude records from older probability-model versions — their prob_win
+        # is out-of-distribution and would poison the isotonic fit.
+        records = getattr(journal, 'records', [])
         samples = [(float(getattr(r, 'prob_win', 0.0) or 0.0), bool(getattr(r, 'won', False)))
-                   for r in getattr(journal, 'records', [])]
-        return self.fit(samples)
+                   for r in records
+                   if int(getattr(r, 'prob_model_version', 0)) >= MIN_MODEL_VERSION]
+        report = self.fit(samples)
+        # maybe_refit() gates on TOTAL journal growth, so _n_seen must track the
+        # full record count — not the (version-filtered) usable sample count, or a
+        # large pool of excluded legacy records would trigger a refit every loop.
+        self._n_seen = len(records)
+        self.save()
+        return report
 
     def maybe_refit(self, journal) -> bool:
         """Refit only when the journal has grown by >= refit_every since last attempt.

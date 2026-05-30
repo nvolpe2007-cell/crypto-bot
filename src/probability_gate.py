@@ -51,6 +51,13 @@ KELLY_REF = float(os.getenv("PROB_GATE_KELLY_REF", "0.10"))
 # Master switch
 ENABLED = os.getenv("PROB_GATE_ENABLED", "1") == "1"
 
+# Probability-model version. Bump whenever the combiner math changes enough that
+# old journaled `prob_win` values are no longer comparable — the calibrator keys
+# off this so a combiner change can't poison its fit with stale-distribution data.
+#   v1 = noisy-OR _stack  (pre-2026-05-30; prob_win clustered ~0.80)
+#   v2 = log-odds _stack  (2026-05-30; honest, lower, rank-informative)
+PROB_MODEL_VERSION = 2
+
 # ── Conviction tiers (size in USD, intended hold) ─────────────────────────
 #   Tier is selected by combined P(win) and number of edges present.
 #   Sizes are concrete dollar amounts (per user preference), capped at MAX.

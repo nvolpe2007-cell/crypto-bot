@@ -92,6 +92,8 @@ class TradeRecord:
     # Probability gate output (stacked-edge reasoning)
     prob_win:           float = 0.0   # P(win) at entry
     edges_used:         str   = ''    # comma-joined edge names that were present
+    prob_model_version: int   = 0     # combiner version (see probability_gate.PROB_MODEL_VERSION);
+                                       # 0 = legacy noisy-OR records, excluded from calibration
 
     def to_dict(self):
         return asdict(self)
@@ -142,6 +144,7 @@ class TradeJournal:
         'ema_fast': 0.0, 'ema_slow': 0.0, 'atr_at_entry': 0.0,
         'sentiment_fng': None, 'sentiment_btc_dom': None,
         'r_multiple': 0.0, 'fees_pct_of_pnl': 0.0,
+        'prob_win': 0.0, 'edges_used': '', 'prob_model_version': 0,
     }
 
     def _load(self):

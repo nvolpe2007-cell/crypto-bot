@@ -44,7 +44,8 @@ from .state import write_state, read_state
 from .ml_scorer import MLScorer
 from .multi_timeframe import MultiTimeframeFilter
 from .mean_reversion_strategy import MeanReversionStrategy, MRSignal
-from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED
+from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED, PROB_MODEL_VERSION
+from .expectancy_gate import ExpectancyGate
 from .macro_data import MacroDataProvider, alt_beta
 from .daily_circuit import DailyCircuitBreaker
 from .trailing_stop import update_trailing_stop
@@ -303,6 +304,7 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
         # Probability gate
         prob_win           = round(float(getattr(pos, 'prob_win', 0.0)), 4) if pos else 0.0,
         edges_used         = ",".join(getattr(pos, 'edges_used', []) or []) if pos else '',
+        prob_model_version = int(getattr(pos, 'prob_model_version', 0)) if pos else 0,
     )
     journal.add(record)
     return record
@@ -776,6 +778,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             logger.warning(f"[CALIB] disabled ({e}); gate will use raw stacked P")
             calibrator = None
     prob_gate   = ProbabilityGate(calibrator=calibrator) if PROB_GATE_ENABLED else None
+    # Expectancy gate: caps each entry path to a small probe size until it proves
+    # positive GROSS expectancy over a meaningful sample. See [[directional_cost_bleed_fix]].
+    expectancy_gate = ExpectancyGate()
+    expectancy_gate.update(journal, force=True)
+    logger.info(f"[EXPECTANCY] {expectancy_gate.status()}")
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
     spread_tracker  = SpreadTracker()
@@ -1812,6 +1819,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     elif _corr_blocked_long and reasoning and reasoning.is_macro_driven:
                         logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven long, allowing concurrent")
 
+                    # Expectancy gate: cap size until this path proves positive gross expectancy
+                    _exp_cap = expectancy_gate.cap_for(_entry_path_tag)
+                    if _exp_cap is not None and size_usd > _exp_cap:
+                        logger.info(f"[EXPECTANCY] {symbol} {_entry_path_tag} unproven → "
+                                    f"size ${size_usd:.2f}→${_exp_cap:.2f} (probe)")
+                        size_usd = _exp_cap
+                        if size_usd < 1.50:
+                            funnel.bump('skip:size')
+                            continue
+
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
                     if position:
@@ -1825,6 +1842,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             position.intended_hold_min = reasoning.hold_minutes
                             position.trail_style = reasoning.trail_style
                             position.target_usd_at_entry = reasoning.target_usd
+                            position.prob_model_version = PROB_MODEL_VERSION
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
                             if reasoning:
@@ -1925,6 +1943,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     elif _corr_blocked_short and reasoning and reasoning.is_macro_driven:
                         logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven short, allowing concurrent")
 
+                    # Expectancy gate: cap size until this path proves positive gross expectancy
+                    _exp_cap = expectancy_gate.cap_for(_entry_path_tag)
+                    if _exp_cap is not None and size_usd > _exp_cap:
+                        logger.info(f"[EXPECTANCY] {symbol} {_entry_path_tag} unproven → "
+                                    f"size ${size_usd:.2f}→${_exp_cap:.2f} (probe)")
+                        size_usd = _exp_cap
+                        if size_usd < 1.50:
+                            funnel.bump('skip:size')
+                            continue
+
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
                     if position:
@@ -1937,6 +1965,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             position.intended_hold_min = reasoning.hold_minutes
                             position.trail_style = reasoning.trail_style
                             position.target_usd_at_entry = reasoning.target_usd
+                            position.prob_model_version = PROB_MODEL_VERSION
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
                             if reasoning:
@@ -2058,6 +2087,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
                 funnel.reset()
+                # Refresh expectancy-gate stats (growth-gated → cheap until trades close)
+                if expectancy_gate.update(journal):
+                    logger.info(f"[EXPECTANCY] {expectancy_gate.status()}")
                 # Persist open positions so a crash/restart can resume
                 _save_open_positions(trader)
 
