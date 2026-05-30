@@ -1444,6 +1444,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                         spread_tracker.push(symbol, spread_abs / mid)
                             except Exception as e:
                                 logger.debug(f"[OFI] spread parse failed for {symbol}: {e}")
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[TICK] Exchange circuit breaker open during book fetch "
+                        f"— skipping remaining symbols, sleeping {wait:.0f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    break  # skip remaining symbols this tick; circuit may half-open by next tick
                 except Exception as e:
                     logger.debug(f"[OFI] order book fetch failed for {symbol}: {e}")
 
@@ -2188,6 +2196,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
         except asyncio.CancelledError:
             break
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.warning(
+                f"[LOOP] Exchange circuit breaker open — pausing main loop {wait:.0f}s "
+                f"({e})"
+            )
+            await asyncio.sleep(wait)
         except Exception as e:
             logger.error(f"Error in paper trading loop: {e}", exc_info=True)
             await asyncio.sleep(5)

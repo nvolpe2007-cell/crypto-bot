@@ -616,6 +616,99 @@ class TestCircuitBreakerOpenException:
         assert isinstance(exc, Exception)
 
 
+# ── CircuitBreaker cooldown escalation ────────────────────────────────────────
+
+class TestCircuitBreakerCooldownEscalation:
+    """The circuit escalates cooldown on successive trips: ×1, ×2, ×5."""
+
+    def test_first_trip_uses_base_cooldown(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        cb.record_failure()
+        assert cb.is_open
+        try:
+            cb.check()
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds > 55.0  # close to 60s (×1)
+            assert exc.remaining_seconds <= 60.0
+
+    def test_second_trip_doubles_cooldown(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        # First trip
+        cb.record_failure()
+        cb.record_success()  # reset and count consecutive_opens
+
+        # Actually, record_success resets consecutive_opens too. Let's use the
+        # internal escalation by directly tripping twice.
+        cb2 = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        cb2.record_failure()                       # trip 1 → ×1 → 60s
+        # expire the cooldown so we can trip again
+        cb2._open_until = time.monotonic() - 1    # force half-open
+        cb2._open_until = None                     # make check() not raise
+        cb2._failures = 0                          # allow threshold to trip again
+        cb2.record_failure()                       # trip 2 → ×2 → 120s
+        try:
+            cb2.check()
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds > 115.0  # close to 120s (×2)
+            assert exc.remaining_seconds <= 120.0
+
+    def test_third_trip_uses_5x_multiplier(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        for _ in range(2):
+            cb.record_failure()
+            cb._open_until = None
+            cb._failures = 0
+        cb.record_failure()                        # trip 3 → ×5 → 300s
+        try:
+            cb.check()
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds > 295.0  # close to 300s (×5)
+            assert exc.remaining_seconds <= 300.0
+
+    def test_fourth_and_beyond_capped_at_5x(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        for _ in range(3):
+            cb.record_failure()
+            cb._open_until = None
+            cb._failures = 0
+        cb.record_failure()                        # trip 4 → still ×5 → 300s
+        try:
+            cb.check()
+        except CircuitBreakerOpen as exc:
+            assert exc.remaining_seconds > 295.0
+            assert exc.remaining_seconds <= 300.0
+
+    def test_consecutive_open_count_increments_each_trip(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        assert cb.consecutive_open_count == 0
+        cb.record_failure()
+        assert cb.consecutive_open_count == 1
+        cb._open_until = None
+        cb._failures = 0
+        cb.record_failure()
+        assert cb.consecutive_open_count == 2
+
+    def test_record_success_resets_consecutive_open_count(self):
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        cb.record_failure()
+        assert cb.consecutive_open_count == 1
+        cb.record_success()
+        assert cb.consecutive_open_count == 0
+
+    def test_remaining_seconds_positive_when_circuit_open(self):
+        """The paper trading loop uses remaining_seconds to sleep — must be > 0."""
+        cb = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        cb.record_failure()
+        try:
+            cb.check()
+            pytest.fail("CircuitBreakerOpen not raised")
+        except CircuitBreakerOpen as exc:
+            # Simulate what the paper trading loop does:
+            wait = exc.remaining_seconds if exc.remaining_seconds > 0 else 60.0
+            assert wait > 0, "wait must always be positive so the loop sleeps properly"
+            assert wait <= 300.0, "wait should not exceed the max escalated cooldown"
+
+
 # ── _retry circuit-breaker integration ───────────────────────────────────────
 
 def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> ExchangeConnection:
