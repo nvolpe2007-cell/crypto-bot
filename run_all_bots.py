@@ -41,6 +41,7 @@ sys.path.insert(0, str(str(Path(__file__).parent / "arbitrage")))
 
 from src.bot import ScalpingBot
 from src.dashboard import run_dashboard
+from src.notifications import create_notifier_from_env
 from arbitrage.dex_arb import DEXArbitrageBot, Chain
 from arbitrage.stablecoin_arb import StablecoinArbBot
 # NOTE: funding-rate arb runs inside the paper_trading session (two cost-aware
@@ -59,6 +60,50 @@ class MasterBotRunner:
         self.dex_arb_bot = None
         self.stablecoin_arb_bot = None
 
+    async def _check_critical_tasks(
+        self,
+        critical_tasks: list,
+        notifier,
+    ) -> None:
+        """Check each critical task for unexpected exit.
+
+        If a task crashed (stored exception), sends a Telegram alert then
+        re-raises as RuntimeError so asyncio.run() propagates it to the OS.
+        systemd's Restart=on-failure then restarts the whole service.
+
+        If a long-running task returned cleanly (shouldn't happen), logs a
+        warning and notifies but does NOT raise — that may be intentional
+        during shutdown.
+        """
+        for name, task in critical_tasks:
+            if not task.done():
+                continue
+            if task.cancelled():
+                logger.warning("[Runner] Task '%s' was cancelled", name)
+                continue
+            exc = task.exception()
+            if exc is not None:
+                msg = (
+                    f"⛔ Bot task '{name}' died: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                logger.critical(msg, exc_info=exc)
+                try:
+                    await notifier.send(msg)
+                except Exception:
+                    pass
+                raise RuntimeError(msg) from exc
+            # Unexpected clean exit from a long-running task
+            msg = (
+                f"⚠️ Bot task '{name}' exited without error — "
+                "this is unexpected for a long-running bot."
+            )
+            logger.warning(msg)
+            try:
+                await notifier.send(msg)
+            except Exception:
+                pass
+
     async def start(self):
         """Start all bots"""
         self.running = True
@@ -72,11 +117,18 @@ class MasterBotRunner:
         except NotImplementedError:
             pass  # Windows: handled by KeyboardInterrupt in main()
 
+        notifier = create_notifier_from_env()
+
+        # Critical tasks are monitored every 30 s — if one dies the process
+        # crashes so systemd can restart it cleanly.
+        _critical_tasks: list = []
+
         # Start scalping bot (mode from config.yaml: paper or live)
         if self.config.get("scalping", {}).get("enabled", True):
             logger.info("Starting scalping bot...")
             self.scalping_bot = ScalpingBot(self.config)
-            asyncio.create_task(self.scalping_bot.start())
+            t = asyncio.create_task(self.scalping_bot.start(), name="scalping_bot")
+            _critical_tasks.append(("scalping_bot", t))
 
         # Start DEX arb
         if self.config.get("dex_arb", {}).get("enabled", True):
@@ -113,7 +165,6 @@ class MasterBotRunner:
             logger.info("Starting altperp strategy (paper, AI gate-keeper=%s)...",
                         "on" if ai_on else "off")
             from src.altperp.runner import run as altperp_run
-            from src.notifications import create_notifier_from_env
             altperp_notifier = create_notifier_from_env()
             asyncio.create_task(altperp_run(notifier=altperp_notifier))
 
@@ -122,9 +173,10 @@ class MasterBotRunner:
         # Start dashboard server alongside bots
         asyncio.create_task(run_dashboard(host="0.0.0.0", port=8080))
 
-        # Keep running
+        # Keep running; check critical task health every 30 s.
         while self.running:
-            await asyncio.sleep(1)
+            await asyncio.sleep(30)
+            await self._check_critical_tasks(_critical_tasks, notifier)
 
     async def shutdown(self):
         """Gracefully shutdown all bots"""
