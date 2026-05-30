@@ -30,6 +30,7 @@ from src.entry_checklist import (
     _kill_filter, _regime_short_block, _rsi_healthy, _adx_strong,
     _volume_strong, _atr_alive, _lead_lag_aligned, _funding_favorable,
     _spread_normal, _vpin_safe, SpreadTracker, SPREAD_MAX_MULT,
+    _ATR_ALIVE_FLOOR,
 )
 
 
@@ -327,15 +328,17 @@ class TestAtrAlive:
         ok, _ = _atr_alive(_ctx(sig=_Sig(atr=1.0, close=100.0)))
         assert ok is True
 
-    def test_fails_when_atr_too_small(self):
-        # atr=0.04, close=100 → ratio=0.0004 = 0.04% < 0.05%
-        ok, reason = _atr_alive(_ctx(sig=_Sig(atr=0.04, close=100.0)))
+    def test_fails_below_cost_floor(self):
+        # Just under the cost-aware floor → refused as structurally negative-EV.
+        atr = (_ATR_ALIVE_FLOOR * 0.5) * 100.0   # ratio = 0.5 × floor, on close=100
+        ok, reason = _atr_alive(_ctx(sig=_Sig(atr=atr, close=100.0)))
         assert ok is False
         assert "atr" in reason.lower()
 
     def test_passes_at_exact_boundary(self):
-        # atr=0.05, close=100 → ratio=0.0005 = 0.05% ≥ 0.05%
-        ok, _ = _atr_alive(_ctx(sig=_Sig(atr=0.05, close=100.0)))
+        # ratio exactly at the cost-aware floor → passes (≥ comparison).
+        atr = _ATR_ALIVE_FLOOR * 100.0   # ratio == floor, on close=100
+        ok, _ = _atr_alive(_ctx(sig=_Sig(atr=atr, close=100.0)))
         assert ok is True
 
     def test_passes_when_atr_none(self):

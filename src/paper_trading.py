@@ -23,7 +23,10 @@ import pandas_ta as _pta
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
-from .microstructure_strategy import MicrostructureStrategy, MicrostructureSignal
+from .microstructure_strategy import (
+    MicrostructureStrategy, MicrostructureSignal,
+    _ENTRY_GRACE_SECS as _MICRO_ENTRY_GRACE_SECS,
+)
 from .exchange import ExchangeConnection, CircuitBreakerOpen
 from .backtester import Trade
 from .notifications import TelegramNotifier
@@ -1005,12 +1008,19 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
                     close_fn = trader.execute_sell
 
+                # Post-entry grace: a fresh taker entry sits ~spread underwater,
+                # so suppress the fixed stop for the first few seconds to avoid
+                # the ~2s noise flush seen in the journal audit. Trailing stop and
+                # take-profit are unaffected.
+                entry_dt = pos.entry_time if isinstance(pos.entry_time, datetime) else now
+                secs_open = (now - entry_dt).total_seconds()
+
                 exit_reason = None
                 # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
                 trail_reason = update_trailing_stop(pos, price)
                 if trail_reason:
                     exit_reason = trail_reason
-                elif pnl_pct / 100 <= -sl_pct:
+                elif pnl_pct / 100 <= -sl_pct and secs_open >= _MICRO_ENTRY_GRACE_SECS:
                     exit_reason = 'STOP_LOSS'
                 elif pnl_pct / 100 >= tp_pct:
                     # All tiers honor fixed TP — was previously gated to atr_stop only;

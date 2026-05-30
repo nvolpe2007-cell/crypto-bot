@@ -23,6 +23,7 @@ Telegram.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -127,18 +128,34 @@ def _classify_tier(combined_p: float, n_edges: int) -> tuple:
 
 
 def _stack(probs: List[float]) -> float:
-    """P_total = 1 - ∏(1 - p_i). Clipped to [0, 0.97]."""
+    """Combine independent edge priors into one win probability via LOG-ODDS
+    (naive-Bayes), NOT noisy-OR.
+
+    Previously this used P = 1 - ∏(1 - p_i), the noisy-OR formula for the
+    probability that *at least one of several independent causes* fires. That is
+    the wrong model for combining noisy *predictors of a single binary outcome*:
+    it can only push probability up, saturates toward the 0.97 cap with even a
+    few weak edges (three 0.53 edges → 0.90), and throws away rank information
+    the calibrator needs. Journal audit confirmed the symptom — prob_win clustered
+    at ~0.80 while the realized win rate was 0.9%.
+
+    Log-odds is the correct combiner for conditionally-independent evidence:
+        logit(P) = Σ logit(p_i)        (since logit(0.5) = 0, neutral edges add 0)
+    Two 0.56 edges → P≈0.62; three 0.53 edges → P≈0.59 — honest, and monotonic in
+    edge strength rather than saturating on edge count. Edges remain heavily
+    correlated (all derived from recent price/volume), so this still mildly
+    overcounts; the downstream isotonic calibrator now has real spread to correct.
+
+    Per-edge p clamped to [0.5, 0.95]; result clipped to [0.5, 0.97].
+    """
     if not probs:
         return 0.5
-    failure = 1.0
+    total_logit = 0.0
     for p in probs:
-        # Only edges with positive lift over coinflip contribute
         p_eff = max(0.5, min(0.95, p))
-        failure *= (1.0 - p_eff)
-    # Re-anchor to 0.5 baseline: convert back so a single 0.5 edge = 0.5
-    # We want stacking to *raise* P above the strongest single edge
-    p_total = 1.0 - failure
-    return min(0.97, p_total)
+        total_logit += math.log(p_eff / (1.0 - p_eff))
+    p_total = 1.0 / (1.0 + math.exp(-total_logit))
+    return max(0.5, min(0.97, p_total))
 
 
 def _kelly(p_win: float, rr: float) -> float:

@@ -110,10 +110,23 @@ class TestStack:
         assert result >= MIN_PROBABILITY
 
     def test_math_formula(self):
-        """P = 1 - ∏(1 - p_eff), with p_eff clamped to [0.5, 0.95]."""
+        """Log-odds (naive-Bayes) combine: logit(P) = Σ logit(p_eff),
+        with p_eff clamped to [0.5, 0.95]."""
+        import math
         probs = [0.62, 0.58]
-        expected = 1.0 - (1.0 - 0.62) * (1.0 - 0.58)
+        total_logit = sum(math.log(p / (1.0 - p)) for p in probs)
+        expected = 1.0 / (1.0 + math.exp(-total_logit))
         assert _stack(probs) == pytest.approx(expected)
+
+    def test_log_odds_is_more_conservative_than_noisy_or(self):
+        """Regression guard: the new combiner must NOT saturate the way noisy-OR
+        did. Three barely-above-coinflip edges should stay well under the old
+        0.90 noisy-OR result."""
+        probs = [0.53, 0.53, 0.53]
+        result = _stack(probs)
+        noisy_or = 1.0 - (1.0 - 0.53) ** 3   # ≈ 0.896
+        assert result < noisy_or
+        assert result < 0.65   # below the gate's MIN_PROBABILITY
 
 
 # ── _kelly ─────────────────────────────────────────────────────────────────────

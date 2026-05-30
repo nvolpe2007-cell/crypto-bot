@@ -49,6 +49,7 @@ from src.microstructure_strategy import (
     _ROUND_TRIP_COST_FRAC,
     _STOP_COST_MULT,
     _T2_COST_MULT,
+    _ENTRY_GRACE_SECS,
 )
 from src.ofi_v2 import OFIState
 from src.cvd_tracker import CVDState
@@ -243,7 +244,12 @@ class TestCheckExitSignalStop:
 
 
 class TestCheckExitPriceStop:
-    """Price moves 2.5× spread against entry → PRICE_STOP."""
+    """Price moves 2.5× spread against entry → PRICE_STOP, but only AFTER the
+    post-entry grace window (noise stops are suppressed for the first few
+    seconds so an entry-spread reversion can't auto-flush the trade)."""
+
+    # A time_open safely past the grace window so the noise stop is allowed.
+    PAST_GRACE = _ENTRY_GRACE_SECS + 5.0
 
     def test_price_stop_long_falls_too_far(self):
         spread = SPREAD
@@ -253,7 +259,7 @@ class TestCheckExitPriceStop:
         pos = _make_position('buy', entry_price=PRICE, signal=_make_signal('buy', spread=spread))
         bad_price = PRICE - stop_dist - 1.0
         strat = MicrostructureStrategy()
-        reason, etype = strat.check_exit(SYMBOL, pos, bad_price, 0.05, 10.0)
+        reason, etype = strat.check_exit(SYMBOL, pos, bad_price, 0.05, self.PAST_GRACE)
         assert reason == 'PRICE_STOP'
         assert etype == 'FULL'
 
@@ -264,17 +270,38 @@ class TestCheckExitPriceStop:
         pos = _make_position('short', entry_price=PRICE, signal=_make_signal('short', spread=spread))
         bad_price = PRICE + stop_dist + 1.0
         strat = MicrostructureStrategy()
-        reason, etype = strat.check_exit(SYMBOL, pos, bad_price, -0.05, 10.0)
+        reason, etype = strat.check_exit(SYMBOL, pos, bad_price, -0.05, self.PAST_GRACE)
         assert reason == 'PRICE_STOP'
         assert etype == 'FULL'
 
+    def test_price_stop_suppressed_during_grace(self):
+        """Within the grace window, the same adverse move must NOT fire a
+        PRICE_STOP — this is the fix for the ~2s noise-flush churn."""
+        spread = SPREAD
+        stop_dist = max(spread * _STOP_SPREAD_MULT,
+                        PRICE * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
+        pos = _make_position('buy', entry_price=PRICE, signal=_make_signal('buy', spread=spread))
+        bad_price = PRICE - stop_dist - 1.0
+        strat = MicrostructureStrategy()
+        # 2s after entry — exactly the case the journal audit flagged.
+        reason, etype = strat.check_exit(SYMBOL, pos, bad_price, 0.05, 2.0)
+        assert reason != 'PRICE_STOP'
+
+    def test_signal_stop_still_fires_during_grace(self):
+        """A real OFI reversal (SIGNAL_STOP) is NOT graced — it fires immediately."""
+        spread = SPREAD
+        pos = _make_position('buy', entry_price=PRICE, signal=_make_signal('buy', spread=spread))
+        strat = MicrostructureStrategy()
+        # Hard opposing OFI past the signal-stop threshold, 1s after entry.
+        reason, etype = strat.check_exit(SYMBOL, pos, PRICE, _SIG_STOP_THRESH - 0.10, 1.0)
+        assert reason == 'SIGNAL_STOP'
+
     def test_no_price_stop_within_threshold(self):
         spread = SPREAD
-        stop_dist = spread * _STOP_SPREAD_MULT   # = 25
         pos = _make_position('buy', entry_price=PRICE, signal=_make_signal('buy', spread=spread))
-        # Price only dropped 20 — within 25 stop
+        # Price only dropped 20 — within stop distance (and past grace).
         strat = MicrostructureStrategy()
-        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - 20.0, 0.05, 10.0)
+        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - 20.0, 0.05, self.PAST_GRACE)
         assert reason != 'PRICE_STOP'
 
     def test_price_stop_uses_fallback_spread_when_zero(self):
@@ -286,7 +313,7 @@ class TestCheckExitPriceStop:
         fallback_spread = PRICE * 0.0001
         stop_dist = max(fallback_spread * _STOP_SPREAD_MULT,
                         PRICE * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
-        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - stop_dist - 1.0, 0.05, 10.0)
+        reason, etype = strat.check_exit(SYMBOL, pos, PRICE - stop_dist - 1.0, 0.05, self.PAST_GRACE)
         assert reason == 'PRICE_STOP'
 
 

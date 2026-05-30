@@ -19,12 +19,30 @@ losing trade had).
 """
 
 from __future__ import annotations
+import os
 from collections import deque
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional
 
 CheckKind = Literal["hard", "soft"]
+
+# ── Cost-aware volatility floor ──────────────────────────────────────────────
+# Round-trip cost (taker fee + spread + slippage) as a fraction of price.
+# Mirrors microstructure_strategy._ROUND_TRIP_COST_FRAC. A trade whose expected
+# per-bar move (ATR) is below the cost it must overcome cannot reach a
+# profitable target before fees — it is structurally negative-EV.
+_ROUND_TRIP_COST_FRAC = float(os.getenv("ROUND_TRIP_COST_FRAC", "0.003"))  # 0.30%
+
+# atr_alive floor = max(absolute floor, ATR_ALIVE_COST_MULT × round-trip cost).
+# Default 0.5 → ATR must be ≥ 0.15% (half the round-trip cost).
+# Journal audit (228 trades, May 2026) showed median ATR 0.07% and *max* 0.24%
+# — every trade's per-bar range was below the 0.30% cost, MFE median was 0.00%,
+# and the win rate was 0.9%. The old 0.05% floor let all of that churn through.
+# Set ATR_ALIVE_COST_MULT=1.0 to require ATR ≥ full round-trip cost (would have
+# blocked every loser in that sample); 0.0 restores the legacy 0.05% floor.
+_ATR_ALIVE_COST_MULT = float(os.getenv("ATR_ALIVE_COST_MULT", "0.5"))
+_ATR_ALIVE_FLOOR = max(0.0005, _ATR_ALIVE_COST_MULT * _ROUND_TRIP_COST_FRAC)
 
 
 @dataclass
@@ -325,17 +343,19 @@ def _volume_strong(ctx: CheckContext):
 
 
 def _atr_alive(ctx: CheckContext):
-    """Reject dead-volatility setups. AGGRESSIVE: ATR / price must be ≥ 0.05%
-    (was 0.08%). Most 1m crypto bars clear this; only the absolute dead-tape
-    setups get vetoed."""
+    """Reject dead-volatility setups whose expected per-bar move (ATR) is below
+    the round-trip cost. Such trades are structurally negative-EV: the price
+    cannot reach a profitable target before fees, so they bleed out via cost.
+    Floor = max(0.05%, ATR_ALIVE_COST_MULT × round-trip cost) — default 0.15%.
+    See journal audit note on _ATR_ALIVE_FLOOR above."""
     atr = getattr(ctx.sig, "atr", None)
     px  = getattr(ctx.sig, "close", None)
     if not atr or not px:
         return True, "no atr/price"
     ratio = atr / px
-    if ratio >= 0.0005:
+    if ratio >= _ATR_ALIVE_FLOOR:
         return True, f"atr/px={ratio*100:.3f}%"
-    return False, f"atr/px={ratio*100:.3f}%<0.05%"
+    return False, f"atr/px={ratio*100:.3f}%<{_ATR_ALIVE_FLOOR*100:.2f}%"
 
 
 def _lead_lag_aligned(ctx: CheckContext):

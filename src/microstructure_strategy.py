@@ -68,6 +68,16 @@ _T2_COST_MULT         = float(os.getenv('MICRO_T2_COST_MULT',   '2.0'))  # T2 mu
 _STOP_COST_MULT       = float(os.getenv('MICRO_STOP_COST_MULT', '1.2'))  # stop wider than cost band
 _MAX_TARGET_ATR_FRAC  = float(os.getenv('MICRO_MAX_TARGET_ATR', '3.0'))  # skip if needed move > this×ATR
 
+# ── Post-entry grace ──────────────────────────────────────────────────────────
+# Don't let a noise-driven stop (PRICE_STOP / fixed STOP_LOSS) fire in the first
+# few seconds after entry. A taker entry crosses the spread, so the position is
+# marked ~spread underwater the instant it opens; without a grace window a single
+# adverse tick trips the stop and the trade dies in ~2s having paid full cost.
+# Journal audit: 196/228 exits were PRICE_STOP at a 0% win rate with a 2s median
+# hold — pure entry-spread + noise churn. SIGNAL_STOP (a real OFI reversal) and
+# TIME_STOP are NOT graced; only the noise stops are deferred.
+_ENTRY_GRACE_SECS = float(os.getenv('MICRO_ENTRY_GRACE_SECS', '15'))
+
 # Regime size multipliers
 _REGIME_MULT = {
     'TRENDING_UP':    1.0,
@@ -566,12 +576,16 @@ class MicrostructureStrategy:
             return 'SIGNAL_STOP', 'FULL'
 
         # ── 2. Price stop ──────────────────────────────────────────────────────
+        # Suppressed during the post-entry grace window: a fresh taker entry sits
+        # ~spread underwater, so without this a single adverse tick auto-flushes
+        # the trade in seconds. SIGNAL_STOP above (a real OFI reversal) still
+        # fires during grace — only the noise stop is deferred.
         stop_distance = max(spread * _STOP_SPREAD_MULT, entry_px * _ROUND_TRIP_COST_FRAC * _STOP_COST_MULT)
-        if price_delta < -stop_distance:
+        if price_delta < -stop_distance and time_open_seconds >= _ENTRY_GRACE_SECS:
             logger.info(
                 f"[MICRO EXIT] {symbol} PRICE_STOP  "
                 f"delta={price_delta:.4f}  stop={-stop_distance:.4f}  "
-                f"spread={spread:.4f}"
+                f"spread={spread:.4f}  open={time_open_seconds:.0f}s"
             )
             return 'PRICE_STOP', 'FULL'
 
