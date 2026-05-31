@@ -20,11 +20,31 @@ Covers:
 - KrakenPrivateWS.get_balance: default 0.0 for unseen currency
 - KrakenPrivateWS.start: skips _connect when token fetch returns None
   (sleeps 30s); reconnects after _connect() exception; stop() exits
+- KrakenBookFeed._handle: snapshot clears/sets book, updates add levels,
+  zero/negative qty removes levels, unknown symbol ignored, non-book
+  channel ignored, invalid JSON handled, invalid entry fields skipped,
+  _last_update set only for known symbols
+- KrakenBookFeed.get_top: empty before data, bids descending, asks
+  ascending, depth capped, custom depth arg, unknown symbol returns empty,
+  each entry is [price, qty]
+- KrakenBookFeed.staleness: inf before update, inf for unknown, small
+  positive after update
+- KrakenBookFeed.start: reconnects after exception, stop exits loop,
+  sleep called with _RECONNECT_DELAY, no sleep on clean stop
+- KrakenTradeFeed._handle: tick parsed correctly, callback called, no
+  callback is safe, unknown symbol ignored, non-trade channel ignored,
+  invalid JSON handled, callback exception caught, _last_update set,
+  multiple trades in one message, timestamp stored
+- KrakenTradeFeed.staleness: inf before update, inf for unknown, small
+  positive after update
+- KrakenTradeFeed.start: reconnects after exception, stop exits loop,
+  sleep called with _RECONNECT_DELAY, no sleep on clean stop
 """
 
 import asyncio
 import base64
 import json
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
@@ -35,6 +55,9 @@ from src.kraken_ws import (
     _fetch_ws_token,
     KrakenPublicWS,
     KrakenPrivateWS,
+    KrakenBookFeed,
+    KrakenTradeFeed,
+    TradeTick,
     CandleClose,
     Execution,
     _RECONNECT_DELAY,
@@ -626,3 +649,463 @@ class TestKrakenPrivateWSReconnect:
         await ws.start()
         sleep_calls = [c[0][0] for c in sleep_mock.call_args_list]
         assert _RECONNECT_DELAY in sleep_calls
+
+
+# ── KrakenBookFeed._handle ────────────────────────────────────────────────────
+
+class TestKrakenBookFeedHandle:
+    SYMBOL = "BTC/USD"
+
+    def _feed(self) -> KrakenBookFeed:
+        return KrakenBookFeed([self.SYMBOL])
+
+    def _snapshot_msg(self, symbol: str, bids: list, asks: list) -> str:
+        return json.dumps({
+            "channel": "book",
+            "type": "snapshot",
+            "data": [{
+                "symbol": symbol,
+                "bids": [{"price": p, "qty": q} for p, q in bids],
+                "asks": [{"price": p, "qty": q} for p, q in asks],
+            }]
+        })
+
+    def _update_msg(self, symbol: str, bids: list = None, asks: list = None) -> str:
+        return json.dumps({
+            "channel": "book",
+            "type": "update",
+            "data": [{
+                "symbol": symbol,
+                "bids": [{"price": p, "qty": q} for p, q in (bids or [])],
+                "asks": [{"price": p, "qty": q} for p, q in (asks or [])],
+            }]
+        })
+
+    def test_snapshot_sets_bids_and_asks(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg(
+            self.SYMBOL, [(50000.0, 1.0), (49999.0, 0.5)], [(50001.0, 0.3)]))
+        bids, asks = feed.get_top(self.SYMBOL)
+        assert len(bids) == 2
+        assert len(asks) == 1
+        assert bids[0][0] == 50000.0
+        assert asks[0][0] == 50001.0
+
+    def test_snapshot_clears_existing_book(self):
+        feed = self._feed()
+        feed._books[self.SYMBOL]["bids"][99999.0] = 5.0
+        feed._handle(self._snapshot_msg(self.SYMBOL, [(50000.0, 1.0)], []))
+        bids, _ = feed.get_top(self.SYMBOL)
+        assert 99999.0 not in [b[0] for b in bids]
+
+    def test_update_adds_new_bid_level(self):
+        feed = self._feed()
+        feed._handle(self._update_msg(self.SYMBOL, bids=[(50000.0, 2.0)]))
+        bids, _ = feed.get_top(self.SYMBOL)
+        assert any(b[0] == 50000.0 and b[1] == 2.0 for b in bids)
+
+    def test_update_adds_new_ask_level(self):
+        feed = self._feed()
+        feed._handle(self._update_msg(self.SYMBOL, asks=[(50001.0, 1.5)]))
+        _, asks = feed.get_top(self.SYMBOL)
+        assert any(a[0] == 50001.0 and a[1] == 1.5 for a in asks)
+
+    def test_zero_qty_bid_removes_level(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg(self.SYMBOL, [(50000.0, 1.0)], []))
+        feed._handle(self._update_msg(self.SYMBOL, bids=[(50000.0, 0.0)]))
+        bids, _ = feed.get_top(self.SYMBOL)
+        assert not any(b[0] == 50000.0 for b in bids)
+
+    def test_zero_qty_ask_removes_level(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg(self.SYMBOL, [], [(50001.0, 1.0)]))
+        feed._handle(self._update_msg(self.SYMBOL, asks=[(50001.0, 0.0)]))
+        _, asks = feed.get_top(self.SYMBOL)
+        assert not any(a[0] == 50001.0 for a in asks)
+
+    def test_negative_qty_bid_removes_level(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg(self.SYMBOL, [(50000.0, 1.0)], []))
+        feed._handle(self._update_msg(self.SYMBOL, bids=[(50000.0, -0.001)]))
+        bids, _ = feed.get_top(self.SYMBOL)
+        assert not any(b[0] == 50000.0 for b in bids)
+
+    def test_unknown_symbol_is_ignored(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg("ETH/USD", [(3000.0, 1.0)], []))
+        bids, asks = feed.get_top(self.SYMBOL)
+        assert bids == [] and asks == []
+
+    def test_non_book_channel_is_ignored(self):
+        feed = self._feed()
+        msg = json.dumps({"channel": "ticker", "type": "update",
+                          "data": [{"symbol": self.SYMBOL}]})
+        feed._handle(msg)
+        bids, asks = feed.get_top(self.SYMBOL)
+        assert bids == [] and asks == []
+
+    def test_invalid_json_handled_silently(self):
+        feed = self._feed()
+        feed._handle("not valid json {{{")  # must not raise
+
+    def test_invalid_price_in_bid_entry_skipped(self):
+        feed = self._feed()
+        msg = json.dumps({
+            "channel": "book", "type": "update",
+            "data": [{"symbol": self.SYMBOL,
+                      "bids": [{"price": "bad", "qty": 1.0}], "asks": []}]
+        })
+        feed._handle(msg)  # must not raise
+
+    def test_invalid_qty_in_ask_entry_skipped(self):
+        feed = self._feed()
+        msg = json.dumps({
+            "channel": "book", "type": "update",
+            "data": [{"symbol": self.SYMBOL,
+                      "bids": [], "asks": [{"price": 50001.0, "qty": "bad"}]}]
+        })
+        feed._handle(msg)  # must not raise
+
+    def test_last_update_set_after_known_symbol(self):
+        feed = self._feed()
+        assert self.SYMBOL not in feed._last_update
+        feed._handle(self._snapshot_msg(self.SYMBOL, [(50000.0, 1.0)], []))
+        assert self.SYMBOL in feed._last_update
+
+    def test_last_update_not_set_for_unknown_symbol(self):
+        feed = self._feed()
+        feed._handle(self._snapshot_msg("ETH/USD", [(3000.0, 1.0)], []))
+        assert "ETH/USD" not in feed._last_update
+
+
+# ── KrakenBookFeed.get_top ────────────────────────────────────────────────────
+
+class TestKrakenBookFeedGetTop:
+    SYMBOL = "BTC/USD"
+
+    def _feed_with_book(self) -> KrakenBookFeed:
+        feed = KrakenBookFeed([self.SYMBOL])
+        feed._books[self.SYMBOL]["bids"] = {50000.0: 1.0, 49999.0: 0.5, 49998.0: 0.25}
+        feed._books[self.SYMBOL]["asks"] = {50001.0: 0.3, 50002.0: 0.2, 50003.0: 0.1}
+        return feed
+
+    def test_empty_before_first_data(self):
+        feed = KrakenBookFeed([self.SYMBOL])
+        bids, asks = feed.get_top(self.SYMBOL)
+        assert bids == [] and asks == []
+
+    def test_bids_descending_by_price(self):
+        feed = self._feed_with_book()
+        bids, _ = feed.get_top(self.SYMBOL)
+        prices = [b[0] for b in bids]
+        assert prices == sorted(prices, reverse=True)
+
+    def test_asks_ascending_by_price(self):
+        feed = self._feed_with_book()
+        _, asks = feed.get_top(self.SYMBOL)
+        prices = [a[0] for a in asks]
+        assert prices == sorted(prices)
+
+    def test_respects_default_depth(self):
+        feed = KrakenBookFeed([self.SYMBOL], depth=2)
+        feed._books[self.SYMBOL]["bids"] = {50000.0: 1.0, 49999.0: 0.5, 49998.0: 0.25}
+        feed._books[self.SYMBOL]["asks"] = {50001.0: 0.3, 50002.0: 0.2, 50003.0: 0.1}
+        bids, asks = feed.get_top(self.SYMBOL)
+        assert len(bids) == 2
+        assert len(asks) == 2
+
+    def test_custom_depth_arg_overrides_default(self):
+        feed = self._feed_with_book()
+        bids, asks = feed.get_top(self.SYMBOL, depth=1)
+        assert len(bids) == 1
+        assert len(asks) == 1
+
+    def test_unknown_symbol_returns_empty(self):
+        feed = self._feed_with_book()
+        bids, asks = feed.get_top("ETH/USD")
+        assert bids == [] and asks == []
+
+    def test_each_entry_is_price_qty_pair(self):
+        feed = self._feed_with_book()
+        bids, asks = feed.get_top(self.SYMBOL)
+        for entry in bids + asks:
+            assert len(entry) == 2
+            assert isinstance(entry[0], float)
+            assert isinstance(entry[1], float)
+
+    def test_best_bid_is_highest_bid(self):
+        feed = self._feed_with_book()
+        bids, _ = feed.get_top(self.SYMBOL)
+        assert bids[0][0] == 50000.0
+
+    def test_best_ask_is_lowest_ask(self):
+        feed = self._feed_with_book()
+        _, asks = feed.get_top(self.SYMBOL)
+        assert asks[0][0] == 50001.0
+
+
+# ── KrakenBookFeed.staleness ──────────────────────────────────────────────────
+
+class TestKrakenBookFeedStaleness:
+    SYMBOL = "BTC/USD"
+
+    def test_inf_before_first_update(self):
+        feed = KrakenBookFeed([self.SYMBOL])
+        assert feed.staleness(self.SYMBOL) == float("inf")
+
+    def test_inf_for_unknown_symbol(self):
+        feed = KrakenBookFeed([self.SYMBOL])
+        assert feed.staleness("ETH/USD") == float("inf")
+
+    def test_small_positive_after_update(self):
+        feed = KrakenBookFeed([self.SYMBOL])
+        feed._last_update[self.SYMBOL] = time.monotonic()
+        assert 0.0 <= feed.staleness(self.SYMBOL) < 1.0
+
+
+# ── KrakenBookFeed.start reconnection ─────────────────────────────────────────
+
+class TestKrakenBookFeedReconnect:
+    async def test_reconnects_after_connect_exception(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        feed = KrakenBookFeed(["BTC/USD"])
+        feed._running = True
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("simulated disconnect")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        assert call_count == 2
+
+    async def test_stop_exits_loop(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        feed = KrakenBookFeed(["BTC/USD"])
+
+        async def fake_connect():
+            feed.stop()
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()  # must not hang
+
+    async def test_sleep_called_with_reconnect_delay_on_exception(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenBookFeed(["BTC/USD"])
+        feed._running = True
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("disconnect")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        sleep_mock.assert_called_once_with(_RECONNECT_DELAY)
+
+    async def test_no_sleep_when_stop_called_cleanly(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenBookFeed(["BTC/USD"])
+
+        async def fake_connect():
+            feed.stop()
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        sleep_mock.assert_not_called()
+
+
+# ── KrakenTradeFeed._handle ───────────────────────────────────────────────────
+
+class TestKrakenTradeFeedHandle:
+    SYMBOL = "BTC/USD"
+
+    def _trade_msg(self, symbol: str, price: float = 50000.0, qty: float = 0.1,
+                   side: str = "buy", timestamp: str = "2024-01-01T00:00:00Z") -> str:
+        return json.dumps({
+            "channel": "trade",
+            "type": "update",
+            "data": [{
+                "symbol": symbol,
+                "price": price,
+                "qty": qty,
+                "side": side,
+                "timestamp": timestamp,
+            }]
+        })
+
+    def test_tick_parsed_correctly(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        feed._handle(self._trade_msg(self.SYMBOL, price=50000.0, qty=0.1, side="buy"))
+        assert len(ticks) == 1
+        tick = ticks[0]
+        assert tick.symbol == self.SYMBOL
+        assert tick.price == 50000.0
+        assert tick.qty == 0.1
+        assert tick.side == "buy"
+
+    def test_on_trade_callback_called(self):
+        called_with = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=called_with.append)
+        feed._handle(self._trade_msg(self.SYMBOL))
+        assert len(called_with) == 1
+        assert isinstance(called_with[0], TradeTick)
+
+    def test_no_callback_does_not_raise(self):
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=None)
+        feed._handle(self._trade_msg(self.SYMBOL))  # must not raise
+
+    def test_unknown_symbol_is_ignored(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        feed._handle(self._trade_msg("ETH/USD"))
+        assert len(ticks) == 0
+
+    def test_non_trade_channel_is_ignored(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        msg = json.dumps({"channel": "ticker", "type": "update",
+                          "data": [{"symbol": self.SYMBOL}]})
+        feed._handle(msg)
+        assert len(ticks) == 0
+
+    def test_invalid_json_handled_silently(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        feed._handle("not json {{{")  # must not raise
+
+    def test_callback_exception_is_caught(self):
+        def bad_callback(tick):
+            raise RuntimeError("boom")
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=bad_callback)
+        feed._handle(self._trade_msg(self.SYMBOL))  # must not raise
+
+    def test_last_update_set_after_known_symbol(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        assert self.SYMBOL not in feed._last_update
+        feed._handle(self._trade_msg(self.SYMBOL))
+        assert self.SYMBOL in feed._last_update
+
+    def test_last_update_not_set_for_unknown_symbol(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        feed._handle(self._trade_msg("ETH/USD"))
+        assert "ETH/USD" not in feed._last_update
+
+    def test_multiple_trades_in_one_message(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        msg = json.dumps({
+            "channel": "trade", "type": "update",
+            "data": [
+                {"symbol": self.SYMBOL, "price": 50000.0, "qty": 0.1,
+                 "side": "buy",  "timestamp": "t1"},
+                {"symbol": self.SYMBOL, "price": 50001.0, "qty": 0.2,
+                 "side": "sell", "timestamp": "t2"},
+            ]
+        })
+        feed._handle(msg)
+        assert len(ticks) == 2
+        assert ticks[0].price == 50000.0
+        assert ticks[1].price == 50001.0
+
+    def test_timestamp_stored_on_tick(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        feed._handle(self._trade_msg(self.SYMBOL, timestamp="2024-06-15T12:00:00Z"))
+        assert ticks[0].timestamp == "2024-06-15T12:00:00Z"
+
+    def test_sell_side_tick_parsed(self):
+        ticks = []
+        feed = KrakenTradeFeed([self.SYMBOL], on_trade=ticks.append)
+        feed._handle(self._trade_msg(self.SYMBOL, side="sell"))
+        assert ticks[0].side == "sell"
+
+
+# ── KrakenTradeFeed.staleness ─────────────────────────────────────────────────
+
+class TestKrakenTradeFeedStaleness:
+    SYMBOL = "BTC/USD"
+
+    def test_inf_before_first_update(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        assert feed.staleness(self.SYMBOL) == float("inf")
+
+    def test_inf_for_unknown_symbol(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        assert feed.staleness("ETH/USD") == float("inf")
+
+    def test_small_positive_after_update(self):
+        feed = KrakenTradeFeed([self.SYMBOL])
+        feed._last_update[self.SYMBOL] = time.monotonic()
+        assert 0.0 <= feed.staleness(self.SYMBOL) < 1.0
+
+
+# ── KrakenTradeFeed.start reconnection ───────────────────────────────────────
+
+class TestKrakenTradeFeedReconnect:
+    async def test_reconnects_after_connect_exception(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        feed = KrakenTradeFeed(["BTC/USD"])
+        feed._running = True
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("simulated disconnect")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        assert call_count == 2
+
+    async def test_stop_exits_loop(self, monkeypatch):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+        feed = KrakenTradeFeed(["BTC/USD"])
+
+        async def fake_connect():
+            feed.stop()
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()  # must not hang
+
+    async def test_sleep_called_with_reconnect_delay_on_exception(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenTradeFeed(["BTC/USD"])
+        feed._running = True
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("disconnect")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        sleep_mock.assert_called_once_with(_RECONNECT_DELAY)
+
+    async def test_no_sleep_when_stop_called_cleanly(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenTradeFeed(["BTC/USD"])
+
+        async def fake_connect():
+            feed.stop()
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+        sleep_mock.assert_not_called()
