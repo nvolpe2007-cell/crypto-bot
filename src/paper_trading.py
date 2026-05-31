@@ -2362,10 +2362,15 @@ _POSITIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data
 
 
 def _save_open_positions(trader):
-    """Dump open positions to disk so a restart can resume them."""
+    """Dump open positions to disk so a restart can resume them.
+
+    Writes to a sibling .tmp file then atomically renames it into place so a
+    crash mid-write never leaves a corrupted JSON file on disk.
+    """
     def _iso(dt):
         return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
 
+    _tmp = _POSITIONS_FILE + '.tmp'
     try:
         os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
         out = []
@@ -2401,15 +2406,25 @@ def _save_open_positions(trader):
                 'funding_accrued':  pos.funding_accrued,
                 'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
             })
-        with open(_POSITIONS_FILE, 'w') as f:
-            json.dump({
-                'saved_at': datetime.now(timezone.utc).isoformat(),
-                'cash':     trader.account.cash,
-                'total_pnl': trader.account.total_pnl,
-                'positions': out,
-            }, f, indent=2)
+        payload = json.dumps({
+            'saved_at': datetime.now(timezone.utc).isoformat(),
+            'cash':     trader.account.cash,
+            'total_pnl': trader.account.total_pnl,
+            'positions': out,
+        }, indent=2)
+        # Write to tmp first, then rename — atomic on POSIX; prevents a
+        # mid-write crash from leaving a truncated/corrupt positions file.
+        with open(_tmp, 'w') as f:
+            f.write(payload)
+        os.replace(_tmp, _POSITIONS_FILE)
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to save open positions to {_POSITIONS_FILE}: {e}")
+        # Clean up the temp file if it was created before the failure.
+        try:
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+        except OSError:
+            pass
 
 
 def _load_open_positions(trader):
@@ -2419,6 +2434,18 @@ def _load_open_positions(trader):
     try:
         with open(_POSITIONS_FILE) as f:
             state = json.load(f)
+        saved_at_raw = state.get('saved_at')
+        if saved_at_raw:
+            try:
+                saved_at = datetime.fromisoformat(saved_at_raw)
+                age_hours = (datetime.now(timezone.utc) - saved_at).total_seconds() / 3600.0
+                if age_hours > 1.0:
+                    logger.warning(
+                        f"[POSITIONS] Restoring positions from a snapshot that is "
+                        f"{age_hours:.1f}h old — entry prices may differ from current market"
+                    )
+            except Exception:
+                pass
         restored = 0
         for p in state.get('positions', []):
             try:

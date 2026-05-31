@@ -7,12 +7,15 @@ Verifies that all critical position fields survive a restart cycle, including:
 - Probability gate context (prob_win, edges_used)
 - Entry context snapshot (spread_at_entry, sentiment_fng, sentiment_btc_dom)
 - Core position fields (entry_price, size, side, peak excursions, cash, total_pnl)
+- Atomic write safety (no temp file left; existing file not corrupted on error)
+- Stale-snapshot warning on load
 """
 
 import json
 import os
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from src.paper_trading import (
     PaperTrader,
@@ -466,3 +469,138 @@ class TestEdgeCases:
         assert p['symbol'] == 'BTC/USD'
         assert p['is_perp'] is True
         assert p['last_funding_ts'] is not None
+
+
+class TestAtomicWrite:
+    """_save_open_positions must use a tmp→rename pattern to prevent corruption."""
+
+    def test_no_tmp_file_left_after_successful_save(self, clean_positions_file):
+        """After a clean save the .tmp sibling must not exist."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        tmp_path = clean_positions_file + '.tmp'
+        assert not os.path.exists(tmp_path), ".tmp file should be cleaned up after a successful save"
+
+    def test_existing_file_intact_when_serialization_fails(self, clean_positions_file):
+        """If json.dumps raises, the original positions file must be untouched."""
+        # Write a valid snapshot first.
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            original_content = f.read()
+
+        # Now make json.dumps blow up during the *next* save attempt.
+        with patch('src.paper_trading.json.dumps', side_effect=TypeError("mock serialization failure")):
+            _save_open_positions(trader)
+
+        # The original file must be completely unchanged.
+        with open(clean_positions_file) as f:
+            after_content = f.read()
+
+        assert after_content == original_content, (
+            "A save failure must not corrupt the previously-written positions file"
+        )
+
+    def test_no_tmp_file_left_after_failed_save(self, clean_positions_file):
+        """A failed save must also clean up the .tmp sibling."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+
+        with patch('src.paper_trading.json.dumps', side_effect=TypeError("mock serialization failure")):
+            _save_open_positions(trader)
+
+        tmp_path = clean_positions_file + '.tmp'
+        assert not os.path.exists(tmp_path), ".tmp file should be removed even when save fails"
+
+    def test_positions_file_is_valid_json_after_save(self, clean_positions_file):
+        """The written file must always be a valid, complete JSON document."""
+        trader = _fresh_trader()
+        trader.account.positions['ETH/USD'] = _perp_position(entry_price=3_000.0)
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)  # would raise if truncated/corrupt
+
+        assert data['positions'][0]['symbol'] == 'ETH/USD'
+
+
+class TestStaleSnapshotWarning:
+    """_load_open_positions must log a warning when restored positions are old."""
+
+    def test_no_warning_for_fresh_snapshot(self, clean_positions_file, caplog):
+        """A snapshot saved moments ago must not trigger the stale warning."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        import logging
+        trader2 = _fresh_trader()
+        with caplog.at_level(logging.WARNING, logger='src.paper_trading'):
+            _load_open_positions(trader2)
+
+        stale_warnings = [r for r in caplog.records if 'old' in r.message and 'Restoring' in r.message]
+        assert not stale_warnings, "Fresh snapshot must not trigger a stale warning"
+
+    def test_warning_emitted_for_old_snapshot(self, clean_positions_file, caplog):
+        """A snapshot more than 1 hour old must produce a warning on load."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        # Back-date the saved_at timestamp by 2 hours.
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        data['saved_at'] = old_ts
+        with open(clean_positions_file, 'w') as f:
+            json.dump(data, f)
+
+        import logging
+        trader2 = _fresh_trader()
+        with caplog.at_level(logging.WARNING, logger='src.paper_trading'):
+            _load_open_positions(trader2)
+
+        stale_warnings = [r for r in caplog.records if 'Restoring' in r.message]
+        assert stale_warnings, "A 2-hour-old snapshot must trigger a stale warning"
+        assert 'old' in stale_warnings[0].message.lower()
+
+    def test_warning_contains_age_in_hours(self, clean_positions_file, caplog):
+        """The stale warning must include the age so operators can assess risk."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        data['saved_at'] = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        with open(clean_positions_file, 'w') as f:
+            json.dump(data, f)
+
+        import logging
+        trader2 = _fresh_trader()
+        with caplog.at_level(logging.WARNING, logger='src.paper_trading'):
+            _load_open_positions(trader2)
+
+        stale_warnings = [r for r in caplog.records if 'Restoring' in r.message]
+        assert stale_warnings
+        assert 'h' in stale_warnings[0].message, "Warning should state the age in hours"
+
+    def test_missing_saved_at_does_not_crash(self, clean_positions_file):
+        """If the snapshot has no saved_at field, load must still succeed silently."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        del data['saved_at']
+        with open(clean_positions_file, 'w') as f:
+            json.dump(data, f)
+
+        trader2 = _fresh_trader()
+        n = _load_open_positions(trader2)
+        assert n == 1, "Load must succeed even when saved_at is absent"
