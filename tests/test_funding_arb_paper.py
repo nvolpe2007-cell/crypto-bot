@@ -1,10 +1,11 @@
 """
 Tests for the cost-aware funding-rate arbitrage paper simulator.
 
-Focus: the round-trip cost model and the cost-aware entry gate. These are the
-changes that turn the sim from a fantasy (gross-funding-only) into an honest
-net-of-costs simulation — the same cost-expectancy discipline applied to the
-microstructure scalper.
+Focus: the round-trip cost model, the cost-aware entry gate, and the exit
+logic (_should_exit).  The exit conditions were previously completely untested;
+they are also where the off_scanner_24h bug lived (last_funding_ts_iso was used
+as a proxy for "last scanner sighting" but was updated even on off-scanner
+decayed-rate ticks, so the 24h gate never fired).
 """
 
 from datetime import datetime, timezone, timedelta
@@ -163,3 +164,237 @@ def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     assert abs(sim._total_pnl()
                - (sim._total_gross_funding() - sim._total_costs())) < 1e-9
     assert abs(pos.net_pnl - (pos.funding_collected - pos.entry_cost)) < 1e-9
+
+
+# ── _should_exit — exit condition tests ──────────────────────────────────────
+
+def _open_pos(entry_apy: float = 40.0,
+              hours_old: float = 0.0,
+              last_seen_hours_ago: float = 0.0) -> PaperPosition:
+    """Build an open PaperPosition with controllable age and scanner-visibility."""
+    now = datetime.now(timezone.utc)
+    entry_time = now - timedelta(hours=hours_old)
+    last_seen  = now - timedelta(hours=last_seen_hours_ago)
+    return PaperPosition(
+        symbol="BTCUSDT", exchange="Binance",
+        direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=entry_apy,
+        entry_rate_8h=entry_apy / 1095.0 / 100.0,  # fraction
+        size_usd=500.0,
+        entry_time_iso=entry_time.isoformat(),
+        last_seen_iso=last_seen.isoformat(),
+    )
+
+
+def _sim_for_exit(tmp_path, monkeypatch) -> FundingArbPaperSim:
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+
+
+class TestShouldExit:
+
+    def test_no_exit_healthy_position(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0, hours_old=24.0)
+        opp = _opp("BTCUSDT", 40.0)  # rate unchanged, on scanner
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 1: max hold ──────────────────────────────────────────────────────
+
+    def test_exits_after_max_hold_days(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 + 1)
+        opp = _opp("BTCUSDT", 40.0)
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason is not None and "max_hold" in reason
+
+    def test_no_exit_just_under_max_hold(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 - 1)
+        opp = _opp("BTCUSDT", 40.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 2: funding flipped sign ──────────────────────────────────────────
+
+    def test_exits_when_positive_funding_flips_negative(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)   # entered as LONG_SPOT_SHORT_PERP
+        opp = _opp("BTCUSDT", -10.0)     # rate is now negative
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason == "funding_flipped"
+
+    def test_exits_when_negative_funding_flips_positive(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=-40.0)  # entered SHORT_SPOT_LONG_PERP
+        opp = _opp("BTCUSDT", 10.0)      # rate is now positive
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason == "funding_flipped"
+
+    def test_no_exit_when_sign_unchanged(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        opp = _opp("BTCUSDT", 20.0)     # positive but lower — sign same
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 3: APY decayed below threshold ───────────────────────────────────
+
+    def test_exits_when_apy_decays_below_fraction(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # EXIT_APY_FRACTION=0.40: exit when current < 40% of entry (40*0.40=16%)
+        # Use 15% — just below the threshold.
+        opp = _opp("BTCUSDT", 15.0)
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason is not None and "apy_decayed" in reason
+
+    def test_no_exit_when_apy_above_fraction(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # 17% > 40*0.40=16% → stays open
+        opp = _opp("BTCUSDT", 17.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    def test_exits_on_exact_decay_boundary(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # Exactly at boundary (40 * 0.40 = 16.0) — abs(16.0) < abs(16.0) is False,
+        # so it should NOT exit at the exact threshold (strict <).
+        opp = _opp("BTCUSDT", 16.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 4: off scanner 24h (the previously broken gate) ─────────────────
+
+    def test_exits_when_off_scanner_over_24h(self, tmp_path, monkeypatch):
+        """Core regression test for the off_scanner_24h bug.
+
+        Before the fix, _should_exit used last_funding_ts_iso, which gets
+        updated on every decayed-rate accrual tick. That reset the 24h clock
+        continuously, making the gate never fire. Now it uses last_seen_iso
+        (updated only when scanner data is present), so the gate correctly
+        fires after 25h of scanner absence.
+        """
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(last_seen_hours_ago=25.0)  # last seen 25h ago
+        reason = sim._should_exit(pos, None, datetime.now(timezone.utc))
+        assert reason == "off_scanner_24h"
+
+    def test_no_exit_when_off_scanner_under_24h(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(last_seen_hours_ago=23.0)
+        assert sim._should_exit(pos, None, datetime.now(timezone.utc)) is None
+
+    def test_off_scanner_gate_survives_decayed_accruals(self, tmp_path, monkeypatch):
+        """Verify that calling _accrue_funding with current_opp=None (decayed rate)
+        does NOT update last_seen_iso and therefore does NOT reset the 24h clock."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(last_seen_hours_ago=20.0)  # seen 20h ago
+        # Simulate three 8h off-scanner accrual ticks: only last_funding_ts_iso
+        # should change, not last_seen_iso.
+        for i in range(1, 4):
+            tick_now = now + timedelta(hours=i * 8)
+            pos.last_funding_ts_iso = (now - timedelta(hours=20 - i * 8)).isoformat()
+            sim._accrue_funding(pos, None, tick_now)
+
+        # last_seen_iso must still be 20h before 'now', not updated.
+        last_seen = datetime.fromisoformat(pos.last_seen_iso)
+        assert (now - last_seen).total_seconds() >= 20 * 3600 - 1
+
+        # After 25h total, the exit should fire (20h already elapsed + 5h gap).
+        final_now = now + timedelta(hours=5)
+        reason = sim._should_exit(pos, None, final_now)
+        assert reason == "off_scanner_24h"
+
+    def test_on_scanner_resets_last_seen(self, tmp_path, monkeypatch):
+        """When the symbol comes back onto the scanner, last_seen_iso is refreshed
+        via _accrue_funding — resetting the 24h clock correctly."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(last_seen_hours_ago=23.0)
+        # Scanner returns data → _accrue_funding updates last_seen_iso.
+        sim._accrue_funding(pos, _opp("BTCUSDT", 40.0), now)
+        # Now last_seen_iso ≈ now; the 25h check should NOT fire.
+        reason = sim._should_exit(pos, None, now + timedelta(hours=2))
+        assert reason is None
+
+    # ── fallback: no last_seen_iso (old persisted positions) ─────────────────
+
+    def test_no_last_seen_iso_uses_entry_time(self, tmp_path, monkeypatch):
+        """Positions persisted before last_seen_iso was added have last_seen_iso=None.
+        The exit check must fall back to entry_time to avoid crashing and should
+        close the position if entry was more than 24h ago with no current scanner data."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(hours_old=26.0)
+        pos.last_seen_iso = None    # simulate old serialized state
+        reason = sim._should_exit(pos, None, now)
+        assert reason == "off_scanner_24h"
+
+    # ── source_allowlist — Kraken-only arm ────────────────────────────────────
+
+    def test_source_allowlist_rejects_non_allowlisted_exchange(self, tmp_path, monkeypatch):
+        """Kraken-only arm must reject Binance/Bybit opportunities."""
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("BTCUSDT", 40.0, exchange="Binance")]),
+            notifier=None,
+            source_allowlist={"Kraken Futures"},
+            state_file=tmp_path / "kraken_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 0
+
+    def test_source_allowlist_accepts_allowlisted_exchange(self, tmp_path, monkeypatch):
+        """Kraken-only arm must accept opportunities from Kraken Futures."""
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("PF_XBTUSD", 40.0, exchange="Kraken Futures")]),
+            notifier=None,
+            source_allowlist={"Kraken Futures"},
+            state_file=tmp_path / "kraken_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 1
+
+    # ── max positions cap ─────────────────────────────────────────────────────
+
+    def test_max_positions_blocks_new_entries(self, tmp_path, monkeypatch):
+        """Once max_positions is reached, no further entries are opened."""
+        opps = [_opp(f"COIN{i}USDT", 40.0) for i in range(5)]
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner(opps), notifier=None,
+            max_positions=2,
+            state_file=tmp_path / "cap_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 2
+
+    # ── state persistence round-trip ──────────────────────────────────────────
+
+    def test_state_persists_and_reloads(self, tmp_path, monkeypatch):
+        """Save state, reload into a fresh sim instance, and verify positions survive."""
+        state_file = tmp_path / "persist_state.json"
+        monkeypatch.setattr(fap, "STATE_FILE", state_file)
+
+        sim1 = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("BTCUSDT", 40.0)]),
+            notifier=None,
+            state_file=state_file,
+        )
+        sim1._tick()
+        assert len(sim1.open_positions) == 1
+        # State is saved inside _tick(); no extra call needed.
+
+        sim2 = FundingArbPaperSim(
+            scanner=_FakeScanner([]),
+            notifier=None,
+            state_file=state_file,
+        )
+        assert len(sim2.open_positions) == 1
+        pos1 = next(iter(sim1.open_positions.values()))
+        pos2 = next(iter(sim2.open_positions.values()))
+        assert pos1.symbol == pos2.symbol
+        assert abs(pos1.entry_cost - pos2.entry_cost) < 1e-9
+        # last_seen_iso must survive the round-trip.
+        assert pos2.last_seen_iso is not None

@@ -137,6 +137,12 @@ class PaperPosition:
     entry_cost: float = 0.0          # round-trip transaction cost, charged at open
     cycles_collected: int = 0
     last_funding_ts_iso: Optional[str] = None
+    # last_seen_iso tracks the most recent tick on which the scanner returned
+    # data for this symbol.  It is ONLY updated when current_opp is not None,
+    # so _should_exit's off_scanner_24h check can use it as a true "last seen"
+    # timestamp — unlike last_funding_ts_iso, which is updated even when the
+    # symbol is off-scanner (decayed accrual), causing the 24h gate to never fire.
+    last_seen_iso: Optional[str] = None
     closed: bool = False
     close_time_iso: Optional[str] = None
     close_reason: Optional[str] = None
@@ -401,6 +407,7 @@ class FundingArbPaperSim:
             size_usd=size,
             entry_time_iso=now.isoformat(),
             last_funding_ts_iso=now.isoformat(),
+            last_seen_iso=now.isoformat(),
             entry_cost=entry_cost,
         )
         self.open_positions[key] = pos
@@ -429,6 +436,15 @@ class FundingArbPaperSim:
         now: datetime,
     ):
         """Accrue funding for any 8h cycles that have elapsed since last accrual."""
+        # Advance last_seen unconditionally when scanner data is present.  This
+        # must happen BEFORE the cycles_due early-return so that ticks inside the
+        # first 8h window (cycles_due == 0) still refresh the timestamp.
+        # last_seen_iso is the sole input to the off_scanner_24h exit check; it
+        # must NOT be updated on decayed-rate (off-scanner) ticks so the 24h clock
+        # correctly reflects scanner absence rather than accrual cadence.
+        if current_opp is not None:
+            pos.last_seen_iso = now.isoformat()
+
         last_ts = (
             datetime.fromisoformat(pos.last_funding_ts_iso)
             if pos.last_funding_ts_iso else pos.entry_time
@@ -478,12 +494,15 @@ class FundingArbPaperSim:
 
         # 4. Symbol disappeared from scanner for an extended period:
         # only force-close if we've been "off the radar" for a full day.
+        # Use last_seen_iso (updated only when scanner returns data) rather than
+        # last_funding_ts_iso (updated on every decayed-rate accrual tick too),
+        # so the 24h window reflects actual scanner absence, not accrual cadence.
         if current_opp is None:
-            last_ts = (
-                datetime.fromisoformat(pos.last_funding_ts_iso)
-                if pos.last_funding_ts_iso else pos.entry_time
+            last_seen_ts = (
+                datetime.fromisoformat(pos.last_seen_iso)
+                if pos.last_seen_iso else pos.entry_time
             )
-            if (now - last_ts).total_seconds() > 86400:
+            if (now - last_seen_ts).total_seconds() > 86400:
                 return "off_scanner_24h"
 
         return None
