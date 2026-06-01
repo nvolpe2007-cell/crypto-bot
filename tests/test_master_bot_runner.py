@@ -20,13 +20,26 @@ from unittest.mock import AsyncMock, patch
 # dependency graph (ScalpingBot → exchange → ccxt, etc.).
 # ---------------------------------------------------------------------------
 
+import importlib
 import sys
 import types
 
-def _make_module(name: str) -> types.ModuleType:
-    m = types.ModuleType(name)
-    sys.modules[name] = m
-    return m
+
+def _ensure_module(name: str) -> None:
+    """Register a minimal stub only if the real module can't be imported.
+
+    Prefer the real module so that test_stablecoin_arb (and others) importing
+    symbols like TriangleOpportunity from the same package don't get a blank
+    stub stuck in sys.modules instead of the live module.
+    """
+    if name in sys.modules:
+        return
+    try:
+        importlib.import_module(name)
+    except (ImportError, ModuleNotFoundError):
+        m = types.ModuleType(name)
+        sys.modules[name] = m
+
 
 # Stub heavy optional imports if not already present from conftest.py
 for _mod in (
@@ -35,8 +48,7 @@ for _mod in (
     "arbitrage.dex_arb",
     "arbitrage.stablecoin_arb",
 ):
-    if _mod not in sys.modules:
-        _make_module(_mod)
+    _ensure_module(_mod)
 
 # Provide the symbols that run_all_bots.py imports from those stubs
 if not hasattr(sys.modules["src.bot"], "ScalpingBot"):
