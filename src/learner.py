@@ -79,7 +79,6 @@ class Learner:
         Higher = harder to enter = more selective.
         """
         losses = self.journal.losses()
-        wins   = self.journal.wins()
         total  = len(self.journal.records)
 
         if total < MIN_TRADES_TO_LEARN:
