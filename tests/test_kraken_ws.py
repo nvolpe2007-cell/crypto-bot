@@ -12,14 +12,15 @@ Covers:
 - KrakenPublicWS.get_price / get_prices: None before first update, copy
   isolation, multi-symbol
 - KrakenPublicWS.start: reconnects after _connect() exception; stop() exits
-  the loop; sleep is called between reconnect attempts
+  the loop; exponential backoff (5→10→20…→60s) on repeated failures; delay
+  resets after a live session; delay capped at _RECONNECT_DELAY_MAX
 - KrakenPrivateWS._handle: trade executions appended, non-trade exec_types
   ignored, on_fill callback called, balance snapshots/updates stored,
   invalid JSON handled
 - KrakenPrivateWS.pop_fills: returns fills and clears the list; idempotent
 - KrakenPrivateWS.get_balance: default 0.0 for unseen currency
 - KrakenPrivateWS.start: skips _connect when token fetch returns None
-  (sleeps 30s); reconnects after _connect() exception; stop() exits
+  (uses exponential backoff); reconnects after _connect() exception; stop() exits
 - KrakenBookFeed._handle: snapshot clears/sets book, updates add levels,
   zero/negative qty removes levels, unknown symbol ignored, non-book
   channel ignored, invalid JSON handled, invalid entry fields skipped,
@@ -30,7 +31,7 @@ Covers:
 - KrakenBookFeed.staleness: inf before update, inf for unknown, small
   positive after update
 - KrakenBookFeed.start: reconnects after exception, stop exits loop,
-  sleep called with _RECONNECT_DELAY, no sleep on clean stop
+  exponential backoff on repeated failures, no sleep on clean stop
 - KrakenTradeFeed._handle: tick parsed correctly, callback called, no
   callback is safe, unknown symbol ignored, non-trade channel ignored,
   invalid JSON handled, callback exception caught, _last_update set,
@@ -38,7 +39,7 @@ Covers:
 - KrakenTradeFeed.staleness: inf before update, inf for unknown, small
   positive after update
 - KrakenTradeFeed.start: reconnects after exception, stop exits loop,
-  sleep called with _RECONNECT_DELAY, no sleep on clean stop
+  exponential backoff on repeated failures, no sleep on clean stop
 """
 
 import asyncio
@@ -60,7 +61,8 @@ from src.kraken_ws import (
     TradeTick,
     CandleClose,
     Execution,
-    _RECONNECT_DELAY,
+    _RECONNECT_DELAY_MIN,
+    _RECONNECT_DELAY_MAX,
 )
 
 
@@ -366,8 +368,8 @@ class TestKrakenPublicWSReconnect:
 
         monkeypatch.setattr(ws, "_connect", fake_connect)
         await ws.start()
-        # Only one sleep: after the first exception (_RECONNECT_DELAY)
-        sleep_mock.assert_called_once_with(_RECONNECT_DELAY)
+        # Only one sleep: after the first exception (initial min delay)
+        sleep_mock.assert_called_once_with(_RECONNECT_DELAY_MIN)
 
     async def test_no_sleep_when_stop_called_cleanly(self, monkeypatch):
         sleep_mock = AsyncMock()
@@ -380,6 +382,76 @@ class TestKrakenPublicWSReconnect:
         monkeypatch.setattr(ws, "_connect", fake_connect)
         await ws.start()
         sleep_mock.assert_not_called()
+
+    async def test_delay_doubles_on_repeated_exceptions(self, monkeypatch):
+        """Sleep values grow exponentially: 5 → 10 → 20 on three failures."""
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        ws = KrakenPublicWS(["BTC/USD"])
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                raise aiohttp.ClientError("flap")
+            ws._running = False  # clean exit on 4th call
+
+        monkeypatch.setattr(ws, "_connect", fake_connect)
+        await ws.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert sleep_args == [
+            _RECONNECT_DELAY_MIN,
+            _RECONNECT_DELAY_MIN * 2,
+            _RECONNECT_DELAY_MIN * 4,
+        ]
+
+    async def test_delay_capped_at_max(self, monkeypatch):
+        """Delay never exceeds _RECONNECT_DELAY_MAX regardless of failure count."""
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        ws = KrakenPublicWS(["BTC/USD"])
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 10:
+                raise aiohttp.ClientError("outage")
+            ws._running = False
+
+        monkeypatch.setattr(ws, "_connect", fake_connect)
+        await ws.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert all(s <= _RECONNECT_DELAY_MAX for s in sleep_args)
+        assert sleep_args[-1] == _RECONNECT_DELAY_MAX
+
+    async def test_delay_resets_after_successful_session(self, monkeypatch):
+        """A clean session resets backoff so the next failure starts at min."""
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        ws = KrakenPublicWS(["BTC/USD"])
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("first fail")
+            if call_count == 2:
+                return  # clean session; resets delay
+            if call_count == 3:
+                raise aiohttp.ClientError("second fail")
+            ws._running = False
+
+        monkeypatch.setattr(ws, "_connect", fake_connect)
+        await ws.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        # call 1 fails → sleep MIN; call 2 succeeds → sleep MIN (reset); call 3 fails → sleep MIN
+        assert all(s == _RECONNECT_DELAY_MIN for s in sleep_args)
 
 
 # ── KrakenPrivateWS._handle ───────────────────────────────────────────────────
@@ -612,9 +684,9 @@ class TestKrakenPrivateWSReconnect:
 
         assert token_call_count == 2
         assert connect_call_count == 1
-        # Must have slept 30s on the failed token attempt
+        # Must have slept on the failed token attempt (initial min delay)
         sleep_calls = [c[0][0] for c in sleep_mock.call_args_list]
-        assert 30 in sleep_calls
+        assert _RECONNECT_DELAY_MIN in sleep_calls
 
     async def test_stop_exits_loop(self, monkeypatch):
         monkeypatch.setattr(asyncio, "sleep", AsyncMock())
@@ -648,7 +720,7 @@ class TestKrakenPrivateWSReconnect:
         monkeypatch.setattr(ws, "_connect", fake_connect)
         await ws.start()
         sleep_calls = [c[0][0] for c in sleep_mock.call_args_list]
-        assert _RECONNECT_DELAY in sleep_calls
+        assert _RECONNECT_DELAY_MIN in sleep_calls
 
 
 # ── KrakenBookFeed._handle ────────────────────────────────────────────────────
@@ -910,7 +982,7 @@ class TestKrakenBookFeedReconnect:
 
         monkeypatch.setattr(feed, "_connect", fake_connect)
         await feed.start()
-        sleep_mock.assert_called_once_with(_RECONNECT_DELAY)
+        sleep_mock.assert_called_once_with(_RECONNECT_DELAY_MIN)
 
     async def test_no_sleep_when_stop_called_cleanly(self, monkeypatch):
         sleep_mock = AsyncMock()
@@ -1096,7 +1168,7 @@ class TestKrakenTradeFeedReconnect:
 
         monkeypatch.setattr(feed, "_connect", fake_connect)
         await feed.start()
-        sleep_mock.assert_called_once_with(_RECONNECT_DELAY)
+        sleep_mock.assert_called_once_with(_RECONNECT_DELAY_MIN)
 
     async def test_no_sleep_when_stop_called_cleanly(self, monkeypatch):
         sleep_mock = AsyncMock()
@@ -1109,3 +1181,109 @@ class TestKrakenTradeFeedReconnect:
         monkeypatch.setattr(feed, "_connect", fake_connect)
         await feed.start()
         sleep_mock.assert_not_called()
+
+    async def test_delay_doubles_on_repeated_exceptions(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenTradeFeed(["BTC/USD"])
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                raise aiohttp.ClientError("flap")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert sleep_args == [
+            _RECONNECT_DELAY_MIN,
+            _RECONNECT_DELAY_MIN * 2,
+            _RECONNECT_DELAY_MIN * 4,
+        ]
+
+
+# ── KrakenPrivateWS backoff ───────────────────────────────────────────────────
+
+class TestKrakenPrivateWSBackoff:
+    async def test_delay_doubles_on_repeated_connect_exceptions(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        monkeypatch.setattr("src.kraken_ws._fetch_ws_token", AsyncMock(return_value="tok"))
+        ws = KrakenPrivateWS("key", "sec")
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                raise aiohttp.ClientError("flap")
+            ws._running = False
+
+        monkeypatch.setattr(ws, "_connect", fake_connect)
+        await ws.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert sleep_args == [
+            _RECONNECT_DELAY_MIN,
+            _RECONNECT_DELAY_MIN * 2,
+            _RECONNECT_DELAY_MIN * 4,
+        ]
+
+    async def test_delay_doubles_on_repeated_token_failures(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        call_count = 0
+
+        async def fake_fetch(key, secret):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                return None
+            return "tok"
+
+        monkeypatch.setattr("src.kraken_ws._fetch_ws_token", fake_fetch)
+
+        async def fake_connect():
+            ws._running = False
+
+        ws = KrakenPrivateWS("key", "sec")
+        monkeypatch.setattr(ws, "_connect", fake_connect)
+        await ws.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert sleep_args == [
+            _RECONNECT_DELAY_MIN,
+            _RECONNECT_DELAY_MIN * 2,
+            _RECONNECT_DELAY_MIN * 4,
+        ]
+
+
+# ── KrakenBookFeed backoff ────────────────────────────────────────────────────
+
+class TestKrakenBookFeedBackoff:
+    async def test_delay_doubles_on_repeated_exceptions(self, monkeypatch):
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+        feed = KrakenBookFeed(["BTC/USD"])
+        call_count = 0
+
+        async def fake_connect():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                raise aiohttp.ClientError("flap")
+            feed._running = False
+
+        monkeypatch.setattr(feed, "_connect", fake_connect)
+        await feed.start()
+
+        sleep_args = [c[0][0] for c in sleep_mock.call_args_list]
+        assert sleep_args == [
+            _RECONNECT_DELAY_MIN,
+            _RECONNECT_DELAY_MIN * 2,
+            _RECONNECT_DELAY_MIN * 4,
+        ]

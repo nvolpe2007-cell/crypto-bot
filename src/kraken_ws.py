@@ -32,7 +32,8 @@ _PUBLIC_WS  = "wss://ws.kraken.com/v2"
 _PRIVATE_WS = "wss://ws-auth.kraken.com/v2"
 _TOKEN_REST = "https://api.kraken.com/0/private/GetWebSocketsToken"
 
-_RECONNECT_DELAY = 5   # seconds before reconnect attempt
+_RECONNECT_DELAY_MIN = 5    # initial reconnect wait (seconds)
+_RECONNECT_DELAY_MAX = 60   # maximum reconnect wait after repeated failures
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -133,13 +134,19 @@ class KrakenPublicWS:
 
     async def start(self):
         self._running = True
+        delay = _RECONNECT_DELAY_MIN
         while self._running:
             try:
                 await self._connect()
+                delay = _RECONNECT_DELAY_MIN   # reset backoff after a live session
             except Exception as e:
-                logger.warning(f"[PublicWS] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+                logger.warning(f"[PublicWS] disconnected: {e} — reconnecting in {delay}s")
+                if self._running:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _RECONNECT_DELAY_MAX)
+                continue
             if self._running:
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await asyncio.sleep(delay)
 
     def stop(self):
         self._running = False
@@ -247,18 +254,26 @@ class KrakenPrivateWS:
 
     async def start(self):
         self._running = True
+        delay = _RECONNECT_DELAY_MIN
         while self._running:
             try:
                 self._token = await _fetch_ws_token(self._api_key, self._api_secret)
                 if not self._token:
-                    logger.warning("[PrivateWS] could not get token — retrying in 30s")
-                    await asyncio.sleep(30)
+                    logger.warning(f"[PrivateWS] could not get WS token — retrying in {delay}s")
+                    if self._running:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, _RECONNECT_DELAY_MAX)
                     continue
                 await self._connect()
+                delay = _RECONNECT_DELAY_MIN   # reset backoff after a live session
             except Exception as e:
-                logger.warning(f"[PrivateWS] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+                logger.warning(f"[PrivateWS] disconnected: {e} — reconnecting in {delay}s")
+                if self._running:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _RECONNECT_DELAY_MAX)
+                continue
             if self._running:
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await asyncio.sleep(delay)
 
     def stop(self):
         self._running = False
@@ -379,13 +394,19 @@ class KrakenBookFeed:
 
     async def start(self):
         self._running = True
+        delay = _RECONNECT_DELAY_MIN
         while self._running:
             try:
                 await self._connect()
+                delay = _RECONNECT_DELAY_MIN   # reset backoff after a live session
             except Exception as e:
-                logger.warning(f"[BookFeed] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+                logger.warning(f"[BookFeed] disconnected: {e} — reconnecting in {delay}s")
+                if self._running:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _RECONNECT_DELAY_MAX)
+                continue
             if self._running:
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await asyncio.sleep(delay)
 
     async def _connect(self):
         logger.info(f"[BookFeed] connecting to {_PUBLIC_WS} (depth={self._depth})")
@@ -478,13 +499,19 @@ class KrakenTradeFeed:
 
     async def start(self):
         self._running = True
+        delay = _RECONNECT_DELAY_MIN
         while self._running:
             try:
                 await self._connect()
+                delay = _RECONNECT_DELAY_MIN   # reset backoff after a live session
             except Exception as e:
-                logger.warning(f"[TradeFeed] disconnected: {e} — reconnecting in {_RECONNECT_DELAY}s")
+                logger.warning(f"[TradeFeed] disconnected: {e} — reconnecting in {delay}s")
+                if self._running:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _RECONNECT_DELAY_MAX)
+                continue
             if self._running:
-                await asyncio.sleep(_RECONNECT_DELAY)
+                await asyncio.sleep(delay)
 
     async def _connect(self):
         logger.info(f"[TradeFeed] connecting to {_PUBLIC_WS}")
