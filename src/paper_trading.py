@@ -830,6 +830,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # sim. Best-effort: any failure here is isolated and never touches the main
     # trading loop. Disable with FUNDING_ARB_ENABLED=0.
     _funding_tasks: List[asyncio.Task] = []
+    # Bound up front so the heartbeat can read arm P&L directly from these
+    # in-memory objects (race-free) regardless of whether the block below runs.
+    _funding_arb_sim = _funding_arb_majors = _funding_arb_kraken = None
     if os.getenv('FUNDING_ARB_ENABLED', '1') == '1':
         try:
             from pathlib import Path as _Path
@@ -2073,19 +2076,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 s_hb = trader.get_account_summary()
                 wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
                 open_syms = ','.join(trader.account.positions.keys()) or 'none'
-                # Fold in the funding-arb arms (shared state) for running combined totals.
-                # Three arms now: aggressive (Binance/Bybit, fantasy baseline),
-                # majors (Binance/Bybit majors-only, also fantasy), kraken (the only
-                # arm whose +$X represents actually-capturable edge).
-                _fa_hb = _fam_hb = _fak_hb = 0.0
-                try:
-                    from .state import read_state as _rs_hb
-                    _st_hb = _rs_hb() or {}
-                    _fa_hb  = float((_st_hb.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
-                    _fam_hb = float((_st_hb.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
-                    _fak_hb = float((_st_hb.get('funding_arb_kraken') or {}).get('total_pnl', 0.0) or 0.0)
-                except Exception:
-                    pass
+                # Fold in the funding-arb arms for running combined totals. Read
+                # net P&L straight from the in-memory arm objects — NOT from the
+                # shared state.json, which the main loop rewrites every tick and
+                # clobbers the funding_arb* keys the merge task writes only every
+                # 65s (the state-flush race that made this read +0.00 ~always).
+                # Three arms: aggressive (Binance/Bybit, fantasy baseline), majors
+                # (Binance/Bybit majors-only, also fantasy), kraken (the only arm
+                # whose +$X represents actually-capturable edge).
+                def _arm_pnl(_arm):
+                    try:
+                        return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
+                    except Exception:
+                        return 0.0
+                _fa_hb  = _arm_pnl(_funding_arb_sim)
+                _fam_hb = _arm_pnl(_funding_arb_majors)
+                _fak_hb = _arm_pnl(_funding_arb_kraken)
                 _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
                 _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
                 logger.info(
@@ -2106,23 +2112,24 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 _save_open_positions(trader)
 
             # Periodic account report to Telegram — made/lost + total money.
-            # Combines the directional paper account with both funding-arb arms
-            # (read from shared state). Fires on its own cadence (default hourly).
+            # Combines the directional paper account with all three funding-arb
+            # arms, read straight from the in-memory arm objects (race-free —
+            # see the heartbeat note above on the state.json clobber race).
+            # Fires on its own cadence (default hourly).
             if notifier and (now_hb - last_account_report >= ACCOUNT_REPORT_INTERVAL_SEC):
                 last_account_report = now_hb
                 try:
                     s_rep = trader.get_account_summary()
                     wr_rep = (s_rep['winning_trades'] / s_rep['closed_trades'] * 100) \
                         if s_rep['closed_trades'] else 0.0
-                    fa_pnl = fam_pnl = fak_pnl = 0.0
-                    try:
-                        from .state import read_state as _rs
-                        _st = _rs() or {}
-                        fa_pnl  = float((_st.get('funding_arb') or {}).get('total_pnl', 0.0) or 0.0)
-                        fam_pnl = float((_st.get('funding_arb_majors') or {}).get('total_pnl', 0.0) or 0.0)
-                        fak_pnl = float((_st.get('funding_arb_kraken') or {}).get('total_pnl', 0.0) or 0.0)
-                    except Exception:
-                        pass
+                    def _arm_pnl_rep(_arm):
+                        try:
+                            return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
+                        except Exception:
+                            return 0.0
+                    fa_pnl  = _arm_pnl_rep(_funding_arb_sim)
+                    fam_pnl = _arm_pnl_rep(_funding_arb_majors)
+                    fak_pnl = _arm_pnl_rep(_funding_arb_kraken)
                     dir_pnl, dir_eq = s_rep['total_pnl'], s_rep['total_equity']
                     combined = dir_pnl + fa_pnl + fam_pnl + fak_pnl
                     total_money = dir_eq + fa_pnl + fam_pnl + fak_pnl
