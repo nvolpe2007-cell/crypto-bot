@@ -65,7 +65,9 @@ ssh crypto-bot-vps "journalctl -u crypto-bot -f"             # watch live
 ## Funding-arb env knobs (no code change)
 `FUNDING_ARB_MAX_APY` (cap, 150), `FUNDING_ARB_MIN_SIZE`/`MAX_SIZE`/`MAX_TOTAL`,
 `FUNDING_ARB_COST_FRAC`, `FUNDING_ARB_ROLLUP_HOURS`, `FUNDING_ARB_NOTIFY_PER_TRADE`,
-`FUNDING_ARB_ENABLED`.
+`FUNDING_ARB_ENABLED`, `FUNDING_ARB_KRAKEN_COST_FRAC`,
+`FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 2 — see
+memory `funding_arb_kraken_bleed`).
 
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.

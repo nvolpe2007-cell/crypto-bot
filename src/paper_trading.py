@@ -866,11 +866,23 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # This is the ONLY arm whose +$X figure represents capturable edge —
             # the other two arms remain as Binance/Bybit research baselines.
             _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0064'))
+            # Persistence/expectancy gate: the Kraken arm's microcap funding
+            # empirically flips at cycle 0, so opening on the lax 10-cycle
+            # breakeven (which assumes ~3 days of rate persistence) bled ~$29
+            # on dead-on-arrival entries (memory funding_arb_kraken_bleed).
+            # Require funding to clear honest cost within a realistic hold
+            # (~2 cycles ≈ 16h). At 0.64% cost this is a strict bar the
+            # microcap band rarely meets — the arm correctly goes mostly idle
+            # rather than taking negative-EV trades. Tune via env.
+            _kraken_max_be = float(
+                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '2')
+            )
             _funding_arb_kraken = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
                 source_allowlist={'Kraken Futures'},
                 cost_frac=_kraken_cost,
+                max_breakeven_cycles=_kraken_max_be,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
             )

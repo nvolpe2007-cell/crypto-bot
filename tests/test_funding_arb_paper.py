@@ -148,6 +148,44 @@ def test_majors_arm_lower_cost_floor(tmp_path, monkeypatch):
     assert sim._apy_floor() < 10.0   # ~8.8% at 0.08% cost / 10 cycles
 
 
+def _make_kraken_sim(tmp_path, opps, monkeypatch, max_be=2.0):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0064,
+        max_breakeven_cycles=max_be,
+        state_file=tmp_path / "kraken_state.json",
+        label="Funding Arb (Kraken)",
+    )
+
+
+def test_kraken_persistence_gate_rejects_microcap(tmp_path, monkeypatch):
+    # 140% APY microcap on Kraken: at 0.64% cost, breakeven ≈ 5 cycles. The
+    # strict 2-cycle persistence gate rejects it (funding won't survive long
+    # enough to clear honest cost) — this is the funding_arb_kraken_bleed fix.
+    opp = _opp("PF_OMIUSD", 140.0, exchange="Kraken Futures")
+    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=2.0)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_kraken_arm_with_lax_gate_would_open(tmp_path, monkeypatch):
+    # Same opportunity under the lax 10-cycle gate WOULD open — proves the
+    # per-arm threshold (not the cost/cap/sign filters) is what gates it out.
+    opp = _opp("PF_OMIUSD", 140.0, exchange="Kraken Futures")
+    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=10.0)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_default_arm_breakeven_gate_unchanged(tmp_path, monkeypatch):
+    # Arms that don't pass max_breakeven_cycles keep the module default (10).
+    sim = _make_sim(tmp_path, [], monkeypatch)
+    assert sim.max_breakeven_cycles == fap.MAX_BREAKEVEN_CYCLES
+
+
 def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     sim = _make_sim(tmp_path, [_opp("BTCUSDT", 40.0)], monkeypatch)
     sim._tick()

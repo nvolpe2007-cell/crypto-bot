@@ -169,6 +169,7 @@ class FundingArbPaperSim:
         max_positions: int = MAX_CONCURRENT_POSITIONS,
         max_entry_apy: float = MAX_ENTRY_APY,
         cost_frac: float = ROUND_TRIP_COST_FRAC,
+        max_breakeven_cycles: float = MAX_BREAKEVEN_CYCLES,
         positive_funding_only: bool = False,
         symbol_allowlist: Optional[set] = None,
         source_allowlist: Optional[set] = None,
@@ -185,6 +186,15 @@ class FundingArbPaperSim:
         # (all symbols, both funding sides) AND a conservative "honest" arm
         # (liquid majors, positive funding only, maker-fee cost) at once.
         self.cost_frac = cost_frac
+        # Per-arm breakeven gate. Entry requires funding at the entry rate to
+        # clear round-trip cost within this many 8h cycles — i.e. it encodes a
+        # funding-PERSISTENCE assumption: we only open if the position is
+        # expected net-positive within a hold we believe the rate survives.
+        # The aggressive/majors arms keep the lax module default (10). The
+        # Kraken arm (honest 0.64% cost) is set much tighter because its
+        # microcap funding empirically flips at cycle 0 — see memory
+        # funding_arb_kraken_bleed.
+        self.max_breakeven_cycles = max_breakeven_cycles
         self.positive_funding_only = positive_funding_only
         self.symbol_allowlist = symbol_allowlist   # set of BASE symbols, e.g. {'BTC','ETH'}
         # Source allowlist restricts to opportunities from specific exchanges,
@@ -347,11 +357,11 @@ class FundingArbPaperSim:
                 if rate_8h_frac <= 0:
                     continue
                 breakeven_cycles = self.cost_frac / rate_8h_frac
-                if breakeven_cycles > MAX_BREAKEVEN_CYCLES:
+                if breakeven_cycles > self.max_breakeven_cycles:
                     logger.info(
                         f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
                         f"apy={opp['apy']:.1f}%: breakeven {breakeven_cycles:.1f} cycles "
-                        f"> max {MAX_BREAKEVEN_CYCLES:.0f} (cost {self.cost_frac*100:.2f}% "
+                        f"> max {self.max_breakeven_cycles:.0f} (cost {self.cost_frac*100:.2f}% "
                         f"vs {rate_8h_frac*100:.4f}%/cycle)"
                     )
                     continue
@@ -363,7 +373,7 @@ class FundingArbPaperSim:
         """The effective APY floor — the rate at which breakeven == the cost
         gate's max cycles. Below this the cost gate rejects entries, so it's the
         natural bottom of the conviction-sizing band. ≈24% at the 0.22% cost."""
-        rate_floor = self.cost_frac / MAX_BREAKEVEN_CYCLES
+        rate_floor = self.cost_frac / self.max_breakeven_cycles
         return rate_floor * 3 * 365 * 100
 
     def _size_for_apy(self, apy: float) -> float:
