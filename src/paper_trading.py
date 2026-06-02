@@ -838,9 +838,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             from pathlib import Path as _Path
             from arbitrage.funding_scanner import FundingScanner
             from arbitrage.funding_arb_paper import FundingArbPaperSim, MAJOR_SYMBOLS
+            from arbitrage.funding_history import FundingHistory
             from .state import read_state as _read_state, write_state as _write_state
 
             _funding_scanner = FundingScanner(notifier=None)
+
+            # Shared funding-history tracker → feeds the Kraken arm's persistence
+            # gate. Records every scanner snapshot; survives restarts (data/).
+            _funding_history = FundingHistory()
 
             # Arm 1 — aggressive/experimental: all symbols, both funding sides,
             # taker cost. Trades often, but optimistic (ignores spot-borrow on
@@ -883,6 +888,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             )
             _kraken_cap = float(os.getenv('FUNDING_ARB_KRAKEN_MAX_APY', '300'))
             _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '100'))
+            # Persistence gate: only enter symbols whose funding has actually
+            # held positive for N cycles and isn't a serial flipper. This is the
+            # evidence-based fix for the cycle-0 flip bleed (the breakeven gate
+            # only assumes persistence; this verifies it). Needs ~min_cycles×8h
+            # of accumulated history per symbol before it'll pass anything —
+            # a deliberate warm-up, not a bug. Set MIN_PERSISTENCE_CYCLES=0 to disable.
+            _kraken_min_persist = float(
+                os.getenv('FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES', '2')
+            )
+            _kraken_max_flips = int(os.getenv('FUNDING_ARB_KRAKEN_MAX_FLIPS', '6'))
             _funding_arb_kraken = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
@@ -894,6 +909,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 min_position_usd=_kraken_alloc,
                 max_position_usd=_kraken_alloc,
                 max_total_notional=_kraken_alloc,
+                history=_funding_history,
+                min_persistence_cycles=_kraken_min_persist,
+                max_flips=_kraken_max_flips,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
             )

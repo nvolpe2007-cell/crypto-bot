@@ -178,6 +178,9 @@ class FundingArbPaperSim:
         min_position_usd: float = MIN_POSITION_USD,
         max_position_usd: float = MAX_POSITION_USD,
         max_total_notional: float = MAX_TOTAL_NOTIONAL,
+        history=None,
+        min_persistence_cycles: float = 0.0,
+        max_flips: int = 10**9,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -185,6 +188,15 @@ class FundingArbPaperSim:
         self.max_entry_apy = max_entry_apy
         self.position_size_usd = position_size_usd
         self.max_positions = max_positions
+        # Funding-persistence gate (FundingHistory). When min_persistence_cycles
+        # > 0, an entry also requires the symbol's funding to have held positive
+        # for that many 8h cycles AND not flipped more than max_flips times in
+        # the retention window. This is the real fix for the cycle-0 flip bleed:
+        # the breakeven gate assumes persistence, this one VERIFIES it from
+        # recorded history. min_persistence_cycles=0 disables it (default).
+        self.history = history
+        self.min_persistence_cycles = min_persistence_cycles
+        self.max_flips = max_flips
         # Per-arm conviction-sizing band (defaults to the module globals). Set
         # min==max==total for an all-in single-position arm: every entry uses
         # the full allocation, no conviction scaling. The Kraken arm uses this
@@ -304,6 +316,13 @@ class FundingArbPaperSim:
 
         now = datetime.now(timezone.utc)
 
+        # Record this snapshot into the shared funding-history tracker so the
+        # persistence gate has data to reason about (downsampled + throttled
+        # internally). Recording the full opp list captures every symbol.
+        if self.history is not None:
+            self.history.record_many(opps, now)
+            self.history.maybe_save(now)
+
         # 1. Accrue funding + check exits on existing positions
         for key, pos in list(self.open_positions.items()):
             self._accrue_funding(pos, opp_by_key.get(key), now)
@@ -375,6 +394,23 @@ class FundingArbPaperSim:
                         f"vs {rate_8h_frac*100:.4f}%/cycle)"
                     )
                     continue
+                # Persistence gate: the breakeven gate above only ASSUMES the
+                # funding lasts; this VERIFIES it from recorded history. Reject
+                # unless funding has actually held positive for the required
+                # cycles and the symbol isn't a serial flipper. This is the
+                # real defence against the cycle-0 flip bleed.
+                if self.history is not None and self.min_persistence_cycles > 0:
+                    if not self.history.is_stable(
+                        key, self.min_persistence_cycles, self.max_flips, now
+                    ):
+                        st = self.history.stats(key, now)
+                        logger.info(
+                            f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
+                            f"apy={opp['apy']:.1f}%: persistence — consec={st['consec_cycles']:.1f}cyc "
+                            f"(need {self.min_persistence_cycles:.0f}) flips={st['flips_30d']} "
+                            f"(max {self.max_flips}) samples={st['samples']}"
+                        )
+                        continue
                 self._open_position(opp, now)
 
         self._save_state()

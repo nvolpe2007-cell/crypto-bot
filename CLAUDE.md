@@ -70,7 +70,11 @@ ssh crypto-bot-vps "journalctl -u crypto-bot -f"             # watch live
 `FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 6),
 `FUNDING_ARB_KRAKEN_MAX_APY` (cap, default 300),
 `FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 100; arm is
-`max_positions=1`). See memory `funding_arb_kraken_bleed`.
+`max_positions=1`), `FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES` (persistence
+gate, default 2; 0 disables), `FUNDING_ARB_KRAKEN_MAX_FLIPS` (serial-flipper
+blacklist, default 6). Funding-history tracker (`arbitrage/funding_history.py`,
+`data/funding_history.json`) tuned via `FUNDING_HISTORY_RETENTION_DAYS`/
+`_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`. See memory `funding_arb_kraken_bleed`.
 
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
