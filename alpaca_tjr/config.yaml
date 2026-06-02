@@ -1,0 +1,57 @@
+alpaca:
+  paper: true
+  # Set these environment variables — get free keys at alpaca.markets
+  # export ALPACA_API_KEY=your_key_here
+  # export ALPACA_SECRET_KEY=your_secret_here
+
+trading:
+  symbols:
+    - SPY
+    - QQQ
+    - AAPL
+    - NVDA
+  primary_timeframe: 5   # minutes — bars used for sweep/BOS/FVG detection
+  htf_timeframe: 1D      # daily bars for trend bias
+
+sessions:
+  # All times in US/Eastern (ET)
+  premarket:
+    start: "04:00"
+    end: "09:30"
+  primary:             # NY open — highest priority
+    start: "09:30"
+    end: "11:30"
+  dead:                # midday chop — no entries
+    start: "11:30"
+    end: "13:00"
+  secondary:           # afternoon London-close rebalancing
+    start: "13:00"
+    end: "14:30"
+  force_close: "15:45" # close all positions before market close
+
+risk:
+  risk_per_trade_pct: 1.0       # % of account equity risked per trade
+  max_daily_loss_pct: 3.0       # halt trading if day P&L falls below -3%
+  max_open_positions: 3          # max concurrent positions across all symbols
+  min_rr: 2.0                   # minimum reward:risk ratio to take the trade
+  cooldown_after_loss_sec: 900   # 15 min pause after a stop-loss hit
+
+strategy:
+  sweep_lookback_bars: 10        # bars within which a sweep must have occurred
+  bos_lookback_bars: 10          # bars after sweep to search for BOS
+  swing_n: 3                     # N bars each side to confirm a swing point
+  impulse_body_ratio: 0.5        # body/range ratio threshold for impulse candle
+  fvg_max_age_bars: 50           # discard FVGs older than this many bars
+  ob_max_age_bars: 30            # discard OBs older than this
+  htf_sma_period: 20             # SMA period on daily bars for bias
+  htf_neutral_band: 0.001        # 0.1% — treat as neutral when price within this of SMA
+  min_pm_range_pct: 0.001        # pre-market range must be at least 0.1% of price
+
+telegram:
+  enabled: false      # set to true and fill token/chat_id to enable Telegram alerts
+  token: ""
+  chat_id: ""
+
+logging:
+  level: INFO
+  file: logs/alpaca_tjr.log
