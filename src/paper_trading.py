@@ -55,6 +55,7 @@ from .entry_checklist import (
     build_long_checklist,
     build_short_checklist,
 )
+from .task_supervisor import supervised
 
 logger = logging.getLogger(__name__)
 
@@ -816,7 +817,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             logger.info(_triarb_scanner.format_log(opps))
                     except Exception as e:
                         logger.debug(f"[TRIARB] scan failed: {e}")
-            _triarb_task = asyncio.create_task(_triarb_loop())
+            _triarb_task = asyncio.create_task(supervised('triarb', _triarb_loop, notifier=notifier))
             logger.info(f"[TRIARB] scanner started, cycles={len(DEFAULT_CYCLES)}")
         except Exception as e:
             logger.warning(f"[TRIARB] disabled: {e}")
@@ -930,11 +931,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.warning(f"[FUNDING] state merge failed: {_exc}")
 
             _funding_tasks = [
-                asyncio.create_task(_funding_scanner.start()),
-                asyncio.create_task(_funding_arb_sim.start()),
-                asyncio.create_task(_funding_arb_majors.start()),
-                asyncio.create_task(_funding_arb_kraken.start()),
-                asyncio.create_task(_merge_funding_state()),
+                asyncio.create_task(supervised('funding_scanner',     _funding_scanner.start,     notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_sim',     _funding_arb_sim.start,     notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_majors',  _funding_arb_majors.start,  notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_kraken',  _funding_arb_kraken.start,  notifier=notifier)),
+                asyncio.create_task(supervised('funding_merge_state', _merge_funding_state,        notifier=notifier)),
             ]
             logger.info("[FUNDING] scanner + 3 delta-neutral arb arms "
                         "(aggressive + majors-honest + kraken-executable) started")
@@ -975,17 +976,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _hourly_digest():
         await asyncio.sleep(3600)
         while trader.running:
-            s = trader.get_account_summary()
-            stats = journal.stats()
-            if notifier:
-                notifier.send_status(
-                    capital=s['total_equity'], pnl=s['total_pnl'],
-                    pnl_pct=s['pnl_pct'], open_positions=s['open_positions'],
-                    trades_today=stats.get('total', 0),
-                )
+            try:
+                s = trader.get_account_summary()
+                stats = journal.stats()
+                if notifier:
+                    notifier.send_status(
+                        capital=s['total_equity'], pnl=s['total_pnl'],
+                        pnl_pct=s['pnl_pct'], open_positions=s['open_positions'],
+                        trades_today=stats.get('total', 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[DIGEST] hourly digest failed: {e}")
             await asyncio.sleep(3600)
 
-    asyncio.create_task(_hourly_digest())
+    asyncio.create_task(supervised('hourly_digest', _hourly_digest, notifier=notifier))
 
     # ── Daily P&L summary (fires at midnight UTC) ──────────────────────────────
     day_start_equity = trader.initial_capital
@@ -993,103 +999,116 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _daily_summary():
         nonlocal day_start_equity
         while trader.running:
-            # Sleep until next midnight UTC
-            now = datetime.now(timezone.utc)
-            midnight = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0)
-            await asyncio.sleep((midnight - now).total_seconds())
+            try:
+                # Sleep until next midnight UTC
+                now = datetime.now(timezone.utc)
+                midnight = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                await asyncio.sleep((midnight - now).total_seconds())
 
-            if not trader.running:
-                break
+                if not trader.running:
+                    break
 
-            s      = trader.get_account_summary()
-            closed = trader.account.closed_trades
-            # Only count today's trades (since last midnight)
-            today  = [t for t in closed if hasattr(t, 'exit_time') and
-                      t.exit_time and
-                      (datetime.now(timezone.utc) - (t.exit_time if t.exit_time.tzinfo
-                       else t.exit_time.replace(tzinfo=timezone.utc))).days == 0]
-            wins   = [t for t in today if t.pnl > 0]
-            losses = [t for t in today if t.pnl <= 0]
-            best   = max((t.pnl for t in today), default=0.0)
-            worst  = min((t.pnl for t in today), default=0.0)
+                s      = trader.get_account_summary()
+                closed = trader.account.closed_trades
+                # Only count today's trades (since last midnight)
+                today  = [t for t in closed if hasattr(t, 'exit_time') and
+                          t.exit_time and
+                          (datetime.now(timezone.utc) - (t.exit_time if t.exit_time.tzinfo
+                           else t.exit_time.replace(tzinfo=timezone.utc))).days == 0]
+                wins   = [t for t in today if t.pnl > 0]
+                losses = [t for t in today if t.pnl <= 0]
+                best   = max((t.pnl for t in today), default=0.0)
+                worst  = min((t.pnl for t in today), default=0.0)
 
-            if notifier:
-                notifier.send_daily_summary(
-                    total_equity=s['total_equity'],
-                    start_equity=day_start_equity,
-                    trades=len(today),
-                    wins=len(wins),
-                    losses=len(losses),
-                    best_trade=best,
-                    worst_trade=worst,
-                )
-            day_start_equity = s['total_equity']   # reset for next day
+                if notifier:
+                    notifier.send_daily_summary(
+                        total_equity=s['total_equity'],
+                        start_equity=day_start_equity,
+                        trades=len(today),
+                        wins=len(wins),
+                        losses=len(losses),
+                        best_trade=best,
+                        worst_trade=worst,
+                    )
+                day_start_equity = s['total_equity']   # reset for next day
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[DIGEST] daily summary failed: {e}")
 
-    asyncio.create_task(_daily_summary())
+    asyncio.create_task(supervised('daily_summary', _daily_summary, notifier=notifier))
 
     # ── SL/TP watcher ──────────────────────────────────────────────────────────
     async def _sltp_watcher():
         while trader.running:
-            await asyncio.sleep(1)
-            if not trader.account.positions:
-                continue
-            ws_prices = public_ws.get_prices() if public_ws else {}
-            for sym in list(trader.account.positions.keys()):
-                price = ws_prices.get(sym) or prices.get(sym)
-                if not price:
+            try:
+                await asyncio.sleep(1)
+                if not trader.account.positions:
                     continue
-                pos = trader.account.positions.get(sym)
-                if not pos:
-                    continue
-                now = datetime.now(timezone.utc)
-                sig = pos.entry_signal
+                ws_prices = public_ws.get_prices() if public_ws else {}
+                for sym in list(trader.account.positions.keys()):
+                    try:
+                        price = ws_prices.get(sym) or prices.get(sym)
+                        if not price:
+                            continue
+                        pos = trader.account.positions.get(sym)
+                        if not pos:
+                            continue
+                        now = datetime.now(timezone.utc)
+                        sig = pos.entry_signal
 
-                # Use signal-derived SL/TP if available, else fallback
-                sl_pct = sig.stop_loss_pct()    / 100 if sig else trader.stop_loss_pct
-                tp_pct = sig.take_profit_pct()  / 100 if sig else trader.take_profit_pct
+                        # Use signal-derived SL/TP if available, else fallback
+                        sl_pct = sig.stop_loss_pct()    / 100 if sig else trader.stop_loss_pct
+                        tp_pct = sig.take_profit_pct()  / 100 if sig else trader.take_profit_pct
 
-                if pos.side == 'short':
-                    pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
-                    close_fn = trader.execute_cover
-                else:
-                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-                    close_fn = trader.execute_sell
+                        if pos.side == 'short':
+                            pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
+                            close_fn = trader.execute_cover
+                        else:
+                            pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+                            close_fn = trader.execute_sell
 
-                # Post-entry grace: a fresh taker entry sits ~spread underwater,
-                # so suppress the fixed stop for the first few seconds to avoid
-                # the ~2s noise flush seen in the journal audit. Trailing stop and
-                # take-profit are unaffected.
-                entry_dt = pos.entry_time if isinstance(pos.entry_time, datetime) else now
-                secs_open = (now - entry_dt).total_seconds()
+                        # Post-entry grace: a fresh taker entry sits ~spread underwater,
+                        # so suppress the fixed stop for the first few seconds to avoid
+                        # the ~2s noise flush seen in the journal audit. Trailing stop and
+                        # take-profit are unaffected.
+                        entry_dt = pos.entry_time if isinstance(pos.entry_time, datetime) else now
+                        secs_open = (now - entry_dt).total_seconds()
 
-                exit_reason = None
-                # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
-                trail_reason = update_trailing_stop(pos, price)
-                if trail_reason:
-                    exit_reason = trail_reason
-                elif pnl_pct / 100 <= -sl_pct and secs_open >= _MICRO_ENTRY_GRACE_SECS:
-                    exit_reason = 'STOP_LOSS'
-                elif pnl_pct / 100 >= tp_pct:
-                    # All tiers honor fixed TP — was previously gated to atr_stop only;
-                    # losers had MFE 0.23% so they never hit TP and bled out instead.
-                    exit_reason = 'TAKE_PROFIT'
+                        exit_reason = None
+                        # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
+                        trail_reason = update_trailing_stop(pos, price)
+                        if trail_reason:
+                            exit_reason = trail_reason
+                        elif pnl_pct / 100 <= -sl_pct and secs_open >= _MICRO_ENTRY_GRACE_SECS:
+                            exit_reason = 'STOP_LOSS'
+                        elif pnl_pct / 100 >= tp_pct:
+                            # All tiers honor fixed TP — was previously gated to atr_stop only;
+                            # losers had MFE 0.23% so they never hit TP and bled out instead.
+                            exit_reason = 'TAKE_PROFIT'
 
-                if exit_reason:
-                    trade = close_fn(sym, price, now, reason=exit_reason)
-                    if trade:
-                        recent_trades.append(_trade_to_dict(trade, sym, exit_reason))
-                        summary = trader.get_account_summary()
-                        equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
-                                         notifier, journal, ml_scorer, calibrator)
-                        _record_exit(sym, exit_reason)
-                        just_halted, halt_msg = circuit_breaker.record_outcome(
-                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
-                        if just_halted and notifier:
-                            notifier.send_message(halt_msg)
+                        if exit_reason:
+                            trade = close_fn(sym, price, now, reason=exit_reason)
+                            if trade:
+                                recent_trades.append(_trade_to_dict(trade, sym, exit_reason))
+                                summary = trader.get_account_summary()
+                                equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
+                                _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
+                                                 notifier, journal, ml_scorer, calibrator)
+                                _record_exit(sym, exit_reason)
+                                just_halted, halt_msg = circuit_breaker.record_outcome(
+                                    won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
+                                if just_halted and notifier:
+                                    notifier.send_message(halt_msg)
+                    except Exception as e:
+                        logger.error(f"[SLTP] error processing {sym}: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[SLTP] watcher iteration error: {e}")
 
-    asyncio.create_task(_sltp_watcher())
+    asyncio.create_task(supervised('sltp_watcher', _sltp_watcher, notifier=notifier, max_restarts=10))
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
@@ -1111,7 +1130,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 await asyncio.sleep(2)
             await asyncio.sleep(20)   # full cycle every ~26s
 
-    asyncio.create_task(_ofi_prefetcher())
+    asyncio.create_task(supervised('ofi_prefetcher', _ofi_prefetcher, notifier=notifier))
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
@@ -1133,7 +1152,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 await asyncio.sleep(3)
             await asyncio.sleep(45)   # full cycle every ~54s
 
-    asyncio.create_task(_htf_fetcher())
+    asyncio.create_task(supervised('htf_fetcher', _htf_fetcher, notifier=notifier))
 
     # ── OHLCV cache — one DataFrame per symbol, refreshed on candle close ──────
     ohlcv_cache:       Dict[str, pd.DataFrame] = {}
@@ -1380,7 +1399,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             except Exception as e:
                 logger.error(f"[CACHE] refresher error: {e}")
 
-    asyncio.create_task(_candle_refresher())
+    asyncio.create_task(supervised('candle_refresher', _candle_refresher, notifier=notifier, max_restarts=10))
 
     # ── Startup notification (so we know systemd restarts after a crash) ──────
     if notifier:
