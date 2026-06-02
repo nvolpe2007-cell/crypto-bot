@@ -186,6 +186,57 @@ def test_default_arm_breakeven_gate_unchanged(tmp_path, monkeypatch):
     assert sim.max_breakeven_cycles == fap.MAX_BREAKEVEN_CYCLES
 
 
+def _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0):
+    # Mirrors the live aggressive Kraken config: all-in single position,
+    # maker-only cost, gate relaxed to 6 cycles, cap raised to 300%.
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0054,
+        max_breakeven_cycles=6.0,
+        max_entry_apy=300.0,
+        max_positions=1,
+        min_position_usd=alloc, max_position_usd=alloc, max_total_notional=alloc,
+        state_file=tmp_path / "kraken_state.json",
+        label="Funding Arb (Kraken)",
+    )
+
+
+def test_aggressive_kraken_goes_all_in_one_position(tmp_path, monkeypatch):
+    # Two rich opportunities, but max_positions=1 → only one opens, sized at the
+    # full allocation (no conviction scaling since min==max==total).
+    opps = [
+        _opp("PF_OMIUSD", 160.0, exchange="Kraken Futures"),
+        _opp("PF_DEXEUSD", 145.0, exchange="Kraken Futures"),
+    ]
+    sim = _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+    pos = next(iter(sim.open_positions.values()))
+    assert abs(pos.size_usd - 500.0) < 1e-9          # all-in, full alloc
+    assert abs(pos.entry_cost - 0.0054 * 500.0) < 1e-9  # maker-only cost
+
+
+def test_aggressive_kraken_relaxed_gate_admits_rich_apy(tmp_path, monkeypatch):
+    # 150% APY: at 0.54% maker cost, breakeven ≈ 3.9 cycles < 6 → the relaxed
+    # gate admits it (the strict 2-cycle gate would have rejected it).
+    opp = _opp("PF_OMIUSD", 150.0, exchange="Kraken Futures")
+    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_aggressive_kraken_still_rejects_thin_funding(tmp_path, monkeypatch):
+    # 60% APY: breakeven = 0.0054 / (60/109500) ≈ 9.9 cycles > 6 → still skipped.
+    # Proves the +EV gate survives the relax — it's aggressive, not blind.
+    opp = _opp("PF_THINUSD", 60.0, exchange="Kraken Futures")
+    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
 def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     sim = _make_sim(tmp_path, [_opp("BTCUSDT", 40.0)], monkeypatch)
     sim._tick()

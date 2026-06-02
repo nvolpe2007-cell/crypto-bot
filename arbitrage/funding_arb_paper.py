@@ -175,6 +175,9 @@ class FundingArbPaperSim:
         source_allowlist: Optional[set] = None,
         state_file: Optional[Path] = None,
         label: str = "Funding Arb",
+        min_position_usd: float = MIN_POSITION_USD,
+        max_position_usd: float = MAX_POSITION_USD,
+        max_total_notional: float = MAX_TOTAL_NOTIONAL,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -182,6 +185,13 @@ class FundingArbPaperSim:
         self.max_entry_apy = max_entry_apy
         self.position_size_usd = position_size_usd
         self.max_positions = max_positions
+        # Per-arm conviction-sizing band (defaults to the module globals). Set
+        # min==max==total for an all-in single-position arm: every entry uses
+        # the full allocation, no conviction scaling. The Kraken arm uses this
+        # for the "aggressive, all money on one trade" config.
+        self.min_position_usd = min_position_usd
+        self.max_position_usd = max_position_usd
+        self.max_total_notional = max_total_notional
         # Per-instance config so the same class can run an aggressive arm
         # (all symbols, both funding sides) AND a conservative "honest" arm
         # (liquid majors, positive funding only, maker-fee cost) at once.
@@ -382,10 +392,10 @@ class FundingArbPaperSim:
         floor = max(self.min_entry_apy, self._apy_floor())
         cap = self.max_entry_apy
         if cap <= floor:
-            return MIN_POSITION_USD
+            return self.min_position_usd
         q = (abs(apy) - floor) / (cap - floor)
         q = max(0.0, min(1.0, q))
-        return MIN_POSITION_USD + (MAX_POSITION_USD - MIN_POSITION_USD) * q
+        return self.min_position_usd + (self.max_position_usd - self.min_position_usd) * q
 
     def _total_notional(self) -> float:
         return sum(p.size_usd for p in self.open_positions.values())
@@ -398,12 +408,12 @@ class FundingArbPaperSim:
         )
         # Conviction-weighted size, trimmed to stay within the total budget.
         size = self._size_for_apy(opp['apy'])
-        remaining = MAX_TOTAL_NOTIONAL - self._total_notional()
-        if remaining < MIN_POSITION_USD:
+        remaining = self.max_total_notional - self._total_notional()
+        if remaining < self.min_position_usd:
             logger.info(
                 f"[{self.label}] SKIP {opp['symbol']} ({opp['exchange']}) "
                 f"total notional ${self._total_notional():.0f} near cap "
-                f"${MAX_TOTAL_NOTIONAL:.0f}"
+                f"${self.max_total_notional:.0f}"
             )
             return
         size = min(size, remaining)
@@ -421,7 +431,7 @@ class FundingArbPaperSim:
             entry_cost=entry_cost,
         )
         self.open_positions[key] = pos
-        conviction_pct = pos.size_usd / MAX_POSITION_USD * 100
+        conviction_pct = pos.size_usd / self.max_position_usd * 100
         logger.info(
             f"[{self.label}] OPEN {pos.symbol} ({pos.exchange}) "
             f"apy={pos.entry_apy:.1f}% dir={direction} size=${pos.size_usd:.0f} "
@@ -434,7 +444,7 @@ class FundingArbPaperSim:
             f"{pos.exchange} {pos.symbol}\n"
             f"{pos.entry_apy:+.0f}% APY · {dir_label}\n"
             f"size <b>${pos.size_usd:.0f}</b> "
-            f"(conviction {conviction_pct:.0f}% of ${MAX_POSITION_USD:.0f} max) · "
+            f"(conviction {conviction_pct:.0f}% of ${self.max_position_usd:.0f} max) · "
             f"cost ${entry_cost:.2f}\n"
             f"<i>collects funding every {FUNDING_CYCLE_HOURS}h while open</i>"
         )

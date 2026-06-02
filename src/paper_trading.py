@@ -861,31 +861,39 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 label="Funding Arb (majors)",
             )
 
-            # Arm 3 — Kraken-only honest: opportunities sourced from Kraken Futures
-            # ONLY (the only venue an account this side of the geo-block can
-            # actually trade), positive-funding-only (no spot-borrow risk), and
-            # cost calibrated to Kraken retail (~0.64% round-trip: maker spot
-            # 0.25% + maker perp 0.02% per side × 2 sides + ~0.10% slippage).
-            # This is the ONLY arm whose +$X figure represents capturable edge —
-            # the other two arms remain as Binance/Bybit research baselines.
-            _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0064'))
-            # Persistence/expectancy gate: the Kraken arm's microcap funding
-            # empirically flips at cycle 0, so opening on the lax 10-cycle
-            # breakeven (which assumes ~3 days of rate persistence) bled ~$29
-            # on dead-on-arrival entries (memory funding_arb_kraken_bleed).
-            # Require funding to clear honest cost within a realistic hold
-            # (~2 cycles ≈ 16h). At 0.64% cost this is a strict bar the
-            # microcap band rarely meets — the arm correctly goes mostly idle
-            # rather than taking negative-EV trades. Tune via env.
+            # Arm 3 — Kraken-only, AGGRESSIVE maker-only config (user-requested).
+            # Opportunities sourced from Kraken Futures ONLY (the only venue an
+            # account this side of the geo-block can actually trade), positive-
+            # funding-only (no spot-borrow risk). Aggressive posture:
+            #   • maker-only cost (~0.54% round-trip: maker spot 0.25% + maker
+            #     perp 0.02% per side × 2 sides, ~0 slippage as a passive maker —
+            #     the spot maker fee is the floor; perps are near-free).
+            #   • ALL-IN: one position at a time (max_positions=1), full
+            #     allocation per trade (min==max==total), no conviction scaling.
+            #   • gate relaxed to ~6-cycle breakeven (≈2 days persistence) and
+            #     APY cap raised to 300% — still only enters when funding is
+            #     expected to clear the (lower) maker cost, so it passes on the
+            #     cycle-0 flip traps that bled ~$29 (memory funding_arb_kraken_bleed)
+            #     while trading the genuinely rich opportunities.
+            # CAVEAT (paper): maker fills + all-in on illiquid microcaps are not
+            # realistically executable live; the sim assumes fills.
+            _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0054'))
             _kraken_max_be = float(
-                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '2')
+                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '6')
             )
+            _kraken_cap = float(os.getenv('FUNDING_ARB_KRAKEN_MAX_APY', '300'))
+            _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '500'))
             _funding_arb_kraken = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
                 source_allowlist={'Kraken Futures'},
                 cost_frac=_kraken_cost,
                 max_breakeven_cycles=_kraken_max_be,
+                max_entry_apy=_kraken_cap,
+                max_positions=1,
+                min_position_usd=_kraken_alloc,
+                max_position_usd=_kraken_alloc,
+                max_total_notional=_kraken_alloc,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
             )
