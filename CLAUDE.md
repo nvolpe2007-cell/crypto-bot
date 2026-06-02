@@ -69,7 +69,7 @@ ssh crypto-bot-vps "journalctl -u crypto-bot -f"             # watch live
 `FUNDING_ARB_KRAKEN_COST_FRAC` (default 0.0054, maker-only),
 `FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 6),
 `FUNDING_ARB_KRAKEN_MAX_APY` (cap, default 300),
-`FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 500; arm is
+`FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 100; arm is
 `max_positions=1`). See memory `funding_arb_kraken_bleed`.
 
 ## Telegram

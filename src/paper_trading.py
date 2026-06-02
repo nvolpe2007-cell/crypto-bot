@@ -882,7 +882,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '6')
             )
             _kraken_cap = float(os.getenv('FUNDING_ARB_KRAKEN_MAX_APY', '300'))
-            _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '500'))
+            _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '100'))
             _funding_arb_kraken = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
