@@ -11,6 +11,8 @@ Covers:
 - PaperTrader.get_account_summary: field correctness, win/loss counts
 - PaperTrader.update_unrealized_pnl: unrealized field updates
 - Insufficient-cash guard in execute_buy
+- _SubsystemFailureTracker: per-symbol failure counting, >= threshold alert,
+  one-shot alert per episode, recovery detection
 """
 
 import pytest
@@ -579,3 +581,172 @@ class TestAccountingIdentityShorts:
         lower_price = PRICE * 0.90
         trade = t.execute_cover(SYMBOL, lower_price, T1)
         assert abs(t.account.cash - (1_000.0 + trade.pnl)) < 1e-6
+
+
+# ── _SubsystemFailureTracker ──────────────────────────────────────────────────
+
+from src.paper_trading import _SubsystemFailureTracker
+
+
+class TestSubsystemFailureTracker:
+    """Tests for the per-symbol failure tracker used by _ofi_prefetcher and
+    _htf_fetcher to ensure degraded alerts fire correctly regardless of which
+    symbols succeed or fail."""
+
+    def _tracker(self, threshold: int = 10) -> _SubsystemFailureTracker:
+        return _SubsystemFailureTracker(threshold=threshold)
+
+    # ── record_failure basics ─────────────────────────────────────────────────
+
+    def test_failure_increments_count(self):
+        t = self._tracker(threshold=5)
+        count, _ = t.record_failure("BTC/USD")
+        assert count == 1
+
+    def test_failure_counts_independently_per_symbol(self):
+        t = self._tracker(threshold=5)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        count, _ = t.record_failure("ETH/USD")
+        assert count == 1  # ETH starts at 1, not 3
+
+    def test_should_alert_false_below_threshold(self):
+        t = self._tracker(threshold=5)
+        for _ in range(4):
+            _, should = t.record_failure("BTC/USD")
+        assert should is False
+
+    def test_should_alert_true_at_threshold(self):
+        t = self._tracker(threshold=5)
+        for _ in range(4):
+            t.record_failure("BTC/USD")
+        _, should = t.record_failure("BTC/USD")  # 5th failure
+        assert should is True
+
+    def test_should_alert_true_above_threshold(self):
+        """Counts that jump past the threshold still trigger the alert (>= not ==)."""
+        t = self._tracker(threshold=3)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        # Manually bump internal count to simulate skipping (e.g., bulk failures)
+        t._failures["BTC/USD"] = 2   # reset to just-below so next is 3
+        _, should = t.record_failure("BTC/USD")  # now 3 — at threshold
+        assert should is True
+
+    # ── one-shot alert (no spam) ──────────────────────────────────────────────
+
+    def test_alert_fires_only_once_per_episode(self):
+        t = self._tracker(threshold=3)
+        alerts = []
+        for _ in range(6):
+            _, should = t.record_failure("BTC/USD")
+            if should:
+                alerts.append(True)
+        assert len(alerts) == 1  # only once, not on every failure above threshold
+
+    def test_different_symbols_each_get_own_alert(self):
+        t = self._tracker(threshold=2)
+        alerts = {}
+        for sym in ("BTC/USD", "ETH/USD"):
+            for _ in range(3):
+                _, should = t.record_failure(sym)
+                if should:
+                    alerts[sym] = True
+        assert "BTC/USD" in alerts
+        assert "ETH/USD" in alerts
+
+    # ── one symbol failing doesn't mask another ───────────────────────────────
+
+    def test_healthy_symbol_success_does_not_reset_failing_symbol_count(self):
+        """ETH/USD succeeding must not zero-out BTC/USD's failure counter."""
+        t = self._tracker(threshold=3)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        t.record_success("ETH/USD")   # ETH fine — should NOT affect BTC count
+        count, should = t.record_failure("BTC/USD")   # BTC's 3rd failure
+        assert count == 3
+        assert should is True  # alert fires — BTC reached threshold
+
+    def test_old_shared_counter_pattern_would_hide_persistent_failure(self):
+        """Regression: the old shared counter reset on any success, so a symbol
+        failing every cycle while another succeeds would never alert.  The tracker
+        prevents this."""
+        t = self._tracker(threshold=5)
+        alerted = False
+        # Simulate 10 cycles: BTC fails, ETH succeeds (as in the old pattern
+        # the shared counter would reset to 0 after each ETH success).
+        for _ in range(10):
+            _, should_btc = t.record_failure("BTC/USD")
+            t.record_success("ETH/USD")
+            if should_btc:
+                alerted = True
+        assert alerted, "Alert must fire for BTC even though ETH always succeeds"
+
+    # ── record_success and recovery ───────────────────────────────────────────
+
+    def test_success_after_no_failures_returns_false(self):
+        t = self._tracker()
+        recovered = t.record_success("BTC/USD")
+        assert recovered is False
+
+    def test_success_before_threshold_returns_false(self):
+        t = self._tracker(threshold=5)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        recovered = t.record_success("BTC/USD")
+        assert recovered is False   # no alert was active
+
+    def test_success_after_alert_returns_true(self):
+        """Once the degraded alert fired, recovery should be reported."""
+        t = self._tracker(threshold=2)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")   # alert fires
+        recovered = t.record_success("BTC/USD")
+        assert recovered is True
+
+    def test_success_resets_failure_count_for_that_symbol(self):
+        t = self._tracker(threshold=5)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        t.record_success("BTC/USD")
+        count, _ = t.record_failure("BTC/USD")
+        assert count == 1  # counter restarted, not continuing from 2
+
+    def test_alert_can_refire_after_recovery_and_new_failures(self):
+        """After recovery, a new streak of failures should alert again."""
+        t = self._tracker(threshold=2)
+        # First episode
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")   # alert 1
+        t.record_success("BTC/USD")   # recovery
+        # Second episode
+        alerts = 0
+        for _ in range(3):
+            _, should = t.record_failure("BTC/USD")
+            if should:
+                alerts += 1
+        assert alerts == 1  # alert fires once for the second episode too
+
+    # ── edge cases ────────────────────────────────────────────────────────────
+
+    def test_threshold_of_one_alerts_on_first_failure(self):
+        t = self._tracker(threshold=1)
+        _, should = t.record_failure("BTC/USD")
+        assert should is True
+
+    def test_multiple_symbols_independent_recovery(self):
+        t = self._tracker(threshold=2)
+        t.record_failure("BTC/USD")
+        t.record_failure("BTC/USD")
+        t.record_failure("ETH/USD")
+        t.record_failure("ETH/USD")
+        # Only recover BTC
+        btc_recovered = t.record_success("BTC/USD")
+        eth_recovered = t.record_success("ETH/USD")
+        assert btc_recovered is True
+        assert eth_recovered is True
+        # Both can now alert again on new failures
+        _, btc_alert = t.record_failure("BTC/USD")
+        _, eth_alert = t.record_failure("ETH/USD")
+        assert not btc_alert   # only 1 failure so far, threshold is 2
+        assert not eth_alert

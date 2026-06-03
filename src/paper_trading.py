@@ -14,7 +14,7 @@ import os
 import time
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Deque
+from typing import Dict, List, Optional, Deque, Tuple, Set
 from dataclasses import dataclass, field
 import logging
 
@@ -77,6 +77,49 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
     except Exception as e:
         logger.debug(f"[FUNDING] state read failed for {symbol}: {e}")
     return None
+
+
+# ── Per-symbol failure tracker for background fetchers ─────────────────────────
+
+class _SubsystemFailureTracker:
+    """Tracks per-symbol consecutive failures for background data fetchers.
+
+    The old pattern used a single shared counter reset by any symbol's success,
+    so a persistently-failing symbol would be masked by healthy ones and the
+    degraded-alert threshold could never be reached.  This class gives each
+    symbol its own counter and fires the alert exactly once per degraded episode,
+    with a recovery notification when the symbol comes back.
+    """
+
+    def __init__(self, threshold: int = 10):
+        self._threshold = threshold
+        self._failures: Dict[str, int] = {}
+        self._notified: Set[str] = set()   # symbols with a live degraded alert
+
+    def record_success(self, sym: str) -> bool:
+        """Record a successful fetch.
+
+        Returns True if the symbol had a live alert — caller should send a
+        recovery notification.
+        """
+        was_alerted = sym in self._notified
+        self._failures.pop(sym, None)
+        self._notified.discard(sym)
+        return was_alerted
+
+    def record_failure(self, sym: str) -> Tuple[int, bool]:
+        """Record a failed fetch.
+
+        Returns (current_count, should_alert).  should_alert is True only the
+        first time count reaches the threshold for this symbol — prevents spam
+        on every subsequent failure.
+        """
+        self._failures[sym] = self._failures.get(sym, 0) + 1
+        count = self._failures[sym]
+        should_alert = count >= self._threshold and sym not in self._notified
+        if should_alert:
+            self._notified.add(sym)
+        return count, should_alert
 
 
 # ── Adaptation state ───────────────────────────────────────────────────────────
@@ -1135,19 +1178,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
-        consecutive_failures = 0
+        tracker = _SubsystemFailureTracker(threshold=10)
         while trader.running:
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
-                    consecutive_failures = 0
+                    if tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>OFI data recovered</b>\n{sym} is responding again"
+                        )
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    count, should_alert = tracker.record_failure(sym)
+                    logger.warning(f"[OFI] fetch failed for {sym} (#{count}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>OFI subsystem degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
+                            f"{sym} failed {count} times in a row — "
                             f"trading without live order flow data"
                         )
                 await asyncio.sleep(2)
@@ -1157,19 +1203,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
-        consecutive_failures = 0
+        tracker = _SubsystemFailureTracker(threshold=10)
         while trader.running:
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
-                    consecutive_failures = 0
+                    if tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>HTF filter recovered</b>\n{sym} is responding again"
+                        )
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    count, should_alert = tracker.record_failure(sym)
+                    logger.warning(f"[HTF] fetch failed for {sym} (#{count}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>HTF filter degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
+                            f"{sym} failed {count} times in a row — "
                             f"multi-timeframe alignment unavailable"
                         )
                 await asyncio.sleep(3)
