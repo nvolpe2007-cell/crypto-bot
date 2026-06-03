@@ -72,13 +72,25 @@ class FundingScanner:
             except Exception as e:
                 logger.debug(f"Scan batch error: {e}")
 
-        # Sort by abs(APY) descending. Cap at 50 (was 20) so positive-funding
-        # opportunities aren't crowded off by high-|APY| negative-funding spikes
-        # — the source-restricted Kraken arm needs visibility into modest-APY
-        # positive-funding Kraken setups even when negative-funding mid-cap alts
-        # dominate the top of the ranking.
+        # Sort by abs(APY) descending, then cap at 50 — BUT preserve every
+        # liquid-major opportunity through the cap. The raw universe is dominated
+        # by extreme microcap perps (median ~315% APY), so a naive abs(APY) top-50
+        # crops out exactly the liquid majors (BTC/ETH/SOL at a modest, capturable
+        # 10-30% APY) that the conservative/Kraken arms are allowed to trade. That
+        # left the majors arm permanently idle and forced the Kraken arm onto
+        # microcaps. So: keep all majors, then backfill remaining slots with the
+        # highest-|APY| non-majors. MAJOR_SYMBOLS/_base_symbol are imported lazily
+        # to avoid any import cycle with funding_arb_paper.
         results.sort(key=lambda x: abs(x.apy), reverse=True)
-        self.opportunities = results[:50]
+        try:
+            from arbitrage.funding_arb_paper import MAJOR_SYMBOLS, _base_symbol
+            majors = [o for o in results if _base_symbol(o.symbol) in MAJOR_SYMBOLS]
+            others = [o for o in results if _base_symbol(o.symbol) not in MAJOR_SYMBOLS]
+            self.opportunities = (majors + others)[:50] if len(majors) >= 50 \
+                else majors + others[:50 - len(majors)]
+        except Exception as e:
+            logger.debug(f"Major-preserving truncation fell back to plain top-50: {e}")
+            self.opportunities = results[:50]
 
         # Funding alerts disabled — data still written to state for strategy use
 

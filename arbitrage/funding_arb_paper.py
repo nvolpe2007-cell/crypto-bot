@@ -107,6 +107,16 @@ _env_majors = os.getenv('FUNDING_ARB_MAJORS', '').strip()
 MAJOR_SYMBOLS = ({s.strip().upper() for s in _env_majors.split(',') if s.strip()}
                  if _env_majors else _DEFAULT_MAJORS)
 
+# Spot-borrow carry for short-spot legs (SHORT_SPOT_LONG_PERP, i.e. negative-
+# funding trades). Shorting spot requires borrowing the asset, which costs a
+# daily fee the old model ignored entirely — it charged only a one-off entry
+# cost and zero carry, so negative-funding microcap shorts looked free and
+# inflated the aggressive arm's P&L. Majors borrow cheap; illiquid alts/microcaps
+# borrow dear (often uneconomic). Applied per funding cycle while the short is
+# open. Set both to 0 to restore the old optimistic (borrow-free) baseline.
+BORROW_APY_MAJOR = float(os.getenv('FUNDING_ARB_BORROW_APY_MAJOR', '10'))
+BORROW_APY_ALT = float(os.getenv('FUNDING_ARB_BORROW_APY_ALT', '50'))
+
 
 def _base_symbol(symbol: str) -> str:
     """Strip exchange prefix + quote suffix → base asset.
@@ -114,14 +124,19 @@ def _base_symbol(symbol: str) -> str:
     'BTCUSDT' → 'BTC' (Binance/Bybit)
     'ETHUSD'  → 'ETH'
     'PF_SOLUSD' → 'SOL' (Kraken Futures multi-collateral perp prefix)
+    'PF_XBTUSD' → 'BTC' (Kraken lists Bitcoin as XBT, not BTC)
     """
     s = symbol.upper()
     if s.startswith('PF_'):       # Kraken Futures multi-collateral perp
         s = s[3:]
     for quote in ('USDT', 'USDC', 'USD'):
         if s.endswith(quote):
-            return s[: -len(quote)]
-    return s
+            s = s[: -len(quote)]
+            break
+    # Normalise exchange-specific aliases to a canonical base so symbol
+    # allowlists match across venues. Kraken uses XBT for Bitcoin (and XDG for
+    # Dogecoin); without this, PF_XBTUSD never matches a 'BTC' allowlist entry.
+    return {'XBT': 'BTC', 'XDG': 'DOGE'}.get(s, s)
 
 
 @dataclass
@@ -135,6 +150,7 @@ class PaperPosition:
     entry_time_iso: str
     funding_collected: float = 0.0   # GROSS funding accrued (before costs)
     entry_cost: float = 0.0          # round-trip transaction cost, charged at open
+    borrow_cost: float = 0.0         # cumulative spot-borrow carry (short-spot legs)
     cycles_collected: int = 0
     last_funding_ts_iso: Optional[str] = None
     # last_seen_iso tracks the most recent tick on which the scanner returned
@@ -153,8 +169,8 @@ class PaperPosition:
 
     @property
     def net_pnl(self) -> float:
-        """Funding collected minus the round-trip transaction cost."""
-        return self.funding_collected - self.entry_cost
+        """Funding collected minus transaction cost and spot-borrow carry."""
+        return self.funding_collected - self.entry_cost - self.borrow_cost
 
 
 class FundingArbPaperSim:
@@ -522,6 +538,19 @@ class FundingArbPaperSim:
         per_cycle_pnl = abs(current_rate_per_cycle) * pos.size_usd
         pos.funding_collected += per_cycle_pnl * cycles_due
         pos.cycles_collected += cycles_due
+
+        # Spot-borrow carry: only short-spot legs (SHORT_SPOT_LONG_PERP) pay it,
+        # since you must borrow the asset to short it. Long-spot legs own the
+        # asset outright, so they carry nothing. Charged per elapsed cycle for as
+        # long as the short is held (accrues even when off-scanner — you still
+        # owe borrow on the open short).
+        if pos.direction == "SHORT_SPOT_LONG_PERP":
+            borrow_apy = (BORROW_APY_MAJOR if _base_symbol(pos.symbol) in MAJOR_SYMBOLS
+                          else BORROW_APY_ALT)
+            borrow_per_cycle = (borrow_apy / 100.0) * pos.size_usd * \
+                (FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+            pos.borrow_cost += borrow_per_cycle * cycles_due
+
         pos.last_funding_ts_iso = (
             last_ts + timedelta(hours=cycles_due * FUNDING_CYCLE_HOURS)
         ).isoformat()
@@ -587,8 +616,8 @@ class FundingArbPaperSim:
                 + sum(p.funding_collected for p in self.closed_positions))
 
     def _total_costs(self) -> float:
-        return (sum(p.entry_cost for p in self.open_positions.values())
-                + sum(p.entry_cost for p in self.closed_positions))
+        return (sum(p.entry_cost + p.borrow_cost for p in self.open_positions.values())
+                + sum(p.entry_cost + p.borrow_cost for p in self.closed_positions))
 
     def _send_daily_rollup(self):
         total = self._total_pnl()
@@ -599,8 +628,9 @@ class FundingArbPaperSim:
 
         open_lines = [
             f"  • {p.exchange} {p.symbol}: net ${p.net_pnl:+.4f} "
-            f"(funding ${p.funding_collected:.4f} − cost ${p.entry_cost:.4f}, "
-            f"{p.cycles_collected} cycles, {p.entry_apy:.0f}% APY)"
+            f"(funding ${p.funding_collected:.4f} − cost ${p.entry_cost:.4f}"
+            + (f" − borrow ${p.borrow_cost:.4f}" if p.borrow_cost else "")
+            + f", {p.cycles_collected} cycles, {p.entry_apy:.0f}% APY)"
             for p in self.open_positions.values()
         ] or ["  (none)"]
 

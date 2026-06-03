@@ -901,10 +901,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 os.getenv('FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES', '2')
             )
             _kraken_max_flips = int(os.getenv('FUNDING_ARB_KRAKEN_MAX_FLIPS', '6'))
+            # Restrict the Kraken arm to liquid majors. The Kraken funding universe
+            # is almost entirely extreme microcap perps (PF_* alts with 300-600%+
+            # APY that flip funding at cycle 0) — that was the source of the -$27
+            # bleed: with no symbol filter the arm was forced to pick the "least
+            # insane" microcap. Confine it to the same MAJOR_SYMBOLS the majors arm
+            # uses; combined with the scanner's major-preserving truncation this
+            # gives it real, capturable Kraken-majors to trade. Override with
+            # FUNDING_ARB_KRAKEN_SYMBOLS="BTC,ETH,..." (comma-separated bases).
+            _env_kraken_syms = os.getenv('FUNDING_ARB_KRAKEN_SYMBOLS', '').strip()
+            _kraken_allowlist = ({s.strip().upper() for s in _env_kraken_syms.split(',') if s.strip()}
+                                 if _env_kraken_syms else MAJOR_SYMBOLS)
             _funding_arb_kraken = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
                 source_allowlist={'Kraken Futures'},
+                symbol_allowlist=_kraken_allowlist,
                 cost_frac=_kraken_cost,
                 max_breakeven_cycles=_kraken_max_be,
                 max_entry_apy=_kraken_cap,
