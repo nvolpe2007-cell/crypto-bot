@@ -398,17 +398,41 @@ class ProbabilityGate:
                  macro_state=None,
                  symbol: str = "BTC/USD") -> TradeReasoning:
 
+        # ── De-correlate the edge stack ──────────────────────────────────────
+        # The log-odds combiner (_stack) assumes conditional independence, but
+        # several raw edges are derived from the SAME underlying series. Stacking
+        # them double-counts one signal and inflates prob_win — the historical
+        # failure mode (prob_win clustered ~0.80 vs ~0.9% realized win rate).
+        # Collapse the two clearest identical-field double-counts:
+        #
+        #   1. gold & contagion both read corr_strength / gold_change_1d. On any
+        #      alt with an active macro driver BOTH fire from the same fields, so
+        #      keep only the stronger (max deviation from 0.5), not their product.
+        #   2. lead-lag on BTC is self-referential — BTC IS the lead symbol, so
+        #      the edge duplicates the BTC OFI edge. Suppress it for BTC.
+        #
+        # (The rule-confidence edge still mildly overlaps OFI/regime/RSI; it is a
+        # distinct calibrated aggregation, so it's retained and the downstream
+        # isotonic calibrator absorbs the residual correlation.)
+        _macro = max(
+            _gold_edge(macro_state, is_buy),
+            _contagion_edge(symbol, macro_state, is_buy),
+            key=lambda e: (e.present, abs(e.p_win - 0.5)),
+        )
+        _lead = _lead_lag_edge(getattr(sig, "lead_lag_dir", None), lead_strength, is_buy)
+        if symbol.startswith("BTC") and _lead.present:
+            _lead = Edge("lead_lag", 0.5, "Lead-lag self-referential on BTC", present=False)
+
         edges: List[Edge] = [
             _confidence_edge(getattr(sig, "confidence", 0.0)),
             _ofi_edge(getattr(sig, "ofi", None), is_buy),
-            _lead_lag_edge(getattr(sig, "lead_lag_dir", None), lead_strength, is_buy),
+            _lead,
             _regime_edge(getattr(sig, "regime", "UNKNOWN"), is_buy, entry_path),
             _rsi_edge(getattr(sig, "rsi", 50.0), is_buy),
             _adx_edge(getattr(sig, "adx", 20.0)),
             _htf_edge(htf_alignment, is_buy),
             _funding_edge(getattr(sig, "funding_rate", None), is_buy),
-            _gold_edge(macro_state, is_buy),
-            _contagion_edge(symbol, macro_state, is_buy),
+            _macro,
         ]
 
         present_probs = [e.p_win for e in edges if e.present]
