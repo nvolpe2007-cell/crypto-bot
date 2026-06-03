@@ -24,8 +24,11 @@ risk:
   max_position_size: 25   # max USD per trade — conservative for first live run
   stop_loss_pct: 2.0
   take_profit_pct: 3.0
-  max_daily_loss: 15      # bot stops for the day if total loss hits this
-  max_open_positions: 3
+  # These two are now read live by paper_trading.py (env vars MAX_DAILY_LOSS /
+  # MAX_OPEN_POSITIONS override). Values reflect the bot's actual aggressive
+  # posture; change them HERE to adjust risk — they are no longer ignored.
+  max_daily_loss: 10      # halt NEW entries for the UTC day if loss hits this (exits/funding continue)
+  max_open_positions: 4   # AGGRESSIVE: concurrent directional positions
 
 futures:
   enabled: true           # set true to enable perp trading

@@ -209,6 +209,7 @@ class ScalpingBot:
                 vol_monitor=vol_mon,
                 book_feed=book_feed,
                 trade_feed=trade_feed,
+                risk_cfg=risk_cfg,
             )
         except KeyboardInterrupt:
             logger.info("Interrupted by user")

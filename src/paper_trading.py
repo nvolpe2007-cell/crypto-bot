@@ -740,8 +740,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                      public_ws: Optional[KrakenPublicWS] = None,
                                      vol_monitor: Optional[CryptoVolMonitor] = None,
                                      book_feed=None,
-                                     trade_feed=None):
+                                     trade_feed=None,
+                                     risk_cfg: Optional[dict] = None):
 
+    risk_cfg = risk_cfg or {}
     trader.running    = True
     trader._started_at = datetime.now(timezone.utc).isoformat()
     logger.info(f"Starting paper trading session for {symbols}")
@@ -955,8 +957,14 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     if ml_scorer.should_retrain():
         ml_scorer.train()
 
-    max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS', 10))
+    # Risk limits: config.yaml is authoritative, env var overrides for ops.
+    max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS',
+                                          risk_cfg.get('max_daily_loss', 10)))
     session_start_equity = trader.initial_capital
+    # UTC-day-rolling baseline for the daily-loss circuit (reset at midnight).
+    risk_day             = datetime.now(timezone.utc).date()
+    risk_day_baseline    = trader.initial_capital
+    daily_entries_halted = False
 
     iteration = 0
     funnel = _FunnelStats()   # entry-funnel diagnostics, logged each heartbeat
@@ -1177,7 +1185,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # Tunables
     COOLDOWN_AFTER_STOP_SEC   = 300.0   # 5 min after STOP_LOSS / SL / signal_stop
     COOLDOWN_AFTER_SIGNAL_SEC = 60.0    # 1 min after signal-driven exits
-    MAX_OPEN_POSITIONS        = 4        # AGGRESSIVE: allow more concurrent positions
+    MAX_OPEN_POSITIONS        = int(os.getenv('MAX_OPEN_POSITIONS',
+                                              risk_cfg.get('max_open_positions', 4)))  # config-authoritative
     WS_PRICE_STALENESS_SEC    = 12.0    # skip entry if WS price older than this
     CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
     HEARTBEAT_INTERVAL_SEC    = 60.0
@@ -1429,18 +1438,31 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             await asyncio.sleep(EVAL_INTERVAL)
             iteration += 1
 
-            # Daily loss circuit breaker
+            # Daily loss circuit breaker — UTC-day-rolling baseline. Halts NEW
+            # entries for the rest of the day (exits + funding arms keep running)
+            # and resets at midnight UTC, instead of permanently killing the loop.
             current_equity = trader.get_account_summary()['total_equity']
-            daily_loss = session_start_equity - current_equity
-            if daily_loss >= max_daily_loss:
-                logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit")
+            _utc_today = datetime.now(timezone.utc).date()
+            if _utc_today != risk_day:
+                risk_day = _utc_today
+                risk_day_baseline = current_equity
+                if daily_entries_halted:
+                    logger.info("[RISK] New UTC day — daily-loss halt cleared")
+                daily_entries_halted = False
+            daily_loss = risk_day_baseline - current_equity
+            # Expose today's P&L fraction so the microstructure kill filter's
+            # DAILY_LOSS gate (Filter 7) can actually fire.
+            strategy._daily_pnl_pct = (current_equity - risk_day_baseline) / max(risk_day_baseline, 1e-9)
+            if daily_loss >= max_daily_loss and not daily_entries_halted:
+                logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit — "
+                               f"halting new entries until 00:00 UTC")
                 if notifier:
                     notifier.send_message(
                         f"🛑 <b>Daily loss limit hit</b>\n"
-                        f"Lost ${daily_loss:.2f} today — bot stopped for the day"
+                        f"Lost ${daily_loss:.2f} today — new entries halted until "
+                        f"00:00 UTC (exits and funding arms continue)"
                     )
-                trader.running = False
-                break
+                daily_entries_halted = True
 
             # Refresh CVaR every 50 iterations
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
@@ -1781,7 +1803,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.debug(f"[DUAL] probe failed for {symbol}: {_e}")
 
                 # ── LONG ENTRY ──────────────────────────────────────────────────
-                if sig.is_buy and pos is None:
+                if sig.is_buy and pos is None and not daily_entries_halted:
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
@@ -1915,7 +1937,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             )
 
                 # ── SHORT ENTRY ─────────────────────────────────────────────────
-                elif sig.is_sell and pos is None:
+                elif sig.is_sell and pos is None and not daily_entries_halted:
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
@@ -2551,10 +2573,14 @@ def _load_open_positions(trader):
             except Exception as e:
                 logger.warning(f"[POSITIONS] Could not restore position {p.get('symbol', '?')}: {e}")
                 continue
-        # Restore cash if it matches better than what we'd otherwise start with
-        if 'cash' in state and state['cash'] < trader.account.cash:
+        # Restore cash/PnL from the snapshot whenever positions were restored.
+        # The snapshot's cash already has each restored position's margin/notional
+        # deducted, so we MUST adopt it — keeping the fresh initial_capital while
+        # re-adding positions double-counts equity (a winning session, where
+        # saved cash > initial_capital, was previously skipped by the old guard).
+        if restored and 'cash' in state:
             trader.account.cash = float(state['cash'])
-            trader.account.total_pnl = float(state.get('total_pnl', 0.0))
+            trader.account.total_pnl = float(state.get('total_pnl', trader.account.total_pnl))
         return restored
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to load open positions from {_POSITIONS_FILE}: {e}")

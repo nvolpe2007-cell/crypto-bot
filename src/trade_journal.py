@@ -157,9 +157,13 @@ class TradeJournal:
             self.records = []
 
     def save(self):
+        # Atomic write: a crash mid-write would otherwise truncate the journal
+        # and lose all trade history. Write to a tmp file then os.replace.
         os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
-        with open(JOURNAL_FILE, 'w') as f:
+        tmp = JOURNAL_FILE + '.tmp'
+        with open(tmp, 'w') as f:
             json.dump([r.to_dict() for r in self.records], f, indent=2)
+        os.replace(tmp, JOURNAL_FILE)
 
     def add(self, record: TradeRecord):
         self.records.append(record)

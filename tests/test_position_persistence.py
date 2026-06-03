@@ -438,20 +438,23 @@ class TestEdgeCases:
         n = _load_open_positions(trader)
         assert n == 0
 
-    def test_cash_not_overwritten_if_saved_cash_higher(self, clean_positions_file):
-        """If saved cash > trader's current cash, don't restore (we only restore if saved < current)."""
+    def test_cash_restored_even_when_saved_higher(self, clean_positions_file):
+        """Saved cash is the source of truth on resume, even when it exceeds the
+        fresh-start capital (a winning session). The snapshot's cash already has
+        each restored position's cost deducted, so adopting it is required —
+        keeping the fresh initial_capital while re-adding positions would
+        double-count realized gains."""
         trader = _fresh_trader(capital=1_000.0)
         trader.account.positions['BTC/USD'] = _spot_position()
-        trader.account.cash = 2_000.0  # higher than initial (impossible in practice, but testing the guard)
+        trader.account.cash = 2_000.0  # winning session: realized gains above initial
 
         _save_open_positions(trader)
 
         trader2 = _fresh_trader(capital=1_000.0)  # starts with 1_000
         _load_open_positions(trader2)
 
-        # Saved cash (2000) > trader2's cash (1000): guard says only restore if saved < current,
-        # so cash should stay at 1000 (NOT overwritten to 2000).
-        assert trader2.account.cash == pytest.approx(1_000.0)
+        # Positions were restored, so the saved cash (2000) must be adopted.
+        assert trader2.account.cash == pytest.approx(2_000.0)
 
     def test_json_file_is_valid_after_save(self, clean_positions_file):
         trader = _fresh_trader()

@@ -361,7 +361,9 @@ class MicrostructureStrategy:
         except Exception:
             pass
 
-        daily_pnl_pct = 0.0  # paper_trading updates this via equity tracking
+        # paper_trading's main loop sets this each tick from real equity so the
+        # kill filter's DAILY_LOSS gate (Filter 7) can fire; 0.0 until first set.
+        daily_pnl_pct = float(getattr(self, '_daily_pnl_pct', 0.0))
         if funding_rate is not None:
             # Use funding_rate as proxy if state unavailable
             funding_opps_proxy = []

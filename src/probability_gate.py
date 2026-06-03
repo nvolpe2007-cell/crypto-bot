@@ -419,13 +419,15 @@ class ProbabilityGate:
         cal_active = self.calibrator is not None and getattr(self.calibrator, "is_active", False)
         decision_p = self.calibrator.calibrate(combined_p) if cal_active else combined_p
 
-        # R:R from the signal's own stop/target
+        # R:R from the signal's own stop/target. On a malformed signal fall back
+        # to a conservative 1.0 (not 2.0): an optimistic R:R inflates Kelly on
+        # exactly the signals we'd want to size DOWN.
         try:
             sl_pct = sig.stop_loss_pct()
             tp_pct = sig.take_profit_pct()
-            rr = (tp_pct / sl_pct) if sl_pct > 0 else 2.0
+            rr = (tp_pct / sl_pct) if sl_pct > 0 else 1.0
         except Exception:
-            rr = 2.0
+            rr = 1.0
 
         k_full = _kelly(decision_p, rr)
         k_quarter = k_full * 0.25

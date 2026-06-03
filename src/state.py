@@ -27,7 +27,12 @@ def write_state(data: Dict[str, Any]):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     try:
         existing = read_state()
-        for key in ('funding_opportunities', 'sentiment'):
+        # Preserve keys written by lower-frequency tasks so the 2s main-loop
+        # write doesn't clobber them. The funding-arb arm P&L is rewritten only
+        # every ~65s by _merge_funding_state; without preserving it here the
+        # dashboard would show blank/stale arb P&L ~97% of the time.
+        for key in ('funding_opportunities', 'sentiment',
+                    'funding_arb', 'funding_arb_majors', 'funding_arb_kraken'):
             if key not in data and key in existing:
                 data[key] = existing[key]
     except Exception:
