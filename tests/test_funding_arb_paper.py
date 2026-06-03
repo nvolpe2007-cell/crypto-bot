@@ -487,3 +487,204 @@ class TestShouldExit:
         assert abs(pos1.entry_cost - pos2.entry_cost) < 1e-9
         # last_seen_iso must survive the round-trip.
         assert pos2.last_seen_iso is not None
+
+
+# ── _base_symbol — symbol normalisation ──────────────────────────────────────
+
+class TestBaseSymbol:
+    """_base_symbol strips exchange-specific prefixes/suffixes and normalises
+    venue aliases (XBT→BTC, XDG→DOGE) so that symbol allowlists work across
+    Binance, Bybit, and Kraken Futures without per-venue special-casing."""
+
+    def test_binance_usdt_pair(self):
+        assert fap._base_symbol("BTCUSDT") == "BTC"
+
+    def test_binance_usd_pair(self):
+        assert fap._base_symbol("ETHUSD") == "ETH"
+
+    def test_binance_usdc_pair(self):
+        assert fap._base_symbol("SOLUSDC") == "SOL"
+
+    def test_kraken_futures_pf_prefix_stripped(self):
+        assert fap._base_symbol("PF_SOLUSD") == "SOL"
+
+    def test_kraken_xbt_alias_normalised_to_btc(self):
+        """Kraken lists Bitcoin as XBT; without normalisation PF_XBTUSD never
+        matches a 'BTC' entry in the symbol allowlist."""
+        assert fap._base_symbol("PF_XBTUSD") == "BTC"
+
+    def test_kraken_xdg_alias_normalised_to_doge(self):
+        """Kraken lists Dogecoin as XDG."""
+        assert fap._base_symbol("PF_XDGUSD") == "DOGE"
+
+    def test_lowercase_input(self):
+        assert fap._base_symbol("btcusdt") == "BTC"
+
+    def test_no_quote_suffix_returned_as_upper(self):
+        """Symbol with no recognised quote suffix is returned uppercased as-is."""
+        assert fap._base_symbol("BTC") == "BTC"
+
+    def test_quote_priority_usdt_before_usd(self):
+        """USDT must be stripped before USD so 'BTCUSDT' → 'BTC' not 'BTCUS'."""
+        result = fap._base_symbol("BTCUSDT")
+        assert result == "BTC"
+
+    def test_kraken_eth_pf_prefix(self):
+        assert fap._base_symbol("PF_ETHUSD") == "ETH"
+
+
+# ── _accrue_funding — borrow cost model ──────────────────────────────────────
+
+class TestBorrowCostAccrual:
+    """The borrow cost model for SHORT_SPOT_LONG_PERP (negative-funding) trades.
+
+    Shorting spot requires borrowing the asset; the old model charged only a
+    one-off entry cost and ignored carry, inflating the aggressive arm's P&L
+    on microcap shorts.  These tests pin the corrected behaviour.
+    """
+
+    def _short_pos(self, symbol: str = "BTCUSDT", size_usd: float = 500.0) -> PaperPosition:
+        """Return a SHORT_SPOT_LONG_PERP position with 1 funding cycle due."""
+        now = datetime.now(timezone.utc)
+        entry = now - timedelta(hours=9)   # 9h ago → int(9/8)=1 cycle due
+        return PaperPosition(
+            symbol=symbol,
+            exchange="Binance",
+            direction="SHORT_SPOT_LONG_PERP",
+            entry_apy=-40.0,
+            entry_rate_8h=-40.0 / 109500.0,  # fraction; 109500 = 1095*100
+            size_usd=size_usd,
+            entry_time_iso=entry.isoformat(),
+            last_funding_ts_iso=entry.isoformat(),
+        )
+
+    def _long_pos(self) -> PaperPosition:
+        """Return a LONG_SPOT_SHORT_PERP position with 1 funding cycle due."""
+        now = datetime.now(timezone.utc)
+        entry = now - timedelta(hours=9)
+        return PaperPosition(
+            symbol="BTCUSDT",
+            exchange="Binance",
+            direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=40.0,
+            entry_rate_8h=40.0 / 109500.0,
+            size_usd=500.0,
+            entry_time_iso=entry.isoformat(),
+            last_funding_ts_iso=entry.isoformat(),
+        )
+
+    def _sim(self, tmp_path, monkeypatch) -> FundingArbPaperSim:
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "s.json")
+        return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+
+    def test_long_position_never_accrues_borrow_cost(self, tmp_path, monkeypatch):
+        """LONG_SPOT_SHORT_PERP owns the spot asset outright — zero borrow needed."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._long_pos()
+        sim._accrue_funding(pos, _opp("BTCUSDT", 40.0), datetime.now(timezone.utc))
+        assert pos.borrow_cost == 0.0
+
+    def test_short_major_uses_major_borrow_rate(self, tmp_path, monkeypatch):
+        """SHORT_SPOT on a liquid major (BTC) charges BORROW_APY_MAJOR per cycle."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_short_alt_uses_higher_alt_borrow_rate(self, tmp_path, monkeypatch):
+        """SHORT_SPOT on an illiquid alt charges the steeper BORROW_APY_ALT."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="OBSCUREUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("OBSCUREUSDT", -40.0), datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_ALT / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_alt_borrow_rate_is_higher_than_major(self, tmp_path, monkeypatch):
+        """Sanity: alt borrow APY must exceed major borrow APY."""
+        assert fap.BORROW_APY_ALT > fap.BORROW_APY_MAJOR
+
+    def test_borrow_scales_with_multiple_cycles(self, tmp_path, monkeypatch):
+        """Three elapsed cycles → 3× the per-cycle borrow charge."""
+        sim = self._sim(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        # Override last timestamp so 3 cycles are due
+        pos.last_funding_ts_iso = (now - timedelta(hours=25)).isoformat()
+        pos.entry_time_iso = pos.last_funding_ts_iso
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), now)
+
+        cycles = int(25 // fap.FUNDING_CYCLE_HOURS)   # = 3
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+            * cycles
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_borrow_cost_accrues_off_scanner(self, tmp_path, monkeypatch):
+        """Borrow must keep accruing even when the symbol drops off the scanner
+        (current_opp=None) — the short is still open and the borrow is still owed."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, None, datetime.now(timezone.utc))  # off-scanner
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_net_pnl_deducts_borrow_from_short_position(self, tmp_path, monkeypatch):
+        """net_pnl must equal funding_collected − entry_cost − borrow_cost."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        pos.entry_cost = 1.50
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        assert pos.borrow_cost > 0.0    # sanity: borrow was charged
+        assert abs(
+            pos.net_pnl - (pos.funding_collected - pos.entry_cost - pos.borrow_cost)
+        ) < 1e-9
+
+    def test_total_costs_includes_borrow_for_short(self, tmp_path, monkeypatch):
+        """_total_costs() must aggregate entry_cost + borrow_cost so that
+        _total_pnl() == _total_gross_funding() - _total_costs() holds."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        pos.entry_cost = 1.50
+        sim.open_positions["Binance:BTCUSDT"] = pos
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        assert abs(
+            sim._total_costs() - (pos.entry_cost + pos.borrow_cost)
+        ) < 1e-9
+        assert abs(
+            sim._total_pnl() - (sim._total_gross_funding() - sim._total_costs())
+        ) < 1e-9
+
+    def test_kraken_xbt_symbol_uses_major_borrow_rate(self, tmp_path, monkeypatch):
+        """PF_XBTUSD: Kraken's XBT alias must map to BTC → major borrow rate."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="PF_XBTUSD", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("PF_XBTUSD", -40.0, exchange="Kraken Futures"),
+                            datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
