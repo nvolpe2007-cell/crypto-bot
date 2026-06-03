@@ -166,6 +166,30 @@ class KrakenPerpsExecutor(Executor):
             return symbol
         return f"{symbol}:USD"
 
+    def _reconcile_position(self, symbol: str) -> Optional[float]:
+        """
+        Query the exchange for the current net position size.
+        Returns positive for long, negative for short, 0.0 for flat, None on failure.
+        Called after a network exception during open_long/open_short to detect whether
+        the order actually executed (ghost-position guard).
+        """
+        try:
+            perp = self._perp_symbol(symbol)
+            positions = self.client.fetch_positions([perp])
+            for pos in (positions or []):
+                if pos.get("symbol") == perp:
+                    contracts = float(pos.get("contracts") or 0)
+                    side = pos.get("side", "")
+                    if side == "long":
+                        return contracts
+                    if side == "short":
+                        return -contracts
+                    return 0.0
+            return 0.0
+        except Exception as e:
+            logger.warning(f"[PERPS-LIVE] reconcile_position failed for {symbol}: {e}")
+            return None
+
     def _market_order(self, side: str, symbol: str, amount: float,
                       reduce_only: bool = False) -> Dict:
         perp   = self._perp_symbol(symbol)
@@ -193,6 +217,15 @@ class KrakenPerpsExecutor(Executor):
                                leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] open_long failed: {e}")
+            net = self._reconcile_position(symbol)
+            if net is not None and net > 0:
+                logger.warning(
+                    f"[PERPS-LIVE] open_long timed out but long position found on exchange "
+                    f"({net:.6f} {symbol}); updating local state to avoid ghost position."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, net, 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def open_short(self, symbol, price, size_usd, timestamp, **kw):
@@ -211,6 +244,15 @@ class KrakenPerpsExecutor(Executor):
                                leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] open_short failed: {e}")
+            net = self._reconcile_position(symbol)
+            if net is not None and net < 0:
+                logger.warning(
+                    f"[PERPS-LIVE] open_short timed out but short position found on exchange "
+                    f"({net:.6f} {symbol}); updating local state to avoid ghost position."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, abs(net), 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_long(self, symbol, price, timestamp, reason=""):

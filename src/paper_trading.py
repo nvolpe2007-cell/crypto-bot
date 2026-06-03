@@ -101,10 +101,13 @@ def _load_adaptations():
 
 def _save_adaptations():
     try:
-        os.makedirs('logs', exist_ok=True)
+        dir_path = os.path.dirname(_ADAPT_FILE) or '.'
+        os.makedirs(dir_path, exist_ok=True)
         _adapt['updated_at'] = datetime.now(timezone.utc).isoformat()
-        with open(_ADAPT_FILE, 'w') as f:
+        tmp_path = _ADAPT_FILE + '.tmp'
+        with open(tmp_path, 'w') as f:
             json.dump(_adapt, f, indent=2)
+        os.replace(tmp_path, _ADAPT_FILE)  # atomic on POSIX — no partial-write corruption
     except Exception as e:
         logger.error(f"[ADAPT] Save failed: {e}")
 

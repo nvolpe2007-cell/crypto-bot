@@ -579,3 +579,119 @@ class TestExecutorAbcContract:
     def test_default_supports_shorts_true(self):
         """Base Executor.supports_shorts() defaults True; spot overrides to False."""
         assert Executor.supports_shorts(None) is True
+
+
+# ── KrakenPerpsExecutor: reconciliation after network timeout ─────────────────
+
+class TestKrakenPerpsExecutorReconciliation:
+    """
+    When open_long/open_short raises (e.g. network timeout), the order may have
+    already executed on the exchange. _reconcile_position queries open positions
+    so the local _open_size stays consistent.
+    """
+
+    def _long_positions(self, symbol: str = "BTC/USD:USD", contracts: float = 0.002):
+        return [{"symbol": symbol, "side": "long", "contracts": contracts}]
+
+    def _short_positions(self, symbol: str = "BTC/USD:USD", contracts: float = 0.001):
+        return [{"symbol": symbol, "side": "short", "contracts": contracts}]
+
+    # ── _reconcile_position ───────────────────────────────────────────────────
+
+    def test_reconcile_returns_positive_for_long(self):
+        client = MagicMock()
+        client.fetch_positions.return_value = self._long_positions(contracts=0.002)
+        ex = KrakenPerpsExecutor(client)
+        assert ex._reconcile_position("BTC/USD") == pytest.approx(0.002)
+
+    def test_reconcile_returns_negative_for_short(self):
+        client = MagicMock()
+        client.fetch_positions.return_value = self._short_positions(contracts=0.001)
+        ex = KrakenPerpsExecutor(client)
+        assert ex._reconcile_position("BTC/USD") == pytest.approx(-0.001)
+
+    def test_reconcile_returns_zero_when_no_position(self):
+        client = MagicMock()
+        client.fetch_positions.return_value = []
+        ex = KrakenPerpsExecutor(client)
+        assert ex._reconcile_position("BTC/USD") == pytest.approx(0.0)
+
+    def test_reconcile_returns_none_when_query_fails(self):
+        client = MagicMock()
+        client.fetch_positions.side_effect = Exception("network error")
+        ex = KrakenPerpsExecutor(client)
+        assert ex._reconcile_position("BTC/USD") is None
+
+    def test_reconcile_ignores_unrelated_symbol(self):
+        client = MagicMock()
+        client.fetch_positions.return_value = [
+            {"symbol": "ETH/USD:USD", "side": "long", "contracts": 1.5}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        # BTC not in response → flat
+        assert ex._reconcile_position("BTC/USD") == pytest.approx(0.0)
+
+    # ── open_long ghost-position recovery ────────────────────────────────────
+
+    def test_open_long_recovers_when_position_found_after_timeout(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.return_value = self._long_positions(contracts=0.002)
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is True
+        assert result.is_leveraged is True
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.002)
+
+    def test_open_long_still_fails_when_reconciliation_finds_no_position(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("rejected")
+        client.fetch_positions.return_value = []
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is False
+        assert ex._open_size.get("BTC/USD", 0.0) == pytest.approx(0.0)
+
+    def test_open_long_still_fails_when_reconciliation_itself_fails(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.side_effect = Exception("also timed out")
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is False
+
+    def test_open_long_does_not_recover_when_short_found_instead(self):
+        # Exchange shows a short (from a different earlier trade) — not a long recovery
+        client = MagicMock()
+        client.create_order.side_effect = Exception("timeout")
+        client.fetch_positions.return_value = self._short_positions(contracts=0.001)
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is False
+
+    # ── open_short ghost-position recovery ────────────────────────────────────
+
+    def test_open_short_recovers_when_position_found_after_timeout(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.return_value = self._short_positions(contracts=0.001)
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_short("BTC/USD", 50_000.0, 50.0, NOW)
+        assert result.success is True
+        assert ex._open_size["BTC/USD"] == pytest.approx(-0.001)
+
+    def test_open_short_still_fails_when_reconciliation_finds_no_position(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("rejected")
+        client.fetch_positions.return_value = []
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_short("BTC/USD", 50_000.0, 50.0, NOW)
+        assert result.success is False
+
+    def test_open_short_does_not_recover_when_long_found_instead(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("timeout")
+        client.fetch_positions.return_value = self._long_positions(contracts=0.002)
+        ex = KrakenPerpsExecutor(client)
+        result = ex.open_short("BTC/USD", 50_000.0, 50.0, NOW)
+        assert result.success is False
