@@ -65,12 +65,19 @@ ssh crypto-bot-vps "journalctl -u crypto-bot -f"             # watch live
 ## Funding-arb env knobs (no code change)
 `FUNDING_ARB_MAX_APY` (cap, 150), `FUNDING_ARB_MIN_SIZE`/`MAX_SIZE`/`MAX_TOTAL`,
 `FUNDING_ARB_COST_FRAC`, `FUNDING_ARB_ROLLUP_HOURS`, `FUNDING_ARB_NOTIFY_PER_TRADE`,
-`FUNDING_ARB_ENABLED`. **Kraken arm (aggressive maker-only config):**
+`FUNDING_ARB_ENABLED`. **Spot-borrow carry (short-spot legs, i.e. negative-funding
+SHORT_SPOT_LONG_PERP trades — only the aggressive arm takes these):**
+`FUNDING_ARB_BORROW_APY_MAJOR` (default 10), `FUNDING_ARB_BORROW_APY_ALT` (default 50);
+set both 0 to restore the old borrow-free optimistic baseline. Without this the sim
+charged only a flat entry cost and no carry, inflating the aggressive arm's microcap
+shorts. **Kraken arm (aggressive maker-only config):**
 `FUNDING_ARB_KRAKEN_COST_FRAC` (default 0.0054, maker-only),
 `FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 6),
 `FUNDING_ARB_KRAKEN_MAX_APY` (cap, default 300),
 `FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 100; arm is
-`max_positions=1`), `FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES` (persistence
+`max_positions=1`), `FUNDING_ARB_KRAKEN_SYMBOLS` (base-symbol whitelist, default
+= MAJOR_SYMBOLS; restricts the arm to liquid Kraken-majors so it stops chasing
+microcaps), `FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES` (persistence
 gate, default 2; 0 disables), `FUNDING_ARB_KRAKEN_MAX_FLIPS` (serial-flipper
 blacklist, default 6). Funding-history tracker (`arbitrage/funding_history.py`,
 `data/funding_history.json`) tuned via `FUNDING_HISTORY_RETENTION_DAYS`/
