@@ -59,6 +59,12 @@ from .task_supervisor import supervised
 
 logger = logging.getLogger(__name__)
 
+# Kraken Futures maintenance margin rate.  A position is liquidated when the
+# unrealized loss consumes (1 - MAINT_MARGIN) of the initial margin.
+# Long liq_price  = entry × (1 − (1−MAINT) / leverage)
+# Short liq_price = entry × (1 + (1−MAINT) / leverage)
+_PERP_MAINT_MARGIN = float(os.getenv("PERP_MAINT_MARGIN", "0.02"))
+
 # ── Funding rate helper ────────────────────────────────────────────────────────
 _SYMBOL_TO_FUNDING = {
     'BTC/USD': 'BTCUSDT',
@@ -350,6 +356,7 @@ class PaperPosition:
     margin_locked:       float = 0.0    # USD locked as margin (= notional / leverage)
     funding_accrued:     float = 0.0    # cumulative funding paid (long) or collected (short)
     last_funding_ts:     Optional[datetime] = None
+    liquidation_price:   float = 0.0    # price at which the exchange force-closes (0 = no liq)
 
 
 @dataclass
@@ -433,6 +440,43 @@ class PaperTrader:
             pos.funding_accrued += delta
             pos.last_funding_ts = last_ts + timedelta(hours=cycles * 8)
 
+    def _liquidate(self, symbol: str, liq_price: float, timestamp: datetime) -> Optional['Trade']:
+        """Force-close a perp position at exactly liq_price (no additional slippage).
+
+        The exchange marks the position at the maintenance-margin boundary; the
+        trader loses almost all margin.  Entry fee was already deducted from cash
+        at open, so we add it back here to avoid double-counting (same pattern as
+        execute_sell / execute_cover).
+        """
+        if symbol not in self.account.positions:
+            return None
+        pos = self.account.positions[symbol]
+        if not pos.is_perp:
+            return None
+        self.accrue_funding(timestamp)
+        exit_fee   = liq_price * pos.size * self.fee_pct
+        total_fees = exit_fee + pos.entry_fee
+        if pos.side == 'buy':
+            pnl = (liq_price - pos.entry_price) * pos.size - total_fees + pos.funding_accrued
+        else:
+            pnl = (pos.entry_price - liq_price) * pos.size - total_fees + pos.funding_accrued
+        cost_basis = pos.margin_locked + pos.entry_fee
+        self.account.cash += pos.margin_locked + pos.entry_fee + pnl
+        pnl_pct = pnl / cost_basis * 100 if cost_basis else 0.0
+        self.account.total_pnl += pnl
+        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
+                      entry_price=pos.entry_price, exit_price=liq_price,
+                      size=pos.size, side='liquidation', pnl=pnl,
+                      pnl_pct=pnl_pct, fees=total_fees)
+        self.account.closed_trades.append(trade)
+        del self.account.positions[symbol]
+        logger.warning(
+            f"[LIQUIDATED] {symbol} @ ${liq_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%)"
+            f"  margin_lost=${pos.margin_locked:.2f}"
+            f"  funding=${pos.funding_accrued:+.4f}"
+        )
+        return trade
+
     def _slippage_pct_for(self, symbol: str, price: float) -> float:
         """
         Realistic slippage = max(floor, 0.5 × spread_pct).
@@ -470,6 +514,10 @@ class PaperTrader:
         if size <= 0 or total_cost > self.account.cash:
             return None
 
+        liq_price = (
+            exec_price * (1.0 - (1.0 - _PERP_MAINT_MARGIN) / self.leverage)
+            if self.perp_mode else 0.0
+        )
         self.account.cash -= total_cost
         pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
                             size=size, side='buy', entry_fee=fee, entry_signal=signal,
@@ -479,10 +527,12 @@ class PaperTrader:
                             is_perp=self.perp_mode,
                             leverage=self.leverage,
                             margin_locked=margin_req,
-                            last_funding_ts=timestamp)
+                            last_funding_ts=timestamp,
+                            liquidation_price=liq_price)
         self.account.positions[symbol] = pos
         tag = "[LONG-PERP]" if self.perp_mode else "[BUY]"
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
+        liq_note = f"  liq=${liq_price:,.2f}" if self.perp_mode else ""
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}{liq_note}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}{liq_note}")
         return pos
 
     def execute_sell(self, symbol: str, price: float, timestamp: datetime,
@@ -543,6 +593,11 @@ class PaperTrader:
 
         if size <= 0 or total_cost > self.account.cash:
             return None
+
+        liq_price = (
+            exec_price * (1.0 + (1.0 - _PERP_MAINT_MARGIN) / self.leverage)
+            if self.perp_mode else 0.0
+        )
         self.account.cash -= total_cost
         pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
                             size=size, side='short', entry_fee=fee, entry_signal=signal,
@@ -552,10 +607,12 @@ class PaperTrader:
                             is_perp=self.perp_mode,
                             leverage=self.leverage,
                             margin_locked=margin_req,
-                            last_funding_ts=timestamp)
+                            last_funding_ts=timestamp,
+                            liquidation_price=liq_price)
         self.account.positions[symbol] = pos
         tag = "[SHORT-PERP]" if self.perp_mode else "[SHORT]"
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
+        liq_note = f"  liq=${liq_price:,.2f}" if self.perp_mode else ""
+        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}{liq_note}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}{liq_note}")
         return pos
 
     def execute_cover(self, symbol: str, price: float, timestamp: datetime,
@@ -647,23 +704,45 @@ class PaperTrader:
                     f"size={partial_size:.6f}  pnl=${pnl_partial:+.4f}")
         return pnl_partial
 
-    def update_unrealized_pnl(self, prices: Dict[str, float]):
+    def update_unrealized_pnl(self, prices: Dict[str, float]) -> List[str]:
+        """Update unrealized PnL and excursion stats for all open positions.
+
+        Returns a list of symbols that were liquidated this tick (perp only).
+        Callers may use this to send alerts; existing callers that ignore the
+        return value are unaffected.
+        """
+        to_liquidate: List[str] = []
         for sym, pos in self.account.positions.items():
-            if sym in prices:
-                p = prices[sym]
-                raw = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
-                # Perp positions accrue funding continuously; include it so that
-                # get_account_summary() and the daily circuit breaker see the true
-                # equity (funding paid by longs reduces equity, collected by shorts
-                # increases it) before the position is closed.
-                pos.unrealized_pnl = raw + pos.funding_accrued if pos.is_perp else raw
-                # Track excursions (favorable = direction we want, adverse = against us)
-                if pos.side == 'buy':
-                    if p > pos.peak_favorable_price: pos.peak_favorable_price = p
-                    if p < pos.peak_adverse_price:   pos.peak_adverse_price   = p
-                else:   # short
-                    if p < pos.peak_favorable_price: pos.peak_favorable_price = p
-                    if p > pos.peak_adverse_price:   pos.peak_adverse_price   = p
+            if sym not in prices:
+                continue
+            p = prices[sym]
+            raw = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
+            # Perp positions accrue funding continuously; include it so that
+            # get_account_summary() and the daily circuit breaker see the true
+            # equity (funding paid by longs reduces equity, collected by shorts
+            # increases it) before the position is closed.
+            pos.unrealized_pnl = raw + pos.funding_accrued if pos.is_perp else raw
+            # Track excursions (favorable = direction we want, adverse = against us)
+            if pos.side == 'buy':
+                if p > pos.peak_favorable_price: pos.peak_favorable_price = p
+                if p < pos.peak_adverse_price:   pos.peak_adverse_price   = p
+            else:   # short
+                if p < pos.peak_favorable_price: pos.peak_favorable_price = p
+                if p > pos.peak_adverse_price:   pos.peak_adverse_price   = p
+            # Liquidation check — only for perp positions that have a computed boundary
+            if pos.is_perp and pos.liquidation_price > 0:
+                if pos.side == 'buy' and p <= pos.liquidation_price:
+                    to_liquidate.append(sym)
+                elif pos.side == 'short' and p >= pos.liquidation_price:
+                    to_liquidate.append(sym)
+
+        liquidated: List[str] = []
+        for sym in to_liquidate:
+            if sym in self.account.positions:
+                liq_price = self.account.positions[sym].liquidation_price
+                self._liquidate(sym, liq_price, datetime.now(timezone.utc))
+                liquidated.append(sym)
+        return liquidated
 
     def get_account_summary(self) -> Dict:
         # Perp positions: only margin_locked is the actual capital at risk, not full notional.
@@ -2170,7 +2249,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         prices[sym] = p
                         last_ws_price_time[sym] = time.time()
                         lead_lag.update_price(sym, p)
-            trader.update_unrealized_pnl(prices)
+            liquidated_syms = trader.update_unrealized_pnl(prices)
+            for liq_sym in liquidated_syms:
+                liq_msg = f"⚠️ LIQUIDATED {liq_sym} — full margin lost (paper mode)"
+                logger.warning(liq_msg)
+                if notifier:
+                    try:
+                        notifier.send_message(liq_msg)
+                    except Exception as _liq_err:
+                        logger.debug(f"[NOTIFY] liquidation alert failed: {_liq_err}")
             if trader.perp_mode:
                 trader.accrue_funding(datetime.now(timezone.utc))
 

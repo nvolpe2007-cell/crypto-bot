@@ -478,3 +478,123 @@ class TestPerpUnrealizedPnlIncludesFunding:
         s = t.get_account_summary()
         # cash=900, margin=100, price_pnl=5, funding=-0.02 → equity = 1004.98
         assert abs(s["total_equity"] - 1_004.98) < 1e-6
+
+
+# ── Liquidation price tracking ─────────────────────────────────────────────────
+
+class TestPerpLiquidation:
+    """
+    Liquidation price is computed at entry; update_unrealized_pnl force-closes
+    the position when price crosses that boundary.
+
+    Formulas (MAINT = 0.02 default):
+      Long  liq = entry × (1 − (1−MAINT) / leverage)
+      Short liq = entry × (1 + (1−MAINT) / leverage)
+    """
+
+    # ── liquidation_price set at entry ────────────────────────────────────────
+
+    def test_long_liquidation_price_computed_on_entry(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        # (1 − 0.98/10) × 50000 = 0.902 × 50000 = 45100
+        expected = PRICE * (1.0 - 0.98 / 10.0)
+        assert abs(pos.liquidation_price - expected) < 0.01
+
+    def test_short_liquidation_price_computed_on_entry(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        # (1 + 0.98/10) × 50000 = 1.098 × 50000 = 54900
+        expected = PRICE * (1.0 + 0.98 / 10.0)
+        assert abs(pos.liquidation_price - expected) < 0.01
+
+    def test_spot_position_has_no_liquidation_price(self):
+        t = PaperTrader(initial_capital=1_000.0, fee_pct=0.0, slippage_pct=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos.liquidation_price == 0.0
+
+    # ── liquidation fires via update_unrealized_pnl ───────────────────────────
+
+    def test_long_liquidated_when_price_drops_to_liq(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        pos = t.account.positions[SYMBOL]
+        liq = pos.liquidation_price
+        liquidated = t.update_unrealized_pnl({SYMBOL: liq})
+        assert SYMBOL in liquidated
+        assert SYMBOL not in t.account.positions
+
+    def test_long_not_liquidated_above_liq_price(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        pos = t.account.positions[SYMBOL]
+        safe_price = pos.liquidation_price + 1.0
+        liquidated = t.update_unrealized_pnl({SYMBOL: safe_price})
+        assert liquidated == []
+        assert SYMBOL in t.account.positions
+
+    def test_short_liquidated_when_price_rises_to_liq(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        pos = t.account.positions[SYMBOL]
+        liq = pos.liquidation_price
+        liquidated = t.update_unrealized_pnl({SYMBOL: liq})
+        assert SYMBOL in liquidated
+        assert SYMBOL not in t.account.positions
+
+    def test_short_not_liquidated_below_liq_price(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        pos = t.account.positions[SYMBOL]
+        safe_price = pos.liquidation_price - 1.0
+        liquidated = t.update_unrealized_pnl({SYMBOL: safe_price})
+        assert liquidated == []
+        assert SYMBOL in t.account.positions
+
+    def test_spot_never_liquidated(self):
+        t = PaperTrader(initial_capital=1_000.0, fee_pct=0.0, slippage_pct=0.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        liquidated = t.update_unrealized_pnl({SYMBOL: 0.01})  # price → 0
+        assert liquidated == []
+        assert SYMBOL in t.account.positions
+
+    # ── accounting after liquidation ──────────────────────────────────────────
+
+    def test_liquidated_trade_recorded_with_side_liquidation(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        liq = t.account.positions[SYMBOL].liquidation_price
+        t.update_unrealized_pnl({SYMBOL: liq})
+        assert len(t.account.closed_trades) == 1
+        assert t.account.closed_trades[0].side == 'liquidation'
+
+    def test_liquidation_pnl_approximately_minus_margin(self):
+        """At liquidation price the loss should be ≈ margin × (1 - MAINT_MARGIN)."""
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0,
+                         initial_capital=1_000.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        pos = t.account.positions[SYMBOL]
+        margin = pos.margin_locked          # 100/10 = $10
+        liq = pos.liquidation_price
+        t.update_unrealized_pnl({SYMBOL: liq})
+        trade = t.account.closed_trades[0]
+        # Expected loss: margin × (1 − MAINT) = 10 × 0.98 = $9.80
+        expected_loss = -margin * (1.0 - 0.02)
+        assert abs(trade.pnl - expected_loss) < 0.01
+
+    def test_accounting_identity_after_liquidation(self):
+        """After liquidation, total_equity == initial_capital + total_pnl."""
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0,
+                         initial_capital=1_000.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        liq = t.account.positions[SYMBOL].liquidation_price
+        t.update_unrealized_pnl({SYMBOL: liq})
+        s = t.get_account_summary()
+        assert s['open_positions'] == 0
+        assert abs(s['total_equity'] - (1_000.0 + s['total_pnl'])) < 1e-6
+
+    def test_update_unrealized_pnl_returns_empty_list_when_no_liq(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        result = t.update_unrealized_pnl({SYMBOL: PRICE * 0.99})
+        assert result == []
