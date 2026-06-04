@@ -110,13 +110,36 @@ class TestStack:
         assert result >= MIN_PROBABILITY
 
     def test_math_formula(self):
-        """Log-odds (naive-Bayes) combine: logit(P) = Σ logit(p_eff),
-        with p_eff clamped to [0.5, 0.95]."""
+        """Correlation-shrunk log-odds: logit(P) = (1−λ)·max logit + λ·Σ logit,
+        with p_eff clamped to [0.5, 0.95] and λ = EDGE_CORRELATION_LAMBDA."""
         import math
+        from src.probability_gate import EDGE_CORRELATION_LAMBDA as lam
         probs = [0.62, 0.58]
-        total_logit = sum(math.log(p / (1.0 - p)) for p in probs)
+        logits = [math.log(p / (1.0 - p)) for p in probs]
+        total_logit = (1.0 - lam) * max(logits) + lam * sum(logits)
         expected = 1.0 / (1.0 + math.exp(-total_logit))
         assert _stack(probs) == pytest.approx(expected)
+
+    def test_lambda_one_recovers_pure_log_odds(self):
+        """λ=1.0 must reduce to the independent naive-Bayes stack (Σ logit)."""
+        import math
+        probs = [0.62, 0.58, 0.55]
+        total_logit = sum(math.log(p / (1.0 - p)) for p in probs)
+        expected = 1.0 / (1.0 + math.exp(-total_logit))
+        assert _stack(probs, corr_lambda=1.0) == pytest.approx(expected)
+
+    def test_shrinkage_is_below_pure_log_odds(self):
+        """The default shrunk combiner must be strictly more conservative than
+        the un-shrunk (λ=1) stack whenever ≥2 edges are present."""
+        probs = [0.60, 0.58, 0.57]
+        assert _stack(probs) < _stack(probs, corr_lambda=1.0)
+
+    def test_shrinkage_grows_sublinearly_in_edge_count(self):
+        """Adding identical correlated edges should add less each time —
+        the marginal lift of the 4th 0.55 edge < lift of the 2nd."""
+        lift_2 = _stack([0.55, 0.55]) - _stack([0.55])
+        lift_4 = _stack([0.55] * 4) - _stack([0.55] * 3)
+        assert 0 < lift_4 < lift_2
 
     def test_log_odds_is_more_conservative_than_noisy_or(self):
         """Regression guard: the new combiner must NOT saturate the way noisy-OR

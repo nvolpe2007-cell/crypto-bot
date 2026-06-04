@@ -51,12 +51,29 @@ KELLY_REF = float(os.getenv("PROB_GATE_KELLY_REF", "0.10"))
 # Master switch
 ENABLED = os.getenv("PROB_GATE_ENABLED", "1") == "1"
 
+# Correlation-shrinkage factor for the log-odds combiner. The edges fed to
+# _stack are NOT conditionally independent — OFI, regime, RSI, ADX, HTF and the
+# rule-confidence aggregate are all derived from the same recent price/volume
+# series. Naive-Bayes log-odds (Σ logit) assumes independence and therefore
+# systematically OVERSTATES confidence when predictors are positively correlated.
+# The intended correction was the downstream isotonic calibrator, but it only
+# activates once there are ≥40 real same-version journal records; until then the
+# gate runs on the raw combined_p and MIN_PROBABILITY is being applied to an
+# inflated number. λ<1 discounts every edge beyond the strongest one to a
+# fraction of its marginal log-odds (effective-sample-size shrinkage / a
+# log-opinion pool with sub-unit weights), which is the honest combiner for
+# correlated evidence. λ=1.0 restores the pure independent-naive-Bayes stack.
+EDGE_CORRELATION_LAMBDA = float(os.getenv("PROB_GATE_EDGE_CORR_LAMBDA", "0.6"))
+
 # Probability-model version. Bump whenever the combiner math changes enough that
 # old journaled `prob_win` values are no longer comparable — the calibrator keys
 # off this so a combiner change can't poison its fit with stale-distribution data.
+# Keep calibration.MIN_MODEL_VERSION in lock-step.
 #   v1 = noisy-OR _stack  (pre-2026-05-30; prob_win clustered ~0.80)
 #   v2 = log-odds _stack  (2026-05-30; honest, lower, rank-informative)
-PROB_MODEL_VERSION = 2
+#   v3 = correlation-shrunk log-odds (2026-06-03; discounts correlated edges so
+#        the raw combined_p stops overcounting while the calibrator is starved)
+PROB_MODEL_VERSION = 3
 
 # ── Conviction tiers (size in USD, intended hold) ─────────────────────────
 #   Tier is selected by combined P(win) and number of edges present.
@@ -134,9 +151,9 @@ def _classify_tier(combined_p: float, n_edges: int) -> tuple:
     return name, min(usd, MAX_TRADE_USD), hold, trail
 
 
-def _stack(probs: List[float]) -> float:
-    """Combine independent edge priors into one win probability via LOG-ODDS
-    (naive-Bayes), NOT noisy-OR.
+def _stack(probs: List[float], corr_lambda: Optional[float] = None) -> float:
+    """Combine edge priors into one win probability via CORRELATION-SHRUNK
+    LOG-ODDS (naive-Bayes), NOT noisy-OR.
 
     Previously this used P = 1 - ∏(1 - p_i), the noisy-OR formula for the
     probability that *at least one of several independent causes* fires. That is
@@ -148,19 +165,33 @@ def _stack(probs: List[float]) -> float:
 
     Log-odds is the correct combiner for conditionally-independent evidence:
         logit(P) = Σ logit(p_i)        (since logit(0.5) = 0, neutral edges add 0)
-    Two 0.56 edges → P≈0.62; three 0.53 edges → P≈0.59 — honest, and monotonic in
-    edge strength rather than saturating on edge count. Edges remain heavily
-    correlated (all derived from recent price/volume), so this still mildly
-    overcounts; the downstream isotonic calibrator now has real spread to correct.
+    but our edges are NOT independent — OFI, regime, RSI, ADX, HTF and the
+    rule-confidence aggregate all read the same recent price/volume series, so a
+    plain sum double-counts one underlying signal and re-inflates prob_win (the
+    original failure mode). The downstream isotonic calibrator was meant to absorb
+    this, but it stays inactive until ~40 real same-version trades exist, so the
+    raw combined_p must be honest on its own.
+
+    Correlation shrinkage (λ = EDGE_CORRELATION_LAMBDA, default 0.6): the single
+    STRONGEST edge keeps its full marginal log-odds (it is the prior), and every
+    additional edge contributes only λ of its marginal log-odds. Closed form:
+
+        logit(P) = (1 − λ)·max_i logit(p_i)  +  λ·Σ_i logit(p_i)
+
+    This preserves single-edge identity (one edge → its own p), stays commutative,
+    remains monotone in both edge strength and count, but grows the stack
+    SUBLINEARLY in the number of correlated edges instead of summing them naively.
+    λ=1.0 recovers the pure independent stack; λ→0 trusts only the best edge.
 
     Per-edge p clamped to [0.5, 0.95]; result clipped to [0.5, 0.97].
     """
     if not probs:
         return 0.5
-    total_logit = 0.0
-    for p in probs:
-        p_eff = max(0.5, min(0.95, p))
-        total_logit += math.log(p_eff / (1.0 - p_eff))
+    lam = EDGE_CORRELATION_LAMBDA if corr_lambda is None else corr_lambda
+    logits = [math.log(p_eff / (1.0 - p_eff))
+              for p in probs
+              for p_eff in (max(0.5, min(0.95, p)),)]
+    total_logit = lam * sum(logits) + (1.0 - lam) * max(logits)
     p_total = 1.0 / (1.0 + math.exp(-total_logit))
     return max(0.5, min(0.97, p_total))
 

@@ -55,12 +55,14 @@ FULL_TRUST_N  = int(os.getenv('CALIB_FULL_TRUST_N', '200'))  # n at which shrink
 REFIT_EVERY   = int(os.getenv('CALIB_REFIT_EVERY', '25'))    # refit after this many new records
 
 # Only calibrate on records whose probability-model version is at least this.
-# The gate's combiner changed (noisy-OR → log-odds, probability_gate.PROB_MODEL_VERSION),
-# so legacy v0/v1 prob_win values come from a different distribution and would
-# poison the fit (e.g. the May-2026 audit's 228 trades clustered prob_win ~0.80
-# at a 0.9% win rate → would map everything to reject-all and freeze the gate).
-# Keep this in lock-step with PROB_MODEL_VERSION.
-MIN_MODEL_VERSION = int(os.getenv('CALIB_MIN_MODEL_VERSION', '2'))
+# The gate's combiner has changed twice (noisy-OR → log-odds → correlation-shrunk
+# log-odds, probability_gate.PROB_MODEL_VERSION), so older prob_win values come
+# from a different distribution and would poison the fit (e.g. the May-2026
+# audit's 228 trades clustered prob_win ~0.80 at a 0.9% win rate → would map
+# everything to reject-all and freeze the gate). Keep this in lock-step with
+# PROB_MODEL_VERSION — now v3 (the v3 shrink lowered the combined_p distribution,
+# so v2 records are no longer comparable).
+MIN_MODEL_VERSION = int(os.getenv('CALIB_MIN_MODEL_VERSION', '3'))
 
 # Output is clipped to the same band the gate's _stack() uses, so calibration
 # can never produce a probability the rest of the system treats as impossible.
