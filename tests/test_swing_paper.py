@@ -6,6 +6,8 @@ bar, closing on target, and idempotency (already-seen bars don't re-trade).
 """
 from pathlib import Path
 
+import pytest
+
 import swing_paper
 from src.swing_strategy import SwingStrategy
 from src.decision_log import DecisionLog
@@ -81,6 +83,21 @@ def test_idempotent_no_new_bars(tmp_path):
     n = swing_paper.process_symbol("BTC", bars, state, strat, dlog)
     assert n == 0
     assert state["positions"] == open_after_first
+
+
+def test_equity_tracks_closed_pnl(tmp_path):
+    bars = _entry_bars()
+    state = _fresh_state(bars)
+    state["equity"] = state["starting_equity"] = 500.0
+    strat, dlog = SwingStrategy(), _dlog(tmp_path)
+    swing_paper.process_symbol("BTC", bars, state, strat, dlog)
+    pos = state["positions"]["BTC"]
+    nxt = {"t": bars[-1]["t"] + 14400, "o": pos["entry"],
+           "h": pos["target"] + 5, "l": pos["entry"] - 0.5, "c": pos["target"] + 3}
+    swing_paper.process_symbol("BTC", bars + [nxt], state, strat, dlog)
+    net = state["closed"][0]["pnl"]
+    assert state["equity"] == pytest.approx(500.0 + net)
+    assert state["closed"][0]["equity_after"] == pytest.approx(500.0 + net, abs=0.01)
 
 
 def test_stop_loss_exit(tmp_path):

@@ -27,8 +27,18 @@ from src.decision_log import DecisionLog
 
 KRAKEN_PAIRS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 INTERVAL_MIN = 240          # 4h
-SIZE_USD = 100.0
 STATE_FILE = Path("data/swing_paper_state.json")
+
+# ── Paper account ────────────────────────────────────────────────────────────
+# A real $500 paper bankroll. Sizing is a FIXED fraction of the STARTING equity
+# (not compounding) so every trade's $ P&L scales identically — that keeps the
+# proof_scorecard t-stat clean (uniform scaling leaves it unchanged; this is
+# capital allocation, NOT a strategy change, so the locked strategy stays locked).
+# Default 1/3 each → up to 3 concurrent majors deploy ~the full account.
+import os
+STARTING_EQUITY = float(os.getenv("SWING_START_EQUITY", "500"))
+ALLOC_FRAC = float(os.getenv("SWING_ALLOC_FRAC", "0.3333"))
+TRADE_SIZE = round(STARTING_EQUITY * ALLOC_FRAC, 2)
 
 
 def fetch_closed_bars(pair: str) -> list[dict]:
@@ -49,6 +59,7 @@ def _load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return {"positions": {}, "closed": [], "last_bar_t": {},
+            "starting_equity": STARTING_EQUITY, "equity": STARTING_EQUITY,
             "started_at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -78,16 +89,19 @@ def _step(base: str, window: list[dict], bar: dict, state: dict,
             if dec.action == "EXIT":
                 exit_price, exit_reason = bar["c"], "trend_break"
         if exit_price is not None:
+            size = pos["size_usd"]
             ret = (exit_price - pos["entry"]) / pos["entry"]
-            net = SIZE_USD * ret - SIZE_USD * ROUND_TRIP_COST_FRAC
+            net = size * ret - size * ROUND_TRIP_COST_FRAC
+            state["equity"] = state.get("equity", STARTING_EQUITY) + net
             rec = {"symbol": base, "entry_ts": pos["entry_ts"],
                    "exit_ts": str(bar["t"]), "entry": pos["entry"],
-                   "exit": exit_price, "size_usd": SIZE_USD, "pnl": net,
-                   "pnl_pct": ret * 100, "reason": exit_reason, "won": net > 0}
+                   "exit": exit_price, "size_usd": size, "pnl": net,
+                   "pnl_pct": ret * 100, "reason": exit_reason, "won": net > 0,
+                   "equity_after": round(state["equity"], 2)}
             state["closed"].append(rec)
             del state["positions"][base]
             dlog.closed(base, pos["entry_ts"], str(bar["t"]), pos["entry"],
-                        exit_price, SIZE_USD, net, ret * 100, exit_reason, 0)
+                        exit_price, size, net, ret * 100, exit_reason, 0)
             if notify:
                 notify(f"SWING CLOSE {base}: {exit_reason} net=${net:+.2f} ({ret*100:+.1f}%)")
         return
@@ -97,8 +111,8 @@ def _step(base: str, window: list[dict], bar: dict, state: dict,
     if dec.is_enter:
         state["positions"][base] = {
             "entry": dec.price, "stop": dec.stop_price, "target": dec.target_price,
-            "entry_ts": str(bar["t"]), "size_usd": SIZE_USD, "rr": dec.rr}
-        dlog.opened(base, str(bar["t"]), dec.price, SIZE_USD,
+            "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr}
+        dlog.opened(base, str(bar["t"]), dec.price, TRADE_SIZE,
                     dec.stop_price, dec.target_price, dec.rr, dec.reason)
         if notify:
             notify(f"SWING OPEN {base} @ {dec.price:.2f} stop {dec.stop_price:.2f} "
@@ -138,9 +152,12 @@ def main():
     _save_state(state)
     open_n = len(state["positions"])
     closed_n = len(state["closed"])
+    eq = state.get("equity", STARTING_EQUITY)
+    start = state.get("starting_equity", STARTING_EQUITY)
     print(f"[swing_paper] {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC  "
-          f"new_bars={total_new} open={open_n} closed={closed_n} "
-          f"open_syms={list(state['positions'])}")
+          f"equity=${eq:.2f} (start ${start:.0f}, {eq-start:+.2f}) "
+          f"trade_size=${TRADE_SIZE:.0f} new_bars={total_new} "
+          f"open={open_n} closed={closed_n} open_syms={list(state['positions'])}")
 
 
 if __name__ == "__main__":
