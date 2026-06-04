@@ -123,6 +123,20 @@ class TestEntry:
             assert dec.rr == pytest.approx(dec.target_pct / dec.stop_pct)
             assert dec.rr == pytest.approx(1.5, abs=0.01)   # 3.0/2.0
 
+    def test_weak_trend_momentum_is_vetoed(self):
+        # ROC>0 but below the 2% min_roc floor → momentum_pos fails (the
+        # trade-review finding: barely-trends get chopped up).
+        strat = SwingStrategy(min_roc=0.02)
+        bars = _uptrend_pullback_resume()
+        # shrink the trend so 20-bar ROC sits in (0, 2%): tiny per-bar rise
+        closes = [100.0 + i * 0.05 for i in range(60)]
+        base = closes[-1]
+        closes += [base - 0.3 * j for j in range(1, 9)]
+        closes += [closes[-1] + 0.9]
+        dec = strat.evaluate(_bars_from_closes(closes, hl_spread=0.2), position_open=False)
+        if dec.action == "SKIP" and "momentum_pos" in dec.gates:
+            assert dec.gates["momentum_pos"] is False
+
     def test_cost_gate_blocks_tiny_atr(self):
         # Force an absurd cost floor so the cost gate fails even on a valid setup.
         strat = SwingStrategy(round_trip_cost=0.5)   # 50% cost → target can't clear

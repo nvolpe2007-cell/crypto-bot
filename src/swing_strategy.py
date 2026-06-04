@@ -17,7 +17,11 @@ profitable. That is the whole game.
 
 THE EDGE STACK (fixed, deliberately simple — complexity is how you overfit):
   1. Trend filter      — only trade WITH a confirmed uptrend (close>EMA50, EMA20>EMA50)
-  2. Momentum confirm  — rate-of-change positive over the lookback
+  2. Momentum confirm  — 20-bar rate-of-change >= min_roc (default 2%). NOT just
+                         >0: trade-review on real data showed weak-trend entries
+                         (ROC<2%) lose (20% win) while real-trend entries (ROC>=2%)
+                         win (~53%) — the trend-break losers were all barely-trends.
+                         This is the strategy's own thesis (trade REAL trends).
   3. Pullback entry    — enter as RSI resumes UP through 50 (buy the dip in an uptrend,
                          not the breakout top)
   4. Overbought veto   — never chase (RSI must be below the overbought band)
@@ -133,7 +137,7 @@ class SwingStrategy:
     LAST (just-closed) bar. The caller owns position state and passes it in."""
 
     def __init__(self, *, ema_fast=20, ema_slow=50, rsi_period=14, atr_period=14,
-                 roc_period=20, atr_stop_mult=2.0, atr_target_mult=3.0,
+                 roc_period=20, min_roc=0.02, atr_stop_mult=2.0, atr_target_mult=3.0,
                  rsi_overbought=68.0, min_target_cost_mult=3.0,
                  round_trip_cost=ROUND_TRIP_COST_FRAC):
         self.ema_fast = ema_fast
@@ -141,6 +145,7 @@ class SwingStrategy:
         self.rsi_period = rsi_period
         self.atr_period = atr_period
         self.roc_period = roc_period
+        self.min_roc = min_roc
         self.atr_stop_mult = atr_stop_mult
         self.atr_target_mult = atr_target_mult
         self.rsi_overbought = rsi_overbought
@@ -184,7 +189,7 @@ class SwingStrategy:
         stop_pct = (atr * self.atr_stop_mult) / price
         gates = {
             "trend_up":        price > ema_s and ema_f > ema_s,
-            "momentum_pos":    roc is not None and roc > 0,
+            "momentum_pos":    roc is not None and roc >= self.min_roc,
             "pullback_resume": rsi_prev < 50.0 <= rsi,        # RSI crossing UP through 50
             "not_overbought":  rsi < self.rsi_overbought,
             "cost_clears":     target_pct >= self.round_trip_cost * self.min_target_cost_mult,
