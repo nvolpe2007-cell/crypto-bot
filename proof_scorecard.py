@@ -104,6 +104,19 @@ def _arm(label: str, fname: str, executable: bool, borrow_correct: bool) -> dict
     return out
 
 
+def _swing_forward() -> dict | None:
+    """The long-only majors swing strategy's FORWARD paper record — the one
+    built to actually clear the bar. Reads swing_paper.py's state file."""
+    path = DATA / 'swing_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+    s = _stats(nets)
+    return dict(label='Swing (long majors, FORWARD)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -139,6 +152,7 @@ def main():
         _arm('Aggressive funding', 'funding_arb_state.json', executable=False, borrow_correct=True),
         _arm('Majors funding',     'funding_arb_majors_state.json', executable=False, borrow_correct=False),
         _arm('Kraken funding',     'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
+        _swing_forward(),
         _directional(),
     ] if a]
 
