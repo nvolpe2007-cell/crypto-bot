@@ -27,7 +27,7 @@ from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
-from .exchange import ExchangeConnection
+from .exchange import ExchangeConnection, CircuitBreakerOpen
 from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
@@ -173,6 +173,8 @@ class LiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, order_type='market', side='buy', amount=size
             )
+        except CircuitBreakerOpen:
+            raise  # propagate to main loop so it can sleep the correct cooldown
         except Exception as e:
             logger.error(f"[LIVE] Buy order FAILED for {symbol}: {e}")
             if self.notifier:
@@ -229,6 +231,8 @@ class LiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, order_type='market', side='sell', amount=pos.size
             )
+        except CircuitBreakerOpen:
+            raise  # propagate to caller; position stays open and will be retried
         except Exception as e:
             logger.error(f"[LIVE] Sell order FAILED for {symbol}: {e}")
             if self.notifier:
@@ -422,6 +426,19 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             if ohlcv:
                 ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                 logger.info(f"[LIVE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.error(f"[LIVE] Exchange circuit breaker open during seed — stopping early ({wait:.0f}s remaining)")
+            if notifier:
+                try:
+                    notifier.send_message(
+                        f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                        f"Data seed interrupted — cooldown {wait:.0f}s.\n"
+                        f"Bot will trade on stale/incomplete cache until exchange recovers."
+                    )
+                except Exception:
+                    pass
+            break  # no point seeding further while circuit is open
         except Exception as e:
             logger.warning(f"[LIVE] Seed failed for {sym}: {e}")
 
@@ -444,6 +461,11 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                             result = trader.regime_detector.detect(ohlcv_cache[sym])
                             if result:
                                 regime_cache[sym] = result.to_dict()
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[LIVE] Exchange circuit breaker open — pausing refresher {wait:.0f}s (symbol={sym})")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; refresher will retry next cycle
                     except Exception as e:
                         logger.debug(f"[LIVE] Candle refresh failed {sym}: {e}")
             except asyncio.TimeoutError:
@@ -452,6 +474,11 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[LIVE] Circuit open (fallback path) — sleeping {wait:.0f}s")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; will resume next cycle
                     except Exception:
                         pass
 
@@ -597,6 +624,18 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
 
         except asyncio.CancelledError:
             break
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.warning(f"[LIVE] Exchange circuit breaker open — pausing main loop {wait:.0f}s")
+            if notifier:
+                try:
+                    notifier.send_message(
+                        f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                        f"Trading paused for {wait:.0f}s — exchange unavailable."
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(wait)
         except Exception as e:
             logger.error(f"[LIVE] Loop error: {e}", exc_info=True)
             await asyncio.sleep(5)

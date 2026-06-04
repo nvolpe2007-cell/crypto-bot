@@ -62,7 +62,7 @@ from src.live_trading import (
 )
 from src.scientific_strategy import ScientificSignal
 from src.indicators import Signal
-from src.exchange import ExchangeConnection
+from src.exchange import ExchangeConnection, CircuitBreakerOpen
 from src.backtester import Trade
 
 import pandas as pd
@@ -589,3 +589,95 @@ class TestQuickDiagnose:
     def test_low_confidence_adds_issue(self):
         issues, _ = _quick_diagnose(5.0, "SIGNAL", self._sig(confidence=65.0))
         assert any("confidence" in i.lower() for i in issues)
+
+
+# ── CircuitBreakerOpen handling ───────────────────────────────────────────────────
+
+class TestCircuitBreakerOpenHandling:
+    """
+    Verify that CircuitBreakerOpen raised by the exchange propagates correctly
+    rather than being silently swallowed as a generic "order failed" error.
+
+    Paper trading handles this properly (paper_trading.py imports and catches
+    CircuitBreakerOpen in 5 places).  These tests guard the equivalent paths
+    in live_trading.py.
+    """
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_open_long_propagates_circuit_breaker_open(self):
+        """CircuitBreakerOpen from create_order must NOT be caught as a plain
+        order failure — it must propagate so the main loop can sleep the correct
+        cooldown, not just log 'Buy order FAILED'."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(
+            side_effect=CircuitBreakerOpen("exchange down", remaining_seconds=30.0)
+        )
+        sig = _make_signal()
+        with pytest.raises(CircuitBreakerOpen):
+            self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+
+    def test_open_long_propagated_circuit_breaker_carries_remaining_seconds(self):
+        """The re-raised exception must retain remaining_seconds so the caller
+        can sleep the right duration."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(
+            side_effect=CircuitBreakerOpen("down", remaining_seconds=45.0)
+        )
+        sig = _make_signal()
+        with pytest.raises(CircuitBreakerOpen) as exc_info:
+            self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert exc_info.value.remaining_seconds == pytest.approx(45.0)
+
+    def test_open_long_does_not_record_position_on_circuit_breaker(self):
+        """No position must be recorded when the circuit trips — the order
+        was never placed."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(
+            side_effect=CircuitBreakerOpen("down", remaining_seconds=10.0)
+        )
+        sig = _make_signal()
+        try:
+            self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        except CircuitBreakerOpen:
+            pass
+        assert "BTC/USD" not in trader.positions
+
+    def test_close_long_propagates_circuit_breaker_open(self):
+        """CircuitBreakerOpen during a sell must propagate — position stays
+        open and the caller decides how long to wait before retrying."""
+        trader = _make_trader()
+        trader.positions["BTC/USD"] = _open_position("BTC/USD")
+        trader.exchange.create_order = AsyncMock(
+            side_effect=CircuitBreakerOpen("exchange down", remaining_seconds=60.0)
+        )
+        with pytest.raises(CircuitBreakerOpen):
+            self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+
+    def test_close_long_keeps_position_open_on_circuit_breaker(self):
+        """If the sell order cannot be placed because the circuit is open,
+        the position must NOT be removed — it is still live on the exchange."""
+        trader = _make_trader()
+        trader.positions["BTC/USD"] = _open_position("BTC/USD")
+        trader.exchange.create_order = AsyncMock(
+            side_effect=CircuitBreakerOpen("down", remaining_seconds=30.0)
+        )
+        try:
+            self._run(trader.close_long("BTC/USD", 51_000.0, "TAKE_PROFIT"))
+        except CircuitBreakerOpen:
+            pass
+        assert "BTC/USD" in trader.positions, "Position must remain open; sell was never executed"
+
+    def test_regular_order_exception_still_returns_none(self):
+        """Regression: plain order failures (network, rejection) must still
+        return None — they must NOT be caught by the CircuitBreakerOpen handler."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(side_effect=RuntimeError("rejected"))
+        sig = _make_signal()
+        result = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert result is None  # swallowed as before — circuit breaker change is non-breaking
