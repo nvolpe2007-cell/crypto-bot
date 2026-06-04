@@ -688,3 +688,98 @@ class TestBorrowCostAccrual:
             * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
         )
         assert abs(pos.borrow_cost - expected) < 1e-9
+
+
+# ── Post-loss re-entry cooldown (realized-outcome feedback loop) ───────────────
+
+def _cooldown_sim(tmp_path, opps, hours):
+    """A both-sides sim with the flip-cooldown enabled and isolated state."""
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        flip_cooldown_hours=hours,
+        state_file=tmp_path / "cooldown_state.json",
+    )
+
+
+def test_net_loss_close_arms_cooldown(tmp_path):
+    opps = [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")]
+    sim = _cooldown_sim(tmp_path, opps, hours=48)
+    sim._tick()                                   # opens (no funding yet)
+    key = "Kraken Futures:PF_DEXEUSD"
+    assert key in sim.open_positions
+    # Funding flips negative → funding_flipped close at a net loss.
+    sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")])
+    sim._tick()
+    assert key not in sim.open_positions
+    assert key in sim._flip_cooldowns             # cooldown stamped
+
+
+def test_cooldown_blocks_reentry(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")], hours=48)
+    sim._tick(); sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")]); sim._tick()
+    assert key in sim._flip_cooldowns
+    # A fresh, attractive positive opp on the SAME symbol must be refused.
+    sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")])
+    sim._tick()
+    assert key not in sim.open_positions          # cooldown held the line
+
+
+def test_cooldown_expires_and_is_pruned(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=24)
+    old = datetime.now(timezone.utc) - timedelta(hours=30)
+    sim._flip_cooldowns[key] = old.isoformat()
+    now = datetime.now(timezone.utc)
+    assert sim._cooldown_remaining_h(key, now) is None   # 30h > 24h → expired
+    assert key not in sim._flip_cooldowns                 # pruned on read
+
+
+def test_cooldown_remaining_is_positive_within_window(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=48)
+    sim._flip_cooldowns[key] = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+    rem = sim._cooldown_remaining_h(key, datetime.now(timezone.utc))
+    assert 37.0 < rem < 39.0                              # ~38h left
+
+
+def test_cooldown_disabled_by_default(tmp_path):
+    # hours=0 → never records, never blocks (the module/arm default for arms
+    # that don't opt in).
+    sim = _cooldown_sim(tmp_path, [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")], hours=0)
+    sim._tick(); sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")]); sim._tick()
+    assert sim._flip_cooldowns == {}
+    assert sim._cooldown_remaining_h("Kraken Futures:PF_DEXEUSD", datetime.now(timezone.utc)) is None
+
+
+def test_cooldown_persists_across_reload(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=48)
+    sim._flip_cooldowns[key] = datetime.now(timezone.utc).isoformat()
+    sim._save_state()
+    sim2 = _cooldown_sim(tmp_path, [], hours=48)          # reloads same state file
+    assert key in sim2._flip_cooldowns
+
+
+# ── Rolling-window net P&L (feedback / observability) ─────────────────────────
+
+def test_net_pnl_since_windows_closed_positions(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    now = datetime.now(timezone.utc)
+    def _closed(net, age_days):
+        # net_pnl = funding_collected - entry_cost - borrow_cost; pin cost at 1.0
+        # and solve funding for the exact net we want.
+        p = PaperPosition(
+            symbol="X", exchange="Kraken Futures", direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=140.0, entry_rate_8h=0.001, size_usd=100.0,
+            entry_time_iso=(now - timedelta(days=age_days + 1)).isoformat(),
+            funding_collected=net + 1.0, entry_cost=1.0,
+        )
+        p.close_time_iso = (now - timedelta(days=age_days)).isoformat()
+        return p
+    sim.closed_positions = [_closed(-20.0, age_days=20), _closed(5.0, age_days=2)]
+    cutoff = now - timedelta(days=7)
+    # Only the 2-day-old +5 falls in the window; the 20-day-old -20 is excluded.
+    assert abs(sim.net_pnl_since(cutoff) - 5.0) < 1e-9
+    # Lifetime still includes the legacy loss.
+    assert abs(sim._total_pnl() - (-15.0)) < 1e-9

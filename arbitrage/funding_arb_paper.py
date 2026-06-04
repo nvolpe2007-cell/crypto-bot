@@ -197,6 +197,7 @@ class FundingArbPaperSim:
         history=None,
         min_persistence_cycles: float = 0.0,
         max_flips: int = 10**9,
+        flip_cooldown_hours: float = 0.0,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -213,6 +214,14 @@ class FundingArbPaperSim:
         self.history = history
         self.min_persistence_cycles = min_persistence_cycles
         self.max_flips = max_flips
+        # Realized-outcome feedback loop: when a position closes at a NET LOSS
+        # (typically funding_flipped at cycle 0), the symbol is stamped with a
+        # cooldown and cannot be re-entered until flip_cooldown_hours elapse.
+        # This is the missing guard behind the bleed — e.g. PF_DEXEUSD flipped,
+        # then got re-entered two days later and flipped AGAIN for another loss.
+        # The breakeven/persistence gates reason about the funding SERIES; this
+        # one reasons about OUR OWN realized P&L on the symbol. 0 disables it.
+        self.flip_cooldown_hours = flip_cooldown_hours
         # Per-arm conviction-sizing band (defaults to the module globals). Set
         # min==max==total for an all-in single-position arm: every entry uses
         # the full allocation, no conviction scaling. The Kraken arm uses this
@@ -244,6 +253,8 @@ class FundingArbPaperSim:
 
         self.open_positions: Dict[str, PaperPosition] = {}
         self.closed_positions: List[PaperPosition] = []
+        # symbol_key -> iso timestamp of the most recent net-loss close.
+        self._flip_cooldowns: Dict[str, str] = {}
         self.start_time = datetime.now(timezone.utc)
         self.last_rollup_total = 0.0       # cumulative P&L at last rollup
         self.running = False
@@ -264,6 +275,7 @@ class FundingArbPaperSim:
                 PaperPosition(**v) for v in data.get('closed', [])
             ]
             self.last_rollup_total = float(data.get('last_rollup_total', 0.0))
+            self._flip_cooldowns = dict(data.get('flip_cooldowns', {}))
             start_iso = data.get('start_time_iso')
             if start_iso:
                 self.start_time = datetime.fromisoformat(start_iso)
@@ -280,6 +292,7 @@ class FundingArbPaperSim:
             'open': {k: asdict(v) for k, v in self.open_positions.items()},
             'closed': [asdict(v) for v in self.closed_positions[-500:]],
             'last_rollup_total': self.last_rollup_total,
+            'flip_cooldowns': self._flip_cooldowns,
             'start_time_iso': self.start_time.isoformat(),
         }
         self.state_file.write_text(json.dumps(payload, indent=2))
@@ -349,6 +362,15 @@ class FundingArbPaperSim:
                 pos.close_reason = reason
                 self.closed_positions.append(pos)
                 del self.open_positions[key]
+                # Feedback loop: stamp a re-entry cooldown on any net-loss close
+                # so we stop immediately re-buying a symbol that just cost us money.
+                if self.flip_cooldown_hours > 0 and pos.net_pnl < 0:
+                    self._flip_cooldowns[key] = now.isoformat()
+                    logger.info(
+                        f"[{self.label}] COOLDOWN {pos.symbol} ({pos.exchange}) "
+                        f"net=${pos.net_pnl:+.4f} → no re-entry for "
+                        f"{self.flip_cooldown_hours:.0f}h"
+                    )
                 logger.info(
                     f"[{self.label}] CLOSE {pos.symbol} ({pos.exchange}) "
                     f"reason={reason} funding=${pos.funding_collected:.4f} "
@@ -371,6 +393,12 @@ class FundingArbPaperSim:
                     break
                 key = f"{opp['exchange']}:{opp['symbol']}"
                 if key in self.open_positions:
+                    continue
+                # Realized-loss cooldown: skip symbols that recently closed at a
+                # net loss (the re-flip guard). Silent — checked every tick, so
+                # logging here would spam.
+                remaining = self._cooldown_remaining_h(key, now)
+                if remaining is not None:
                     continue
                 # Source-restricted arm: only consider opportunities from
                 # allowlisted exchanges (e.g. {'Kraken Futures'} for an arm whose
@@ -605,11 +633,38 @@ class FundingArbPaperSim:
         except asyncio.CancelledError:
             pass
 
+    def _cooldown_remaining_h(self, key: str, now: datetime) -> Optional[float]:
+        """Hours left on a symbol's post-loss re-entry cooldown, or None if it's
+        clear (or the feature is disabled). Expired entries are pruned on read."""
+        if self.flip_cooldown_hours <= 0:
+            return None
+        ts_iso = self._flip_cooldowns.get(key)
+        if not ts_iso:
+            return None
+        elapsed_h = (now - datetime.fromisoformat(ts_iso)).total_seconds() / 3600.0
+        if elapsed_h >= self.flip_cooldown_hours:
+            del self._flip_cooldowns[key]      # expired — forget it
+            return None
+        return self.flip_cooldown_hours - elapsed_h
+
     def _total_pnl(self) -> float:
         """Cumulative NET P&L (funding collected minus transaction costs)."""
         open_pnl = sum(p.net_pnl for p in self.open_positions.values())
         closed_pnl = sum(p.net_pnl for p in self.closed_positions)
         return open_pnl + closed_pnl
+
+    def net_pnl_since(self, cutoff: datetime) -> float:
+        """NET P&L from positions CLOSED at/after `cutoff`, plus all currently
+        open positions. Lifetime cumulative conflates dead config eras with the
+        live one (e.g. the Kraken arm's -$27 is almost entirely pre-whitelist
+        legacy); a rolling window shows what the CURRENT config is actually doing."""
+        closed = sum(
+            p.net_pnl for p in self.closed_positions
+            if p.close_time_iso
+            and datetime.fromisoformat(p.close_time_iso) >= cutoff
+        )
+        open_pnl = sum(p.net_pnl for p in self.open_positions.values())
+        return closed + open_pnl
 
     def _total_gross_funding(self) -> float:
         return (sum(p.funding_collected for p in self.open_positions.values())
@@ -675,8 +730,14 @@ class FundingArbPaperSim:
         return {
             'open_positions': len(self.open_positions),
             'closed_positions': len(self.closed_positions),
-            'total_pnl': round(self._total_pnl(), 4),          # NET of costs
+            'total_pnl': round(self._total_pnl(), 4),          # NET of costs (lifetime)
+            'pnl_7d': round(self.net_pnl_since(
+                datetime.now(timezone.utc) - timedelta(days=7)), 4),  # rolling window
             'total_gross_funding': round(self._total_gross_funding(), 4),
             'total_costs': round(self._total_costs(), 4),
+            'cooldowns_active': sum(
+                1 for k in list(self._flip_cooldowns)
+                if self._cooldown_remaining_h(k, datetime.now(timezone.utc)) is not None
+            ),
             'positions': [asdict(p) for p in self.open_positions.values()],
         }

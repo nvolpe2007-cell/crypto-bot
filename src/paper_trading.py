@@ -900,10 +900,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # only assumes persistence; this verifies it). Needs ~min_cycles×8h
             # of accumulated history per symbol before it'll pass anything —
             # a deliberate warm-up, not a bug. Set MIN_PERSISTENCE_CYCLES=0 to disable.
+            # Default raised 2 → 3: the live ledger showed losers collected 0-1
+            # cycles while every winner persisted 7-12, so requiring 3 cycles
+            # (~24h) of verified prior stability cleanly separates carry from spikes.
             _kraken_min_persist = float(
-                os.getenv('FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES', '2')
+                os.getenv('FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES', '3')
             )
             _kraken_max_flips = int(os.getenv('FUNDING_ARB_KRAKEN_MAX_FLIPS', '6'))
+            # Post-loss re-entry cooldown (hours). After a net-loss close the arm
+            # refuses to re-buy that symbol for this long — the realized-outcome
+            # feedback guard that stops the re-flip bleed (e.g. DEXE flipped, was
+            # re-entered, flipped again). Default 48h; 0 disables.
+            _kraken_flip_cooldown = float(
+                os.getenv('FUNDING_ARB_KRAKEN_FLIP_COOLDOWN_HOURS', '48')
+            )
             # Restrict the Kraken arm to liquid majors. The Kraken funding universe
             # is almost entirely extreme microcap perps (PF_* alts with 300-600%+
             # APY that flip funding at cycle 0) — that was the source of the -$27
@@ -930,6 +940,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 history=_funding_history,
                 min_persistence_cycles=_kraken_min_persist,
                 max_flips=_kraken_max_flips,
+                flip_cooldown_hours=_kraken_flip_cooldown,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
             )
@@ -2171,9 +2182,18 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
                     except Exception:
                         return 0.0
+                # Rolling 7d window for the Kraken arm — its lifetime total is
+                # dominated by dead pre-whitelist legacy losses, so the 7d figure
+                # is what actually reflects the CURRENT config's edge.
+                def _arm_pnl_7d(_arm):
+                    try:
+                        return float(_arm.get_summary().get('pnl_7d', 0.0)) if _arm else 0.0
+                    except Exception:
+                        return 0.0
                 _fa_hb  = _arm_pnl(_funding_arb_sim)
                 _fam_hb = _arm_pnl(_funding_arb_majors)
                 _fak_hb = _arm_pnl(_funding_arb_kraken)
+                _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
                 _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
                 _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
                 logger.info(
@@ -2182,7 +2202,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
-                    f"(arb kraken={_fak_hb:+.2f} maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
+                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
