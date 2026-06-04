@@ -853,10 +853,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # gate. Records every scanner snapshot; survives restarts (data/).
             _funding_history = FundingHistory()
 
-            # Arm 1 — aggressive/experimental: all symbols, both funding sides,
-            # taker cost. Trades often, but optimistic (ignores spot-borrow on
-            # short-spot legs). Existing behavior, unchanged.
-            _funding_arb_sim = FundingArbPaperSim(scanner=_funding_scanner, notifier=notifier)
+            # Arm 1 — aggressive/experimental: all symbols, taker cost. Trades
+            # often. NOW positive-funding-only by default: a live-ledger audit
+            # showed its entire apparent +$16 came from short-spot (negative-
+            # funding) legs whose biggest winners were never charged spot-borrow
+            # carry (they closed before the borrow model deployed). Charging the
+            # borrow they owed flips that side from +$19 booked to −$11 — i.e. the
+            # negative funding ≈ the borrow cost, the legs cancel, and there is no
+            # edge there. The clean long-spot/short-perp side needs no borrow and
+            # is honestly executable, so the arm is confined to it. Set
+            # FUNDING_ARB_AGGR_POSITIVE_ONLY=0 to restore the old both-sides
+            # research baseline (its short legs are now correctly carry-charged).
+            _aggr_positive_only = os.getenv('FUNDING_ARB_AGGR_POSITIVE_ONLY', '1') == '1'
+            _funding_arb_sim = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=_aggr_positive_only,
+            )
 
             # Arm 2 — conservative/"honest": liquid majors only, positive funding
             # only (long spot / short perp → no borrow needed), maker-fee cost
@@ -2190,7 +2202,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         return float(_arm.get_summary().get('pnl_7d', 0.0)) if _arm else 0.0
                     except Exception:
                         return 0.0
+                # Borrow-corrected lifetime: charges every short-spot leg the carry
+                # it owes. For the aggressive arm this strips the unpaid-borrow
+                # illusion (booked +$16 vs honest ≈ −$14).
+                def _arm_pnl_adj(_arm):
+                    try:
+                        return float(_arm.get_summary().get('borrow_corrected_pnl', 0.0)) if _arm else 0.0
+                    except Exception:
+                        return 0.0
                 _fa_hb  = _arm_pnl(_funding_arb_sim)
+                _fa_adj = _arm_pnl_adj(_funding_arb_sim)
                 _fam_hb = _arm_pnl(_funding_arb_majors)
                 _fak_hb = _arm_pnl(_funding_arb_kraken)
                 _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
@@ -2202,7 +2223,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
-                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} aggr={_fa_hb:+.2f})"
+                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} "
+                    f"aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}])"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")

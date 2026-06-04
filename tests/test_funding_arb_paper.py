@@ -783,3 +783,59 @@ def test_net_pnl_since_windows_closed_positions(tmp_path):
     assert abs(sim.net_pnl_since(cutoff) - 5.0) < 1e-9
     # Lifetime still includes the legacy loss.
     assert abs(sim._total_pnl() - (-15.0)) < 1e-9
+
+
+# ── Borrow-corrected P&L (unpaid-carry exposure) ──────────────────────────────
+
+def test_borrow_owed_zero_for_long_spot(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    p = PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=5.0, entry_cost=1.0, cycles_collected=10,
+    )
+    assert sim._borrow_owed(p) == 0.0          # own the asset → no borrow
+
+
+def test_borrow_owed_uses_alt_tier_for_microcap(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    p = PaperPosition(
+        symbol="XCNUSDT", exchange="Binance", direction="SHORT_SPOT_LONG_PERP",
+        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=11.0, entry_cost=2.0, cycles_collected=21,
+    )
+    # 50% alt APY × $900 × (21×8h / 8760h)
+    expected = (fap.BORROW_APY_ALT / 100.0) * 900.0 * (21 * fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+    assert abs(sim._borrow_owed(p) - expected) < 1e-9
+
+
+def test_borrow_corrected_strips_unpaid_carry(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    # A legacy short-spot winner charged $0 borrow (pre-model) but owes plenty.
+    legacy = PaperPosition(
+        symbol="XCNUSDT", exchange="Binance", direction="SHORT_SPOT_LONG_PERP",
+        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=11.69, entry_cost=2.0, borrow_cost=0.0, cycles_collected=21,
+    )
+    sim.closed_positions = [legacy]
+    booked = sim._total_pnl()
+    corrected = sim.borrow_corrected_pnl()
+    assert booked > 0                          # looks profitable as booked
+    assert corrected < booked                  # honest carry deflates it
+    owed = sim._borrow_owed(legacy)
+    assert abs(corrected - (booked - owed)) < 1e-9
+
+
+def test_borrow_corrected_equals_total_for_positive_only(tmp_path):
+    # An arm with no short-spot legs: corrected == booked (nothing to charge).
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    sim.closed_positions = [PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=4.0, entry_cost=1.1, cycles_collected=8,
+    )]
+    assert abs(sim.borrow_corrected_pnl() - sim._total_pnl()) < 1e-9

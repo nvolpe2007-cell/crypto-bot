@@ -653,6 +653,30 @@ class FundingArbPaperSim:
         closed_pnl = sum(p.net_pnl for p in self.closed_positions)
         return open_pnl + closed_pnl
 
+    @staticmethod
+    def _borrow_owed(pos: PaperPosition) -> float:
+        """Spot-borrow carry a short-spot leg SHOULD have paid over its whole
+        life, recomputed fresh from the tiered borrow APY — independent of what
+        was actually charged. Positions opened before the borrow model existed
+        paid $0 carry, which inflated their net; this exposes the true cost.
+        Returns 0 for long-spot legs (you own the asset, nothing to borrow)."""
+        if pos.direction != "SHORT_SPOT_LONG_PERP":
+            return 0.0
+        borrow_apy = (BORROW_APY_MAJOR if _base_symbol(pos.symbol) in MAJOR_SYMBOLS
+                      else BORROW_APY_ALT)
+        return ((borrow_apy / 100.0) * pos.size_usd
+                * (pos.cycles_collected * FUNDING_CYCLE_HOURS / (24.0 * 365.0)))
+
+    def borrow_corrected_pnl(self) -> float:
+        """Lifetime NET P&L with EVERY short-spot leg charged the borrow it owes
+        (not just what was booked). For positive-funding-only arms this equals
+        _total_pnl; for the aggressive arm it strips the unpaid-carry illusion in
+        legacy short-spot trades that closed before the borrow model deployed."""
+        total = 0.0
+        for p in list(self.open_positions.values()) + self.closed_positions:
+            total += p.funding_collected - p.entry_cost - self._borrow_owed(p)
+        return total
+
     def net_pnl_since(self, cutoff: datetime) -> float:
         """NET P&L from positions CLOSED at/after `cutoff`, plus all currently
         open positions. Lifetime cumulative conflates dead config eras with the
@@ -731,6 +755,7 @@ class FundingArbPaperSim:
             'open_positions': len(self.open_positions),
             'closed_positions': len(self.closed_positions),
             'total_pnl': round(self._total_pnl(), 4),          # NET of costs (lifetime)
+            'borrow_corrected_pnl': round(self.borrow_corrected_pnl(), 4),  # honest short-spot carry
             'pnl_7d': round(self.net_pnl_since(
                 datetime.now(timezone.utc) - timedelta(days=7)), 4),  # rolling window
             'total_gross_funding': round(self._total_gross_funding(), 4),
