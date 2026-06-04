@@ -49,10 +49,10 @@ def _make_ofi(symbols=None) -> OrderFlowImbalance:
 
 
 def _make_mtf() -> MultiTimeframeFilter:
-    """Return a MultiTimeframeFilter with a mock exchange."""
+    """Return a MultiTimeframeFilter with a mock exchange wrapper."""
     mock_exchange = MagicMock()
-    mock_exchange.exchange = MagicMock()
-    mock_exchange.exchange.fetch_ohlcv = AsyncMock(return_value=[])
+    # fetch_ohlcv is the wrapper method; tests set its return_value per-case.
+    mock_exchange.fetch_ohlcv = AsyncMock(return_value=[])
     return MultiTimeframeFilter(exchange=mock_exchange)
 
 
@@ -319,14 +319,14 @@ class TestMTFFetch:
     async def test_returns_dataframe_on_success(self):
         mtf = _make_mtf()
         rows = _ohlcv_rows(_MIN_BARS + 5)
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(return_value=rows)
+        mtf._exchange.fetch_ohlcv = AsyncMock(return_value=rows)
         df = await mtf.fetch(SYMBOL)
         assert df is not None
         assert len(df) == _MIN_BARS + 5
 
     async def test_returns_none_when_too_few_bars(self):
         mtf = _make_mtf()
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(
+        mtf._exchange.fetch_ohlcv = AsyncMock(
             return_value=_ohlcv_rows(_MIN_BARS - 1)
         )
         df = await mtf.fetch(SYMBOL)
@@ -334,13 +334,13 @@ class TestMTFFetch:
 
     async def test_returns_none_on_empty_response(self):
         mtf = _make_mtf()
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(return_value=[])
+        mtf._exchange.fetch_ohlcv = AsyncMock(return_value=[])
         df = await mtf.fetch(SYMBOL)
         assert df is None
 
     async def test_returns_none_on_exchange_error(self):
         mtf = _make_mtf()
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(
+        mtf._exchange.fetch_ohlcv = AsyncMock(
             side_effect=Exception("connection refused")
         )
         df = await mtf.fetch(SYMBOL)
@@ -349,7 +349,7 @@ class TestMTFFetch:
     async def test_caches_result(self):
         mtf = _make_mtf()
         rows = _ohlcv_rows(_MIN_BARS + 5)
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(return_value=rows)
+        mtf._exchange.fetch_ohlcv = AsyncMock(return_value=rows)
         await mtf.fetch(SYMBOL)
         assert SYMBOL in mtf._cache
 
@@ -357,7 +357,7 @@ class TestMTFFetch:
         mtf = _make_mtf()
         rows = _ohlcv_rows(_MIN_BARS + 5)
         mock_fn = AsyncMock(return_value=rows)
-        mtf._exchange.exchange.fetch_ohlcv = mock_fn
+        mtf._exchange.fetch_ohlcv = mock_fn
         await mtf.fetch(SYMBOL)
         await mtf.fetch(SYMBOL)   # second call within TTL
         assert mock_fn.call_count == 1
@@ -366,7 +366,7 @@ class TestMTFFetch:
         mtf = _make_mtf()
         rows = _ohlcv_rows(_MIN_BARS + 5)
         mock_fn = AsyncMock(return_value=rows)
-        mtf._exchange.exchange.fetch_ohlcv = mock_fn
+        mtf._exchange.fetch_ohlcv = mock_fn
 
         await mtf.fetch(SYMBOL)
         # Force cache to appear expired
@@ -378,7 +378,7 @@ class TestMTFFetch:
     async def test_returns_df_with_correct_columns(self):
         mtf = _make_mtf()
         rows = _ohlcv_rows(_MIN_BARS + 5)
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(return_value=rows)
+        mtf._exchange.fetch_ohlcv = AsyncMock(return_value=rows)
         df = await mtf.fetch(SYMBOL)
         for col in ("open", "high", "low", "close", "volume"):
             assert col in df.columns
@@ -392,7 +392,7 @@ class TestMTFAlignmentScore:
     async def test_returns_nonzero_when_cached(self):
         mtf = _make_mtf()
         rows = _ohlcv_rows(60, trend=10.0)   # uptrend
-        mtf._exchange.exchange.fetch_ohlcv = AsyncMock(return_value=rows)
+        mtf._exchange.fetch_ohlcv = AsyncMock(return_value=rows)
         await mtf.fetch(SYMBOL)
         score = mtf.alignment_score(SYMBOL, is_buy=True)
         # score is a float; the exact value depends on the stub ema/rsi

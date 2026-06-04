@@ -52,7 +52,7 @@ class MultiTimeframeFilter:
         if cached and time.time() - cached[0] < _CACHE_TTL_S:
             return cached[1]
         try:
-            ohlcv = await self._exchange.exchange.fetch_ohlcv(symbol, '5m', limit=60)
+            ohlcv = await self._exchange.fetch_ohlcv(symbol, '5m', limit=60)
             if not ohlcv or len(ohlcv) < _MIN_BARS:
                 return None
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
