@@ -121,3 +121,21 @@ def test_stop_loss_exit(tmp_path):
     assert len(state["closed"]) == 1
     assert state["closed"][0]["reason"] == "stop"
     assert state["closed"][0]["won"] is False
+
+
+def test_gap_down_through_stop_fills_at_open(tmp_path):
+    """When a bar GAPS open below the stop, the (market) stop fills at the worse
+    open price, not at the stop — otherwise gap-downs overstate P&L."""
+    bars = _entry_bars()
+    state = _fresh_state(bars)
+    strat, dlog = SwingStrategy(), _dlog(tmp_path)
+    _proc(bars, state, strat, dlog)
+    pos = state["positions"][KEY]
+    gap_open = pos["stop"] - 3.0              # opens BELOW the stop (gap down)
+    nxt = {"t": bars[-1]["t"] + 14400, "o": gap_open,
+           "h": gap_open + 0.2, "l": gap_open - 1.0, "c": gap_open - 0.5}
+    _proc(bars + [nxt], state, strat, dlog)
+    rec = state["closed"][0]
+    assert rec["reason"] == "stop"
+    # filled at the gapped-open, strictly worse than the stop price
+    assert rec["exit"] == gap_open < pos["stop"]

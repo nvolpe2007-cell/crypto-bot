@@ -112,8 +112,12 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
     if pos:
         exit_price = exit_reason = None
         if bar["l"] <= pos["stop"]:
-            exit_price, exit_reason = pos["stop"], "stop"
+            # A stop is a market order: if the bar GAPS open below the stop, you
+            # fill at the (worse) open, not the stop price. Modeling the fill at
+            # exactly the stop overstated P&L on gap-downs (esp. daily bars).
+            exit_price, exit_reason = min(pos["stop"], bar["o"]), "stop"
         elif bar["h"] >= pos["target"]:
+            # Target is a limit order → fills at the limit even on a gap up.
             exit_price, exit_reason = pos["target"], "target"
         else:
             dec = strat.evaluate(window, position_open=True)

@@ -323,6 +323,19 @@ def test_total_funding_invariant_to_interval():
     assert c8 == 3 and c1 == 24         # finer granularity at 1h
 
 
+def test_off_scanner_accrues_no_phantom_funding(tmp_path, monkeypatch):
+    """A position that's fallen off the scanner must NOT keep booking funding —
+    off-scanner means its rate dropped below the scanner's threshold, so any
+    credit is phantom income. Default OFFSCANNER_RATE_FRAC=0 → zero funding."""
+    sim = _sim_for_exit(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    pos = _open_pos(entry_apy=40.0)           # long-spot → no borrow either
+    pos.last_funding_ts_iso = now.isoformat()
+    sim._accrue_funding(pos, None, now + timedelta(hours=24))  # 3 cycles, off-scanner
+    assert pos.cycles_collected == 3          # time still advances
+    assert pos.funding_collected == 0.0       # but no phantom funding booked
+
+
 # ── _should_exit — exit condition tests ──────────────────────────────────────
 
 def _open_pos(entry_apy: float = 40.0,

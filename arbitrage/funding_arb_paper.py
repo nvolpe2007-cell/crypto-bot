@@ -51,6 +51,11 @@ KRAKEN_FUNDING_INTERVAL_HOURS = float(
     os.getenv('FUNDING_ARB_KRAKEN_INTERVAL_HOURS', '1')
 )
 
+# Fraction of entry funding still credited while a position is OFF the scanner.
+# 0 = book nothing we can't observe (honest default; off-scanner means funding
+# fell below the scanner's threshold). Was hardcoded 0.25 (optimistic phantom).
+OFFSCANNER_RATE_FRAC = float(os.getenv('FUNDING_ARB_OFFSCANNER_RATE_FRAC', '0.0'))
+
 
 def _funding_interval_hours(exchange: Optional[str]) -> float:
     """Funding settlement interval (hours) for a venue. Kraken Futures = 1h."""
@@ -579,12 +584,17 @@ class FundingArbPaperSim:
         if cycles_due <= 0:
             return
 
-        # Use current rate if scanner still tracks the symbol, otherwise
-        # decay toward zero (assume rate normalised below scanner's min threshold).
+        # Use current rate if scanner still tracks the symbol, otherwise stop
+        # crediting funding. A symbol leaves the scanner because its funding fell
+        # below the scanner's threshold — i.e. we can no longer observe it paying.
+        # The old 0.25×entry-rate credit was optimistic PHANTOM income that
+        # inflated the arms' P&L. Default 0 (book nothing we can't see); set
+        # FUNDING_ARB_OFFSCANNER_RATE_FRAC>0 to restore a research fraction.
+        # NOTE: borrow carry below still accrues — you owe it regardless of scanner.
         if current_opp is not None:
             current_rate_per_cycle = float(current_opp['rate_8h']) / 100.0
         else:
-            current_rate_per_cycle = pos.entry_rate_8h * 0.25  # conservative
+            current_rate_per_cycle = pos.entry_rate_8h * OFFSCANNER_RATE_FRAC
 
         # We collect funding (we're on the receiving side by construction).
         # Sign of entry_rate tells us which side; magnitude × size = $/8h-cycle.
