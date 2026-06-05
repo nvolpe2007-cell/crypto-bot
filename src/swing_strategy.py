@@ -43,7 +43,17 @@ from typing import Dict, List, Optional
 # Round-trip cost as a fraction of price (taker fee + spread + slippage). Same
 # basis as the rest of the system. At 4h ATR the target clears this easily; the
 # gate exists to refuse the rare low-vol setup where it wouldn't.
-ROUND_TRIP_COST_FRAC = float(os.getenv("SWING_ROUND_TRIP_COST_FRAC", "0.003"))
+# Round-trip cost as a fraction of price (fees + spread + slippage), Kraken spot.
+# REALISM FIX (2026-06-05): the old 0.30% default was below even Kraken's pure-
+# maker floor (0.25%/side × 2 = 0.50%), i.e. unachievable under any execution —
+# it flattered every trade's net and risked a FALSE-POSITIVE proof (printing
+# PROVEN when honest costs make the edge break-even). Default now 0.55%: maker
+# round-trip (0.50%) for a non-latency-sensitive swing using limit entries, plus
+# a ~0.05% spread/slippage cushion. Conservative (market-order) execution is
+# closer to 0.80% — set SWING_ROUND_TRIP_COST_FRAC=0.008 to stress-test. Fixed
+# while the forward ledger is still empty so the whole proof is built on honest
+# costs. Cf. the funding majors arm cost-realism fix.
+ROUND_TRIP_COST_FRAC = float(os.getenv("SWING_ROUND_TRIP_COST_FRAC", "0.0055"))
 
 
 # ── indicator helpers (dependency-light, list-based, unit-testable) ──────────
