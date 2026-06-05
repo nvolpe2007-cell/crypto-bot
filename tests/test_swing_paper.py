@@ -123,6 +123,46 @@ def test_stop_loss_exit(tmp_path):
     assert state["closed"][0]["won"] is False
 
 
+def test_fill_realism_uses_live_price(tmp_path):
+    """On the latest bar, the entry fills at the live market price (cron acts
+    after the close), not the bar close — stop/target shift to preserve R:R."""
+    bars = _entry_bars()
+    state = _fresh_state(bars)
+    strat, dlog = SwingStrategy(), _dlog(tmp_path)
+    sig_close = bars[-1]["c"]
+    live = sig_close + 1.0
+    n = swing_paper.process_symbol(KEY, BASE, TF, bars, state, strat, dlog,
+                                   live_price=live)
+    assert n == 1
+    pos = state["positions"][KEY]
+    assert pos["entry"] == live                      # filled at market
+    assert pos["target"] > pos["entry"] > pos["stop"]  # R:R intact
+
+
+def test_event_blackout_vetoes_entry(tmp_path, monkeypatch):
+    """A would-be entry inside an event blackout window is vetoed (no position)."""
+    bars = _entry_bars()
+    state = _fresh_state(bars)
+    strat, dlog = SwingStrategy(), _dlog(tmp_path)
+    monkeypatch.setattr(swing_paper, "blackout_reason", lambda *a, **k: "FOMC in 2.0h")
+    n = swing_paper.process_symbol(KEY, BASE, TF, bars, state, strat, dlog)
+    assert n == 1                                    # bar was processed
+    assert state["positions"] == {}                  # but no entry opened
+
+
+def test_vp_context_annotates_with_volume():
+    ctx = swing_paper._vp_context([{"l": 99, "h": 101, "c": 100, "v": 100.0}
+                                   for _ in range(30)], 100.0)
+    assert ctx["vp_zone"] != "n/a"
+    assert "vp_poc" in ctx and "vp_dist_poc_pct" in ctx
+
+
+def test_vp_context_na_without_volume():
+    ctx = swing_paper._vp_context([{"l": 99, "h": 101, "c": 100} for _ in range(30)],
+                                  100.0)
+    assert ctx["vp_zone"] == "n/a"
+
+
 def test_gap_down_through_stop_fills_at_open(tmp_path):
     """When a bar GAPS open below the stop, the (market) stop fills at the worse
     open price, not at the stop — otherwise gap-downs overstate P&L."""

@@ -25,6 +25,8 @@ from pathlib import Path
 
 from src.swing_strategy import SwingStrategy, ROUND_TRIP_COST_FRAC
 from src.decision_log import DecisionLog
+from src.volume_profile import volume_profile, DEFAULT_BINS
+from src.event_calendar import blackout_reason
 
 # Validated liquid Kraken USD-spot majors (pair codes confirmed live against the
 # OHLC endpoint). A WIDER universe is the fastest, cleanest way to reach the
@@ -80,9 +82,28 @@ def fetch_closed_bars(pair: str, interval_min: int) -> list[dict]:
     if data.get("error"):
         raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
     series = next(v for k, v in data["result"].items() if k != "last")
+    # Kraken OHLC row: [time, open, high, low, close, vwap, volume, count].
+    # Volume (row[6]) is kept so the volume-profile annotation has data.
     bars = [{"t": int(row[0]), "o": float(row[1]), "h": float(row[2]),
-             "l": float(row[3]), "c": float(row[4])} for row in series]
+             "l": float(row[3]), "c": float(row[4]), "v": float(row[6])}
+            for row in series]
     return bars[:-1]            # drop the still-forming current bar
+
+
+def fetch_ticker(pair: str) -> float | None:
+    """Current last-trade price for entry-fill realism (the swing cron acts
+    minutes after a bar closes, so fills happen at the live price, not the
+    bar's close). Returns None on any failure → caller falls back to the close."""
+    try:
+        url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+        if data.get("error"):
+            return None
+        res = next(v for k, v in data["result"].items())
+        return float(res["c"][0])          # 'c' = [last_price, lot_volume]
+    except Exception:
+        return None
 
 
 def _load_state() -> dict:
@@ -100,10 +121,30 @@ def _save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
+def _vp_context(window: list[dict], fill: float) -> dict:
+    """Volume-profile annotation for an entry (RESEARCH ONLY — not acted on).
+    Records where the fill sits in the profile so we can later MEASURE whether
+    that structure separates winners from losers. See src/volume_profile.py."""
+    if len(window) < 20:
+        return {"vp_zone": "n/a"}
+    vp = volume_profile(window, n_bins=DEFAULT_BINS)
+    if vp is None:
+        return {"vp_zone": "n/a"}
+    return {
+        "vp_zone": vp.classify(fill),
+        "vp_poc": round(vp.poc, 4),
+        "vp_dist_poc_pct": round((fill - vp.poc) / fill * 100.0, 3) if fill else 0.0,
+        "vp_in_value": vp.val <= fill <= vp.vah,
+    }
+
+
 def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: dict,
-          strat: SwingStrategy, dlog: DecisionLog, notify=None) -> None:
+          strat: SwingStrategy, dlog: DecisionLog, notify=None,
+          live_price: float | None = None, is_latest: bool = False) -> None:
     """Advance one closed bar for a (symbol, timeframe) slot. `key` namespaces
-    state ("BASE@INTERVAL"); `base`/`tf` are for labels and the trade record."""
+    state ("BASE@INTERVAL"); `base`/`tf` are for labels and the trade record.
+    `live_price`/`is_latest`: on the most recent bar, fill entries at the live
+    market price (the cron acts minutes after the close), not the bar close."""
     label = f"{base} {tf}m"
     for b in window:
         b["symbol"] = base
@@ -134,6 +175,11 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
                    "exit": exit_price, "size_usd": size, "pnl": net,
                    "pnl_pct": ret * 100, "reason": exit_reason, "won": net > 0,
                    "equity_after": round(state["equity"], 2)}
+            # carry the entry's volume-profile context onto the closed record so
+            # proof_scorecard / analysis can test win-rate by VP zone (research).
+            for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value"):
+                if k in pos:
+                    rec[k] = pos[k]
             state["closed"].append(rec)
             del state["positions"][key]
             dlog.closed(base, pos["entry_ts"], str(bar["t"]), pos["entry"],
@@ -144,24 +190,52 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
 
     dec = strat.evaluate(window, position_open=False)
     dlog.evaluation(dec)
-    if dec.is_enter:
-        state["positions"][key] = {
-            "symbol": base, "tf": tf,
-            "entry": dec.price, "stop": dec.stop_price, "target": dec.target_price,
-            "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr}
-        dlog.opened(base, str(bar["t"]), dec.price, TRADE_SIZE,
-                    dec.stop_price, dec.target_price, dec.rr, dec.reason)
+    if not dec.is_enter:
+        return
+
+    # ── #5 event blackout: veto NEW entries near scheduled high-impact events ──
+    # Use the bar's CLOSE time (≈ when the entry would execute) as the clock.
+    entry_dt = datetime.fromtimestamp(bar["t"] + tf * 60, tz=timezone.utc)
+    blk = blackout_reason(entry_dt)
+    if blk:
+        dlog._write("skip_event", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
+                                   "reason": f"event_blackout: {blk}"})
         if notify:
-            notify(f"SWING OPEN {label} @ {dec.price:.2f} stop {dec.stop_price:.2f} "
-                   f"target {dec.target_price:.2f} (R:R {dec.rr:.1f}) — {dec.reason}")
+            notify(f"SWING SKIP {label}: event blackout ({blk})")
+        return
+
+    # ── #4 fill realism: the latest bar fills at the live price, not the close.
+    # Stop/target are ATR offsets, so shift them by the same delta to preserve R:R.
+    fill = dec.price
+    if is_latest and live_price and live_price > 0:
+        fill = live_price
+    delta = fill - dec.price
+    stop, target = dec.stop_price + delta, dec.target_price + delta
+
+    # ── #9 volume-profile annotation (logged, NOT acted on) ───────────────────
+    vp_ctx = _vp_context(window, fill)
+
+    state["positions"][key] = {
+        "symbol": base, "tf": tf,
+        "entry": fill, "stop": stop, "target": target,
+        "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr,
+        **vp_ctx}
+    dlog.opened(base, str(bar["t"]), fill, TRADE_SIZE, stop, target, dec.rr, dec.reason)
+    dlog._write("open_context", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
+                                 "fill": fill, "signal_close": dec.price, **vp_ctx})
+    if notify:
+        slip = f" (filled {fill:.2f} vs close {dec.price:.2f})" if delta else ""
+        notify(f"SWING OPEN {label} @ {fill:.2f} stop {stop:.2f} target {target:.2f} "
+               f"(R:R {dec.rr:.1f}, {vp_ctx['vp_zone']}){slip} — {dec.reason}")
 
 
 def process_symbol(key: str, base: str, tf: int, closed_bars: list[dict],
                    state: dict, strat: SwingStrategy, dlog: DecisionLog,
-                   notify=None) -> int:
+                   notify=None, live_price: float | None = None) -> int:
     """Process every newly-closed bar since last run for one (symbol, timeframe)
     slot. Returns # bars processed. First-ever run per slot only sets the
-    baseline (forward-only, no replay)."""
+    baseline (forward-only, no replay). `live_price` (if given) fills an entry on
+    the MOST RECENT bar at market, modeling the cron's post-close execution lag."""
     if not closed_bars:
         return 0
     last_t = state["last_bar_t"].get(key)
@@ -169,9 +243,10 @@ def process_symbol(key: str, base: str, tf: int, closed_bars: list[dict],
         state["last_bar_t"][key] = closed_bars[-1]["t"]
         return 0
     new = [b for b in closed_bars if b["t"] > last_t]
-    for bar in new:
+    for i, bar in enumerate(new):
         idx = closed_bars.index(bar)
-        _step(key, base, tf, closed_bars[: idx + 1], bar, state, strat, dlog, notify)
+        _step(key, base, tf, closed_bars[: idx + 1], bar, state, strat, dlog, notify,
+              live_price=live_price, is_latest=(i == len(new) - 1))
         state["last_bar_t"][key] = bar["t"]
     return len(new)
 
@@ -182,6 +257,9 @@ def main():
     state = _load_state()
     total_new = 0
     for base, pair in KRAKEN_PAIRS.items():
+        # One live-price read per symbol for entry-fill realism (shared across
+        # this symbol's timeframes). None on failure → fills fall back to close.
+        live_price = fetch_ticker(pair)
         for tf in INTERVALS:
             key = f"{base}@{tf}"
             try:
@@ -189,7 +267,8 @@ def main():
             except Exception as e:
                 print(f"{key}: fetch failed - {e}")
                 continue
-            total_new += process_symbol(key, base, tf, bars, state, strat, dlog)
+            total_new += process_symbol(key, base, tf, bars, state, strat, dlog,
+                                        live_price=live_price)
     _save_state(state)
     open_n = len(state["positions"])
     closed_n = len(state["closed"])
