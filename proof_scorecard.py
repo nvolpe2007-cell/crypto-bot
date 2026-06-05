@@ -54,17 +54,56 @@ DATA = Path(__file__).parent / 'data'
 N_MIN, T_MIN = 30, 2.0
 
 
-def _stats(nets: list[float]) -> dict:
-    """Per-trade summary stats for a list of net P&Ls (one per closed trade)."""
+def _design_effect_eff_n(nets: list[float], clusters: list) -> float:
+    """Kish design effect → EFFECTIVE sample size for correlated trades.
+
+    A per-trade t-stat assumes independent trades. But a long-only momentum book
+    across 16 majors enters and wins/loses TOGETHER (one market regime → many
+    correlated trades), so the true information content is < n. Trades sharing a
+    cluster (here: entry-week) are treated as correlated; the intra-cluster
+    correlation (ICC) is estimated by one-way ANOVA and converted to a design
+    effect DEFF = 1 + (m̄-1)·ICC. eff_n = n / DEFF. Uncorrelated trades (ICC≈0)
+    give eff_n≈n; highly-correlated trades shrink it. Only positive correlation
+    (the optimistic-bias direction) is penalised; ICC is floored at 0.
+    """
+    n = len(nets)
+    groups: dict = {}
+    for x, c in zip(nets, clusters):
+        groups.setdefault(c, []).append(x)
+    k = len(groups)
+    if n < 2 or k < 2 or k == n:        # nothing to cluster / all-singleton
+        return float(n)
+    grand = sum(nets) / n
+    m_bar = n / k
+    ss_between = sum(len(g) * (sum(g) / len(g) - grand) ** 2 for g in groups.values())
+    ss_within = sum((x - sum(g) / len(g)) ** 2 for g in groups.values() for x in g)
+    ms_between = ss_between / (k - 1)
+    ms_within = ss_within / (n - k) if n > k else 0.0
+    denom = ms_between + (m_bar - 1) * ms_within
+    icc = (ms_between - ms_within) / denom if denom > 0 else 0.0
+    icc = max(0.0, min(1.0, icc))       # penalise only positive (optimistic) corr
+    deff = 1.0 + (m_bar - 1) * icc
+    return n / deff if deff > 0 else float(n)
+
+
+def _stats(nets: list[float], clusters: list | None = None) -> dict:
+    """Per-trade summary stats for a list of net P&Ls (one per closed trade).
+
+    If `clusters` (one key per trade) is given, also computes a correlation-
+    adjusted t-stat on the EFFECTIVE sample size, which the verdict uses so a
+    correlated universe can't manufacture significance. Without clusters the
+    adjusted t-stat equals the raw one."""
     n = len(nets)
     total = sum(nets)
     if n == 0:
         return dict(n=0, total=0.0, win_rate=0.0, expectancy=0.0,
-                    t_stat=0.0, sharpe=0.0, max_dd=0.0)
+                    t_stat=0.0, t_clustered=0.0, eff_n=0.0, sharpe=0.0, max_dd=0.0)
     wins = sum(1 for x in nets if x > 0)
     mean = total / n
     sd = st.pstdev(nets) if n < 2 else st.stdev(nets)
     t_stat = (mean / (sd / math.sqrt(n))) if (n >= 2 and sd > 0) else 0.0
+    eff_n = _design_effect_eff_n(nets, clusters) if clusters else float(n)
+    t_clustered = (mean / (sd / math.sqrt(eff_n))) if (eff_n >= 2 and sd > 0) else 0.0
     sharpe = (mean / sd) if sd > 0 else 0.0          # per-trade Sharpe (not annualised)
     # max drawdown on the cumulative equity curve
     cum = peak = dd = 0.0
@@ -73,7 +112,8 @@ def _stats(nets: list[float]) -> dict:
         peak = max(peak, cum)
         dd = min(dd, cum - peak)
     return dict(n=n, total=total, win_rate=wins / n, expectancy=mean,
-                t_stat=t_stat, sharpe=sharpe, max_dd=dd)
+                t_stat=t_stat, t_clustered=t_clustered, eff_n=eff_n,
+                sharpe=sharpe, max_dd=dd)
 
 
 def _borrow_owed(p: dict) -> float:
@@ -113,7 +153,19 @@ def _swing_forward() -> dict | None:
     d = json.loads(path.read_text())
     closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
     nets = [float(p['pnl']) for p in closed]
-    s = _stats(nets)
+
+    # Cluster by ENTRY WEEK: the 16 majors are highly correlated, so trades that
+    # open the same week share market risk and aren't independent bets. The
+    # clustered t-stat is what the verdict judges (see _design_effect_eff_n).
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    clusters = [_week(p) for p in closed]
+    s = _stats(nets, clusters)
     return dict(label='Swing (long majors, FORWARD)', executable=True, **s)
 
 
@@ -142,9 +194,15 @@ def _verdict(a: dict) -> str:
         return f'NOT PROVEN — only {a["n"]} trades (need {N_MIN}+)'
     if a['expectancy'] <= 0:
         return f'FAILED — negative expectancy ({a["expectancy"]:+.4f}/trade)'
-    if a['t_stat'] <= T_MIN:
-        return f'NOT PROVEN — t={a["t_stat"]:.2f} (need >{T_MIN}; could be luck)'
-    return f'PROVEN ✓ exp={a["expectancy"]:+.4f}/trade  t={a["t_stat"]:.2f}'
+    # Judge on the CORRELATION-ADJUSTED t-stat: a correlated universe can post a
+    # raw t>2 on far fewer independent bets. t_clustered==t_stat when uncorrelated.
+    t = a.get('t_clustered', a['t_stat'])
+    if t <= T_MIN:
+        return (f'NOT PROVEN — clustered t={t:.2f} (need >{T_MIN}; '
+                f'raw t={a["t_stat"]:.2f} but only ~{a.get("eff_n", a["n"]):.0f} '
+                f'independent bets across correlated majors)')
+    return (f'PROVEN ✓ exp={a["expectancy"]:+.4f}/trade  '
+            f'clustered t={t:.2f} (eff_n≈{a.get("eff_n", a["n"]):.0f})')
 
 
 def main():
@@ -163,7 +221,11 @@ def main():
         print(f"\n▌ {a['label']}   [{'EXECUTABLE' if a['executable'] else 'FANTASY'}]")
         print(f"   trades={a['n']:<4} net=${a['total']:+8.2f}  win={a['win_rate']*100:4.0f}%  "
               f"exp=${a['expectancy']:+.4f}/trade")
-        print(f"   t-stat={a['t_stat']:5.2f}  sharpe(per-trade)={a['sharpe']:5.2f}  "
+        _tc = a.get('t_clustered', a['t_stat'])
+        _en = a.get('eff_n', a['n'])
+        _cline = (f"  clustered_t={_tc:5.2f} (eff_n≈{_en:.0f})"
+                  if abs(_en - a['n']) > 0.5 else "")
+        print(f"   t-stat={a['t_stat']:5.2f}{_cline}  sharpe(per-trade)={a['sharpe']:5.2f}  "
               f"maxDD=${a['max_dd']:+.2f}")
         if 'corrected_total' in a:
             print(f"   borrow-corrected net=${a['corrected_total']:+8.2f}  "
