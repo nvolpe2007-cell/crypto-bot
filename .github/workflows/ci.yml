@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -23,9 +23,14 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # Install the FULL pinned dependency set, not a hand-picked subset — the
+        # old subset drifted from requirements.txt (missing ccxt/aiohttp/anthropic/
+        # pandas-ta…), so CI silently tested a different environment than prod and
+        # could pass while imports broke for real. pytest-asyncio is in
+        # requirements.txt, so the async suite (asyncio_mode=auto) runs here too.
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy scipy scikit-learn xgboost pytest pytest-asyncio PyYAML python-dotenv
+          pip install -r requirements.txt
 
       - name: Run tests
         run: pytest tests/ -q --tb=short

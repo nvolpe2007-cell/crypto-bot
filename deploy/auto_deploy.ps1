@@ -92,15 +92,30 @@ $pushOutput.TrimEnd().Split("`n") | ForEach-Object { Write-Host "  $_" }
 if ($pushExit -ne 0) { Fail "git push failed (exit $pushExit)" }
 
 # ── 4. Trigger VPS update ─────────────────────────────────────────────────────
+# Capture the currently-deployed commit BEFORE updating, so a failed deploy can
+# be rolled back to a known-good SHA (more reliable than reflog HEAD@{1}).
+$prevSha = (& ssh $VPSHost "cd /opt/crypto-bot && git rev-parse HEAD").Trim()
+
 Step "Running vps_update.sh on $VPSHost"
 # vps_update.sh handles git fetch, .env preservation, requirements, systemd restart.
 # We tee its output but only show key lines locally to keep noise low.
 & ssh $VPSHost "bash /opt/crypto-bot/deploy/vps_update.sh 2>&1 | tail -25"
 if ($LASTEXITCODE -ne 0) { Fail "vps_update.sh failed (exit $LASTEXITCODE)" }
 
-# ── 5. Verify the bot is alive ────────────────────────────────────────────────
-Step "Waiting ${Wait}s then grabbing journal tail"
+# ── 5. Verify the bot is alive — AUTO-ROLLBACK if the new commit won't run ─────
+Step "Waiting ${Wait}s then checking service health"
 Start-Sleep -Seconds $Wait
-& ssh $VPSHost "systemctl is-active crypto-bot; echo ---; journalctl -u crypto-bot --no-pager -n 15"
-
-Step "Deploy complete"
+$alive = (& ssh $VPSHost "systemctl is-active crypto-bot").Trim()
+if ($alive -ne "active") {
+    Step "Service is '$alive' after deploy — ROLLING BACK to $prevSha"
+    & ssh $VPSHost "cd /opt/crypto-bot && git reset --hard $prevSha && sudo systemctl restart crypto-bot && sleep $Wait"
+    $recovered = (& ssh $VPSHost "systemctl is-active crypto-bot").Trim()
+    & ssh $VPSHost "journalctl -u crypto-bot --no-pager -n 25"
+    if ($recovered -eq "active") {
+        Fail "Deploy failed health check; ROLLED BACK to $prevSha and the service recovered. The pushed commit is bad — investigate before redeploying."
+    } else {
+        Fail "Deploy FAILED health check and rollback did NOT recover (service=$recovered). Manual intervention required on $VPSHost."
+    }
+}
+& ssh $VPSHost "journalctl -u crypto-bot --no-pager -n 15"
+Step "Deploy complete — service healthy"
