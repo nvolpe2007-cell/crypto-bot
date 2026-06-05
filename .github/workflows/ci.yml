@@ -23,14 +23,15 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        # Install the FULL pinned dependency set, not a hand-picked subset — the
-        # old subset drifted from requirements.txt (missing ccxt/aiohttp/anthropic/
-        # pandas-ta…), so CI silently tested a different environment than prod and
-        # could pass while imports broke for real. pytest-asyncio is in
-        # requirements.txt, so the async suite (asyncio_mode=auto) runs here too.
+        # Install from requirements.txt (not a hand-picked subset — that drift is
+        # why CI silently died on a missing `requests`). pandas-ta classic was
+        # pulled from PyPI and is unfindable on 3.11+; the test suite STUBS it
+        # (tests/conftest.py), so it's excluded here — prod gets it via the git
+        # fallback in deploy/vps_update.sh. pytest-asyncio is in requirements.txt,
+        # so the async suite (asyncio_mode=auto) runs here too.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          grep -v '^pandas-ta' requirements.txt | pip install -r /dev/stdin
 
       - name: Run tests
         run: pytest tests/ -q --tb=short
