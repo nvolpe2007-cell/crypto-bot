@@ -13,3 +13,9 @@ venv/
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
 .claude/agents/
+
+# Local-only dev artifacts (not part of the bot runtime)
+# Modelfile: Ollama dev-assistant model def; machine-specific local path
+# archive/: junk-drawer of removed one-off scripts, kept locally for reference
+Modelfile
+archive/
