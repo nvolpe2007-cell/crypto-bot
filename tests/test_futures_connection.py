@@ -25,7 +25,7 @@ import ccxt.async_support as ccxt
 from src.exchange import KrakenFuturesConnection, CircuitBreaker
 
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
+# ── fixtures ────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
@@ -54,10 +54,12 @@ def _make_conn() -> KrakenFuturesConnection:
     conn.exchange.close = AsyncMock(return_value=None)
     # High threshold so existing retry tests are not affected by the circuit breaker
     conn._circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
+    conn._data_circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
+    conn._order_circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
     return conn
 
 
-# ── perp_symbol ───────────────────────────────────────────────────────────────
+# ── perp_symbol ──────────────────────────────────────────────────────────────────────────
 
 class TestPerpSymbol:
     def test_maps_btc_usd(self):
@@ -77,7 +79,7 @@ class TestPerpSymbol:
         assert conn.perp_symbol('XRP/USD') == 'XRP/USD'
 
 
-# ── _retry ────────────────────────────────────────────────────────────────────
+# ── _retry ────────────────────────────────────────────────────────────────────────────
 
 class TestFuturesRetryHelper:
     async def test_succeeds_on_first_attempt(self):
@@ -160,7 +162,7 @@ class TestFuturesRetryHelper:
         assert fn.call_count == 5
 
 
-# ── connect ───────────────────────────────────────────────────────────────────
+# ── connect ───────────────────────────────────────────────────────────────────────────
 
 class TestFuturesConnect:
     async def test_calls_load_markets(self):
@@ -195,7 +197,7 @@ class TestFuturesConnect:
         assert conn.exchange.load_markets.call_count == 1
 
 
-# ── fetch_ohlcv ───────────────────────────────────────────────────────────────
+# ── fetch_ohlcv ─────────────────────────────────────────────────────────────────────────
 
 class TestFuturesFetchOhlcv:
     CANDLES = [[1_700_000_000_000, 50000, 50100, 49900, 50050, 100.0]]
@@ -243,7 +245,7 @@ class TestFuturesFetchOhlcv:
         assert conn.exchange.fetch_ohlcv.call_count == 1
 
 
-# ── get_ticker ────────────────────────────────────────────────────────────────
+# ── get_ticker ───────────────────────────────────────────────────────────────────────────
 
 class TestFuturesGetTicker:
     async def test_returns_ticker_on_success(self):
@@ -288,7 +290,7 @@ class TestFuturesGetTicker:
         assert conn.exchange.fetch_ticker.call_count == 1
 
 
-# ── fetch_funding_rate ────────────────────────────────────────────────────────
+# ── fetch_funding_rate ──────────────────────────────────────────────────────────────────
 
 class TestFetchFundingRate:
     async def test_returns_funding_rate_on_success(self):
@@ -340,7 +342,7 @@ class TestFetchFundingRate:
         assert conn.exchange.fetch_funding_rate.call_count == 1
 
 
-# ── fetch_funding_rate_history ────────────────────────────────────────────────
+# ── fetch_funding_rate_history ──────────────────────────────────────────────────────────────────
 
 class TestFetchFundingRateHistory:
     HISTORY = [
@@ -391,7 +393,7 @@ class TestFetchFundingRateHistory:
         assert conn.exchange.fetch_funding_rate_history.call_count == 1
 
 
-# ── get_balance ───────────────────────────────────────────────────────────────
+# ── get_balance ─────────────────────────────────────────────────────────────────────────
 
 class TestFuturesGetBalance:
     async def test_returns_balance_on_success(self):
@@ -439,7 +441,7 @@ class TestFuturesGetBalance:
         assert conn.exchange.fetch_balance.call_count == 1
 
 
-# ── create_order — no retry ───────────────────────────────────────────────────
+# ── create_order — no retry ──────────────────────────────────────────────────────────────
 
 class TestFuturesCreateOrder:
     async def test_returns_order_on_success(self):
@@ -492,7 +494,7 @@ class TestFuturesCreateOrder:
         assert 'leverage' not in params
 
 
-# ── cancel_order ──────────────────────────────────────────────────────────────
+# ── cancel_order ─────────────────────────────────────────────────────────────────────────
 
 class TestFuturesCancelOrder:
     async def test_returns_result_on_success(self):
@@ -526,7 +528,7 @@ class TestFuturesCancelOrder:
         assert conn.exchange.cancel_order.call_count == 2
 
 
-# ── get_open_positions ────────────────────────────────────────────────────────
+# ── get_open_positions ───────────────────────────────────────────────────────────────────
 
 class TestGetOpenPositions:
     async def test_returns_positions_on_success(self):

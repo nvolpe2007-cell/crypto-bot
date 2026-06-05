@@ -48,7 +48,7 @@ class CircuitBreaker:
       - Call record_failure() when all retries are exhausted — increments counter
         and opens the circuit if threshold is reached.
 
-    The circuit is "half-open" after the cooldown expires: it allows one call
+    The circuit is “half-open” after the cooldown expires: it allows one call
     through. If that call succeeds, record_success() fully resets the state.
     If it fails again, record_failure() re-opens the circuit.
 
@@ -145,10 +145,17 @@ class ExchangeConnection:
             self.exchange.set_sandbox_mode(True)
         self._circuit = CircuitBreaker(threshold=circuit_threshold,
                                        cooldown_seconds=circuit_cooldown)
+        # Separate circuits prevent cascade failures: OHLCV rate-limits should not
+        # block order management, and order failures should not mute market data.
+        self._data_circuit = CircuitBreaker(threshold=circuit_threshold,
+                                            cooldown_seconds=circuit_cooldown)
+        self._order_circuit = CircuitBreaker(threshold=circuit_threshold,
+                                             cooldown_seconds=circuit_cooldown)
         logger.info(f"Exchange initialized (sandbox={sandbox})")
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
-                     label: str = '?', call_timeout: float = 30.0, **kwargs):
+                     label: str = '?', call_timeout: float = 30.0,
+                     circuit: Optional[CircuitBreaker] = None, **kwargs):
         """Call coro_fn(*args, **kwargs) with exponential-backoff retry.
 
         Retries only on _RETRYABLE (NetworkError, RequestTimeout,
@@ -164,13 +171,19 @@ class ExchangeConnection:
             with normal exponential backoff.  Pass None to disable (not
             recommended in production; a hung call blocks the entire event loop).
 
+        circuit: Which CircuitBreaker instance to use. Defaults to self._circuit.
+            Pass self._data_circuit for market-data calls and self._order_circuit
+            for order-management calls so a data outage cannot block order execution
+            and vice versa.
+
         Raises CircuitBreakerOpen if the circuit is currently open (too many
         consecutive total-failures across all calls on this connection).
 
         Raises the last seen _RETRYABLE exception (or ccxt.RequestTimeout on
         hang) when all attempts are exhausted.
         """
-        self._circuit.check()  # raises CircuitBreakerOpen if open
+        cb = circuit if circuit is not None else self._circuit
+        cb.check()  # raises CircuitBreakerOpen if open
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
@@ -179,7 +192,7 @@ class ExchangeConnection:
                     result = await asyncio.wait_for(coro, timeout=call_timeout)
                 else:
                     result = await coro
-                self._circuit.record_success()
+                cb.record_success()
                 return result
             except asyncio.TimeoutError:
                 # A hung ccxt call — convert to RequestTimeout so callers and
@@ -208,7 +221,7 @@ class ExchangeConnection:
                         # they don't all hammer the exchange at the same moment.
                         wait = 2 ** attempt + random.uniform(0, 1)
                     await asyncio.sleep(wait)
-        self._circuit.record_failure()
+        cb.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
 
@@ -236,6 +249,7 @@ class ExchangeConnection:
                 self.exchange.fetch_ohlcv, symbol,
                 timeframe=timeframe, limit=limit, since=since,
                 retries=retries, label=f'fetch_ohlcv({symbol})',
+                circuit=self._data_circuit,
             )
         except CircuitBreakerOpen:
             raise
@@ -291,6 +305,7 @@ class ExchangeConnection:
         return await self._retry(
             self.exchange.fetch_ticker, symbol,
             retries=retries, label=f'get_ticker({symbol})',
+            circuit=self._data_circuit,
         )
 
     async def get_balance(self, retries: int = 3) -> Dict:
@@ -347,6 +362,7 @@ class ExchangeConnection:
         return await self._retry(
             self.exchange.cancel_order, order_id, symbol,
             retries=retries, label=f'cancel_order({order_id})',
+            circuit=self._order_circuit,
         )
 
     async def get_open_orders(self, symbol: Optional[str] = None,
@@ -355,6 +371,7 @@ class ExchangeConnection:
         return await self._retry(
             self.exchange.fetch_open_orders, symbol,
             retries=retries, label='get_open_orders',
+            circuit=self._order_circuit,
         )
 
     async def get_trades(self, symbol: Optional[str] = None,
@@ -364,6 +381,7 @@ class ExchangeConnection:
         return await self._retry(
             self.exchange.fetch_trades, symbol, since=since,
             retries=retries, label=f'get_trades({symbol})',
+            circuit=self._order_circuit,
         )
 
 
@@ -397,6 +415,10 @@ class KrakenFuturesConnection:
             self.exchange.set_sandbox_mode(True)
         self._circuit = CircuitBreaker(threshold=circuit_threshold,
                                        cooldown_seconds=circuit_cooldown)
+        self._data_circuit = CircuitBreaker(threshold=circuit_threshold,
+                                            cooldown_seconds=circuit_cooldown)
+        self._order_circuit = CircuitBreaker(threshold=circuit_threshold,
+                                             cooldown_seconds=circuit_cooldown)
         logger.info(f"Kraken Futures initialized (sandbox={sandbox})")
 
     def perp_symbol(self, spot_symbol: str) -> str:
@@ -404,7 +426,8 @@ class KrakenFuturesConnection:
         return self.SPOT_TO_PERP.get(spot_symbol, spot_symbol)
 
     async def _retry(self, coro_fn, *args, retries: int = 3,
-                     label: str = '?', call_timeout: float = 30.0, **kwargs):
+                     label: str = '?', call_timeout: float = 30.0,
+                     circuit: Optional[CircuitBreaker] = None, **kwargs):
         """Identical retry + circuit-breaker semantics to ExchangeConnection._retry.
 
         Retries only _RETRYABLE errors with exponential backoff.
@@ -415,8 +438,13 @@ class KrakenFuturesConnection:
         call_timeout: Per-call wall-clock timeout in seconds (default 30).
             Hung ccxt calls are cancelled and re-raised as ccxt.RequestTimeout.
             Pass None to disable.
+
+        circuit: Which CircuitBreaker to use (default: self._circuit).
+            Use self._data_circuit for market-data calls and self._order_circuit
+            for order-management so failures in one category don't block the other.
         """
-        self._circuit.check()
+        cb = circuit if circuit is not None else self._circuit
+        cb.check()
         last_exc: Exception = RuntimeError("_retry: no attempts made")
         for attempt in range(1, retries + 1):
             try:
@@ -425,7 +453,7 @@ class KrakenFuturesConnection:
                     result = await asyncio.wait_for(coro, timeout=call_timeout)
                 else:
                     result = await coro
-                self._circuit.record_success()
+                cb.record_success()
                 return result
             except asyncio.TimeoutError:
                 msg = (
@@ -449,7 +477,7 @@ class KrakenFuturesConnection:
                     else:
                         wait = 2 ** attempt + random.uniform(0, 1)
                     await asyncio.sleep(wait)
-        self._circuit.record_failure()
+        cb.record_failure()
         logger.error(f"{label} failed after {retries} attempts: {last_exc}")
         raise last_exc
 
@@ -474,6 +502,7 @@ class KrakenFuturesConnection:
                 self.exchange.fetch_ohlcv, perp,
                 timeframe=timeframe, limit=limit, since=since,
                 retries=retries, label=f'futures.fetch_ohlcv({perp})',
+                circuit=self._data_circuit,
             )
         except CircuitBreakerOpen:
             raise
@@ -486,6 +515,7 @@ class KrakenFuturesConnection:
         return await self._retry(
             self.exchange.fetch_ticker, self.perp_symbol(symbol),
             retries=retries, label=f'futures.get_ticker({symbol})',
+            circuit=self._data_circuit,
         )
 
     async def fetch_funding_rate(self, symbol: str,
@@ -499,6 +529,7 @@ class KrakenFuturesConnection:
             data = await self._retry(
                 self.exchange.fetch_funding_rate, self.perp_symbol(symbol),
                 retries=retries, label=f'futures.fetch_funding_rate({symbol})',
+                circuit=self._data_circuit,
             )
             return data.get('fundingRate')
         except CircuitBreakerOpen:
@@ -519,6 +550,7 @@ class KrakenFuturesConnection:
                 limit=limit,
                 retries=retries,
                 label=f'futures.fetch_funding_rate_history({symbol})',
+                circuit=self._data_circuit,
             )
         except CircuitBreakerOpen:
             raise
@@ -566,6 +598,7 @@ class KrakenFuturesConnection:
         return await self._retry(
             self.exchange.cancel_order, order_id, self.perp_symbol(symbol),
             retries=retries, label=f'futures.cancel_order({order_id})',
+            circuit=self._order_circuit,
         )
 
     async def get_open_positions(self, retries: int = 3) -> List:
@@ -576,6 +609,7 @@ class KrakenFuturesConnection:
             return await self._retry(
                 self.exchange.fetch_positions,
                 retries=retries, label='futures.get_open_positions',
+                circuit=self._order_circuit,
             )
         except CircuitBreakerOpen:
             raise

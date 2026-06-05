@@ -36,7 +36,7 @@ _RECONNECT_DELAY_MIN = 5    # initial reconnect wait (seconds)
 _RECONNECT_DELAY_MAX = 60   # maximum reconnect wait after repeated failures
 
 
-# ── Data types ────────────────────────────────────────────────────────────────
+# ── Data types ────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CandleClose:
@@ -61,7 +61,7 @@ class Execution:
     timestamp: str
 
 
-# ── Kraken REST signing (for WS token) ────────────────────────────────────────
+# ── Kraken REST signing (for WS token) ──────────────────────────────────────────────
 
 def _kraken_sign(api_secret: str, url_path: str, data: dict) -> tuple[str, str]:
     """Return (nonce_str, api_sign_header) for a private REST call."""
@@ -103,7 +103,7 @@ async def _fetch_ws_token(api_key: str, api_secret: str) -> Optional[str]:
         return None
 
 
-# ── Public WebSocket ──────────────────────────────────────────────────────────
+# ── Public WebSocket ────────────────────────────────────────────────────────────────────────
 
 class KrakenPublicWS:
     """
@@ -154,7 +154,10 @@ class KrakenPublicWS:
     async def _connect(self):
         logger.info(f"[PublicWS] connecting to {_PUBLIC_WS}")
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(_PUBLIC_WS, heartbeat=30) as ws:
+            async with session.ws_connect(
+                _PUBLIC_WS, heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as ws:
                 logger.info("[PublicWS] connected")
 
                 # Subscribe to ticker
@@ -219,7 +222,7 @@ class KrakenPublicWS:
                         pass
 
 
-# ── Private WebSocket ─────────────────────────────────────────────────────────
+# ── Private WebSocket ───────────────────────────────────────────────────────────────────
 
 class KrakenPrivateWS:
     """
@@ -281,7 +284,10 @@ class KrakenPrivateWS:
     async def _connect(self):
         logger.info(f"[PrivateWS] connecting to {_PRIVATE_WS}")
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(_PRIVATE_WS, heartbeat=30) as ws:
+            async with session.ws_connect(
+                _PRIVATE_WS, heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as ws:
                 logger.info("[PrivateWS] connected")
 
                 await ws.send_json({
@@ -346,7 +352,7 @@ class KrakenPrivateWS:
                     logger.debug(f"[PrivateWS] balance update: {currency}={balance:.4f}")
 
 
-# ── Public L2 book feed ───────────────────────────────────────────────────────
+# ── Public L2 book feed ────────────────────────────────────────────────────────────────────
 
 class KrakenBookFeed:
     """Maintains a streaming L2 order book per symbol via Kraken WS v2.
@@ -411,7 +417,10 @@ class KrakenBookFeed:
     async def _connect(self):
         logger.info(f"[BookFeed] connecting to {_PUBLIC_WS} (depth={self._depth})")
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(_PUBLIC_WS, heartbeat=30) as ws:
+            async with session.ws_connect(
+                _PUBLIC_WS, heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as ws:
                 logger.info("[BookFeed] connected")
                 await ws.send_json({
                     "method": "subscribe",
@@ -465,7 +474,7 @@ class KrakenBookFeed:
             self._last_update[sym] = time.monotonic()
 
 
-# ── Public trade tape feed (for VPIN / CVD) ───────────────────────────────────
+# ── Public trade tape feed (for VPIN / CVD) ───────────────────────────────────────────────
 
 @dataclass
 class TradeTick:
@@ -516,7 +525,10 @@ class KrakenTradeFeed:
     async def _connect(self):
         logger.info(f"[TradeFeed] connecting to {_PUBLIC_WS}")
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(_PUBLIC_WS, heartbeat=30) as ws:
+            async with session.ws_connect(
+                _PUBLIC_WS, heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as ws:
                 logger.info("[TradeFeed] connected")
                 await ws.send_json({
                     "method": "subscribe",
