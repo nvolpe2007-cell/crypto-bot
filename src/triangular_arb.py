@@ -48,6 +48,20 @@ LEG_FEE = float(os.getenv("TRIARB_LEG_FEE", "0.0040"))
 # Minimum net edge AFTER fees to record an opportunity.
 MIN_EDGE_BPS = float(os.getenv("TRIARB_MIN_EDGE_BPS", "5.0"))
 
+# Max seconds a leg's quote may be stale before the cycle is untradeable.
+# The thin cross pairs (ETH/BTC, SOL/BTC) update far less often than the USD
+# legs; pairing a fresh USD quote with a stale cross quote manufactures a
+# phantom edge that does not exist in the live book. Any leg older than this
+# voids the whole cycle. 0 disables the gate (restores the old behavior).
+MAX_STALENESS_SEC = float(os.getenv("TRIARB_MAX_STALENESS_SEC", "3.0"))
+
+# No-arbitrage backstop: a real single-venue triangular edge on liquid majors,
+# net of ~120bps of fees, is a few bps and fleeting. A persistent edge above
+# this is a data artifact (stale/crossed quote), not money. Such opportunities
+# are counted as `implausible` and excluded from paper P&L rather than logged
+# as profit. 0 disables the backstop.
+MAX_EDGE_BPS = float(os.getenv("TRIARB_MAX_EDGE_BPS", "50.0"))
+
 # Test notional per cycle (paper sim — never touches real funds).
 TEST_NOTIONAL_USD = float(os.getenv("TRIARB_TEST_NOTIONAL_USD", "100.0"))
 
@@ -87,33 +101,68 @@ class Opportunity:
 # ── Scanner ───────────────────────────────────────────────────────────────────
 
 BookGetter = Callable[[str], Tuple[List[List[float]], List[List[float]]]]
+StalenessGetter = Callable[[str], float]
 
 
 class TriangularArbScanner:
     def __init__(self, cycles: List[Cycle], get_book: BookGetter,
-                 leg_fee: float = LEG_FEE, min_edge_bps: float = MIN_EDGE_BPS):
-        self.cycles       = cycles
-        self.get_book     = get_book
-        self.leg_fee      = leg_fee
-        self.min_edge_bps = min_edge_bps
+                 leg_fee: float = LEG_FEE, min_edge_bps: float = MIN_EDGE_BPS,
+                 get_staleness: Optional[StalenessGetter] = None,
+                 max_staleness_sec: float = MAX_STALENESS_SEC,
+                 max_edge_bps: float = MAX_EDGE_BPS):
+        self.cycles            = cycles
+        self.get_book          = get_book
+        self.leg_fee           = leg_fee
+        self.min_edge_bps      = min_edge_bps
+        self.get_staleness     = get_staleness
+        self.max_staleness_sec = max_staleness_sec
+        self.max_edge_bps      = max_edge_bps
         self.journal: Deque[Opportunity] = deque(maxlen=JOURNAL_MAXLEN)
-        self._scans         = 0
-        self._opps_found    = 0
-        self._best_edge_bps = 0.0
-        self._cum_paper_pnl = 0.0
+        self._scans           = 0
+        self._opps_found      = 0
+        self._best_edge_bps   = 0.0
+        self._cum_paper_pnl   = 0.0
+        self._skipped_stale   = 0   # cycles voided by a stale leg
+        self._skipped_implaus = 0   # edges rejected as data artifacts
+
+    def _cycle_is_stale(self, cycle: Cycle) -> bool:
+        """True if any leg's quote is older than max_staleness_sec.
+
+        A stale leg means we'd be 'arbing' a price that no longer exists; the
+        resulting edge is fictional. No staleness source → can't check → False.
+        """
+        if self.get_staleness is None or self.max_staleness_sec <= 0:
+            return False
+        for leg in cycle.legs:
+            try:
+                if self.get_staleness(leg.symbol) > self.max_staleness_sec:
+                    return True
+            except Exception:
+                return True   # can't prove freshness → treat as stale
+        return False
 
     def scan_once(self) -> List[Opportunity]:
         self._scans += 1
         found: List[Opportunity] = []
         for cycle in self.cycles:
+            if self._cycle_is_stale(cycle):
+                self._skipped_stale += 1
+                continue
             opp = self._evaluate(cycle)
-            if opp is not None and opp.edge_bps >= self.min_edge_bps:
-                found.append(opp)
-                self.journal.append(opp)
-                self._opps_found += 1
-                self._cum_paper_pnl += opp.profit_usd
-                if opp.edge_bps > self._best_edge_bps:
-                    self._best_edge_bps = opp.edge_bps
+            if opp is None or opp.edge_bps < self.min_edge_bps:
+                continue
+            # No-arbitrage backstop: implausibly large persistent edges are
+            # stale/crossed-quote artifacts, not tradeable money. Drop them
+            # from results and paper P&L so the log stays honest.
+            if self.max_edge_bps > 0 and opp.edge_bps > self.max_edge_bps:
+                self._skipped_implaus += 1
+                continue
+            found.append(opp)
+            self.journal.append(opp)
+            self._opps_found += 1
+            self._cum_paper_pnl += opp.profit_usd
+            if opp.edge_bps > self._best_edge_bps:
+                self._best_edge_bps = opp.edge_bps
         return found
 
     def _leg_price_and_ratio(self, leg: Leg) -> Optional[Tuple[float, float]]:
@@ -174,6 +223,8 @@ class TriangularArbScanner:
             "hit_rate":       (self._opps_found / self._scans) if self._scans else 0.0,
             "best_edge_bps":  round(self._best_edge_bps, 2),
             "cum_paper_pnl_usd": round(self._cum_paper_pnl, 4),
+            "skipped_stale":     self._skipped_stale,
+            "skipped_implausible": self._skipped_implaus,
             "journal_size":   len(self.journal),
         }
 

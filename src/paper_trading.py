@@ -890,6 +890,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             _triarb_scanner = TriangularArbScanner(
                 cycles=DEFAULT_CYCLES,
                 get_book=lambda s: book_feed.get_top(s, depth=10),
+                # Void cycles whose quotes are stale — the thin cross pairs
+                # (ETH/BTC, SOL/BTC) lag the USD legs and manufacture phantom
+                # edges. book_feed.staleness() returns seconds since last tick.
+                get_staleness=book_feed.staleness,
             )
             async def _triarb_loop():
                 interval = float(os.getenv("TRIARB_SCAN_INTERVAL_SEC", "30"))
