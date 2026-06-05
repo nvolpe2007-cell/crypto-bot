@@ -219,6 +219,30 @@ class ScalpingBot:
 
     async def _run_live_mode(self):
         """Run live trading with real money on Kraken."""
+        # SAFETY GATE: live_trading.py runs the intraday DIRECTIONAL engine — the
+        # same logic the proof scorecard FAILED (229 trades, expectancy -$0.088,
+        # t-stat -8.82). That engine is shelved in paper (DIRECTIONAL_ENABLED=0);
+        # this makes the shelf apply to REAL MONEY too, so flipping config
+        # `mode: live` can't accidentally fire a disproven strategy. The swing
+        # strategy (the actual proven-path candidate) runs via its OWN cron, not
+        # through here. Set DIRECTIONAL_ENABLED=1 ONLY to deliberately live-trade
+        # the directional engine. See proof_scorecard.py / [[directional_cost_bleed_fix]].
+        if os.getenv('DIRECTIONAL_ENABLED', '0') != '1':
+            logger.error(
+                "[LIVE] REFUSING to start — live mode trades the DIRECTIONAL engine, "
+                "which is SHELVED (proof_scorecard: 229 trades, t=-8.82, FAILED). "
+                "The swing strategy runs via its own cron, not here. Set "
+                "DIRECTIONAL_ENABLED=1 only if you truly intend to live-trade it."
+            )
+            if (n := create_notifier_from_env()) is not None:
+                try:
+                    n.send_message(
+                        "🛑 <b>LIVE start refused</b>\nDirectional engine is shelved "
+                        "(t=-8.82, FAILED). Set DIRECTIONAL_ENABLED=1 to override."
+                    )
+                except Exception:
+                    pass
+            return
         trading_mode = os.getenv('TRADING_MODE', 'spot').lower()
         is_perps     = trading_mode == 'perps'
 

@@ -67,7 +67,13 @@ logging:
 # The package's orders.py raises if anyone tries to flip it to live without a
 # Kraken execution client wired up. Leave it that way until edge is measured.
 altperp:
-  enabled: true
+  # SHELVED 2026-06-05: same category as the disproven directional engine — an
+  # unproven DIRECTIONAL strategy that shorts Kraken Futures perps (NOT executable
+  # on a US Kraken-spot account) and which proof_scorecard.py does not even track,
+  # so it was running unjudged. Off until it's either executable or measured.
+  # Flip back to true (and consider adding it to the scorecard) to resume forward
+  # data collection. See proof_scorecard.py.
+  enabled: false
   # Claude-API gate-keeper layer that confirms / vetoes / sizes structural setups.
   # OFF by default: without ANTHROPIC_API_KEY in .env the brain fail-closes and
   # vetoes every trade, which defeats the point of collecting forward data.
