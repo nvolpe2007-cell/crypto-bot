@@ -323,7 +323,9 @@ class FundingArbPaperSim:
             'flip_cooldowns': self._flip_cooldowns,
             'start_time_iso': self.start_time.isoformat(),
         }
-        self.state_file.write_text(json.dumps(payload, indent=2))
+        tmp = self.state_file.with_suffix('.tmp')
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, self.state_file)  # atomic on POSIX — no partial-write corruption
 
     # ── core sim loop ──────────────────────────────────────────────────────────
 
