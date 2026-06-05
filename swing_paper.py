@@ -27,6 +27,7 @@ from src.swing_strategy import SwingStrategy, ROUND_TRIP_COST_FRAC
 from src.decision_log import DecisionLog
 from src.volume_profile import volume_profile, DEFAULT_BINS
 from src.event_calendar import blackout_reason
+from src.cot_report import cot_signal
 
 # Validated liquid Kraken USD-spot majors (pair codes confirmed live against the
 # OHLC endpoint). A WIDER universe is the fastest, cleanest way to reach the
@@ -140,7 +141,8 @@ def _vp_context(window: list[dict], fill: float) -> dict:
 
 def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: dict,
           strat: SwingStrategy, dlog: DecisionLog, notify=None,
-          live_price: float | None = None, is_latest: bool = False) -> None:
+          live_price: float | None = None, is_latest: bool = False,
+          cot_bias: str = "n/a") -> None:
     """Advance one closed bar for a (symbol, timeframe) slot. `key` namespaces
     state ("BASE@INTERVAL"); `base`/`tf` are for labels and the trade record.
     `live_price`/`is_latest`: on the most recent bar, fill entries at the live
@@ -175,9 +177,10 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
                    "exit": exit_price, "size_usd": size, "pnl": net,
                    "pnl_pct": ret * 100, "reason": exit_reason, "won": net > 0,
                    "equity_after": round(state["equity"], 2)}
-            # carry the entry's volume-profile context onto the closed record so
-            # proof_scorecard / analysis can test win-rate by VP zone (research).
-            for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value"):
+            # carry entry research context (VP zone + COT macro bias) onto the
+            # closed record so proof_scorecard / analysis can test win-rate by
+            # each signal — measure-first, before either gates a trade.
+            for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value", "cot_bias"):
                 if k in pos:
                     rec[k] = pos[k]
             state["closed"].append(rec)
@@ -219,7 +222,7 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
         "symbol": base, "tf": tf,
         "entry": fill, "stop": stop, "target": target,
         "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr,
-        **vp_ctx}
+        "cot_bias": cot_bias, **vp_ctx}
     dlog.opened(base, str(bar["t"]), fill, TRADE_SIZE, stop, target, dec.rr, dec.reason)
     dlog._write("open_context", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
                                  "fill": fill, "signal_close": dec.price, **vp_ctx})
@@ -231,7 +234,8 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
 
 def process_symbol(key: str, base: str, tf: int, closed_bars: list[dict],
                    state: dict, strat: SwingStrategy, dlog: DecisionLog,
-                   notify=None, live_price: float | None = None) -> int:
+                   notify=None, live_price: float | None = None,
+                   cot_bias: str = "n/a") -> int:
     """Process every newly-closed bar since last run for one (symbol, timeframe)
     slot. Returns # bars processed. First-ever run per slot only sets the
     baseline (forward-only, no replay). `live_price` (if given) fills an entry on
@@ -246,7 +250,7 @@ def process_symbol(key: str, base: str, tf: int, closed_bars: list[dict],
     for i, bar in enumerate(new):
         idx = closed_bars.index(bar)
         _step(key, base, tf, closed_bars[: idx + 1], bar, state, strat, dlog, notify,
-              live_price=live_price, is_latest=(i == len(new) - 1))
+              live_price=live_price, is_latest=(i == len(new) - 1), cot_bias=cot_bias)
         state["last_bar_t"][key] = bar["t"]
     return len(new)
 
@@ -255,6 +259,18 @@ def main():
     strat = SwingStrategy()
     dlog = DecisionLog(path=Path("data/swing_decisions.jsonl"))
     state = _load_state()
+
+    # COT macro context (research): logged once per run and stamped on each entry
+    # so we can later MEASURE whether leveraged-fund extremes skew swing outcomes.
+    # Best-effort — never blocks the run.
+    cot = cot_signal()
+    cot_bias = cot.bias if cot else "n/a"
+    if cot:
+        dlog._write("macro_context", {
+            "source": "COT-CME-BTC", "date": cot.date, "lev_net": cot.lev_net,
+            "lev_net_pctile": cot.lev_net_pctile, "asset_mgr_net": cot.asset_mgr_net,
+            "extreme": cot.extreme, "bias": cot.bias})
+
     total_new = 0
     for base, pair in KRAKEN_PAIRS.items():
         # One live-price read per symbol for entry-fill realism (shared across
@@ -268,7 +284,7 @@ def main():
                 print(f"{key}: fetch failed - {e}")
                 continue
             total_new += process_symbol(key, base, tf, bars, state, strat, dlog,
-                                        live_price=live_price)
+                                        live_price=live_price, cot_bias=cot_bias)
     _save_state(state)
     open_n = len(state["positions"])
     closed_n = len(state["closed"])
