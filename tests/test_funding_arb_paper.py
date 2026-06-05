@@ -110,42 +110,68 @@ def test_apy_within_band_opens(tmp_path, monkeypatch):
 
 
 def _make_majors_sim(tmp_path, opps, monkeypatch):
+    # Mirrors the deployed majors arm: Kraken Futures only (the executable venue)
+    # at a realistic ~0.54% round-trip cost. See the realism fix in paper_trading.
     monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
     return FundingArbPaperSim(
         scanner=_FakeScanner(opps), notifier=None,
         positive_funding_only=True,
         symbol_allowlist=fap.MAJOR_SYMBOLS,
-        cost_frac=0.0008,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0054,
         state_file=tmp_path / "majors_state.json",
         label="Funding Arb (majors)",
     )
 
 
+def _kf_opp(symbol, apy):
+    """A Kraken-Futures opportunity (the only venue the majors arm executes)."""
+    return _opp(symbol, apy, exchange="Kraken Futures")
+
+
 def test_majors_arm_rejects_non_major(tmp_path, monkeypatch):
     # ENJ isn't in the majors allowlist → conservative arm skips it.
-    sim = _make_majors_sim(tmp_path, [_opp("ENJUSDT", 30.0)], monkeypatch)
+    sim = _make_majors_sim(tmp_path, [_kf_opp("ENJUSDT", 80.0)], monkeypatch)
     sim._tick()
     assert len(sim.open_positions) == 0
 
 
 def test_majors_arm_rejects_negative_funding(tmp_path, monkeypatch):
     # Negative funding would need a spot short (borrow) → conservative arm skips.
-    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", -30.0)], monkeypatch)
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", -80.0)], monkeypatch)
     sim._tick()
     assert len(sim.open_positions) == 0
 
 
-def test_majors_arm_opens_positive_major(tmp_path, monkeypatch):
-    # Positive funding on a major, above the maker-fee floor (~9%) → opens.
-    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", 15.0)], monkeypatch)
+def test_majors_arm_rejects_non_executable_venue(tmp_path, monkeypatch):
+    # A positive major well above the floor, but on Binance — not executable for
+    # a US-restricted account. The source allowlist must reject it.
+    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", 80.0, exchange="Binance")],
+                           monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_opens_rich_executable_major(tmp_path, monkeypatch):
+    # Positive major on Kraken Futures, above the realistic-cost floor (~59%) → opens.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", 80.0)], monkeypatch)
     sim._tick()
     assert len(sim.open_positions) == 1
 
 
-def test_majors_arm_lower_cost_floor(tmp_path, monkeypatch):
-    # Maker-fee cost (0.08%) gives a much lower APY floor than the taker default.
+def test_majors_arm_skips_below_realistic_floor(tmp_path, monkeypatch):
+    # 15% APY cleared the old 0.08%-cost floor but not the realistic 0.54% one
+    # (~59%): at honest cost it doesn't break even in time, so the arm passes.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", 15.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_realistic_cost_floor(tmp_path, monkeypatch):
+    # Realistic Kraken round-trip cost (~0.54%) lifts the APY floor far above the
+    # old optimistic ~9%: 0.0054 / 10 cycles × 3 × 365 × 100 ≈ 59%.
     sim = _make_majors_sim(tmp_path, [], monkeypatch)
-    assert sim._apy_floor() < 10.0   # ~8.8% at 0.08% cost / 10 cycles
+    assert 50.0 < sim._apy_floor() < 65.0
 
 
 def _make_kraken_sim(tmp_path, opps, monkeypatch, max_be=2.0):

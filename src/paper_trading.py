@@ -954,10 +954,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             )
 
             # Arm 2 — conservative/"honest": liquid majors only, positive funding
-            # only (long spot / short perp → no borrow needed), maker-fee cost
-            # (~0.08%). Trades rarely, but every trade is genuinely retail-
-            # executable, so its P&L is a believable estimate. Separate ledger +
+            # only (long spot / short perp → no borrow needed). Separate ledger +
             # alert label so the two arms can be compared side by side.
+            # REALISM FIX: the arm previously sourced ALL venues and booked a
+            # 0.08% cost. But for a US-restricted account only Kraken Futures is
+            # executable (funding_scanner docstring: Binance/Bybit are research
+            # baselines), and the long-spot/short-perp round-trip on Kraken really
+            # costs ~0.54% (Kraken Pro spot maker 0.25% + perp maker 0.02%, ×2
+            # sides) — the same figure the Kraken arm uses for the identical trade.
+            # Booking 0.08% on non-executable venues flattered the arm two ways.
+            # Now confined to Kraken Futures at realistic cost so its P&L means
+            # something; the aggressive arm (all venues) remains the research
+            # baseline. This raises the breakeven APY floor (~9% → ~59%), so the
+            # arm trades only when funding genuinely clears the real cost.
+            _maj_cost = float(os.getenv('FUNDING_ARB_MAJORS_COST_FRAC', '0.0054'))
             # Persistence gate (was OFF) — the live ledger showed the majors arm
             # repeating the cycle-0 flip bleed the Kraken arm was fixed for: it
             # opened OP/NEAR/ETC at 28-43% APY and every loss closed
@@ -983,7 +993,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
                 symbol_allowlist=MAJOR_SYMBOLS,
-                cost_frac=0.0008,
+                source_allowlist={'Kraken Futures'},
+                cost_frac=_maj_cost,
                 min_position_usd=_maj_min_size,
                 max_position_usd=_maj_max_size,
                 max_total_notional=_maj_max_total,
