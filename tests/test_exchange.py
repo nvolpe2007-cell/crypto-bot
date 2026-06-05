@@ -31,7 +31,7 @@ import ccxt.async_support as ccxt
 from src.exchange import ExchangeConnection, CircuitBreaker, CircuitBreakerOpen, KrakenFuturesConnection
 
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
+# ── fixtures ────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
@@ -60,10 +60,12 @@ def _make_conn() -> ExchangeConnection:
     conn.exchange.close = AsyncMock(return_value=None)
     # High threshold so existing retry tests are not affected by the circuit breaker
     conn._circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
+    conn._data_circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
+    conn._order_circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
     return conn
 
 
-# ── _retry ────────────────────────────────────────────────────────────────────
+# ── _retry ────────────────────────────────────────────────────────────────────────────
 
 class TestRetryHelper:
     async def test_succeeds_on_first_attempt(self):
@@ -164,7 +166,7 @@ class TestRetryHelper:
         assert fn.call_count == 5
 
 
-# ── fetch_ohlcv ───────────────────────────────────────────────────────────────
+# ── fetch_ohlcv ─────────────────────────────────────────────────────────────────────────
 
 class TestFetchOhlcv:
     CANDLES = [[1_700_000_000_000, 50000, 50100, 49900, 50050, 100.0]]
@@ -210,7 +212,7 @@ class TestFetchOhlcv:
         )
 
 
-# ── get_ticker ────────────────────────────────────────────────────────────────
+# ── get_ticker ─────────────────────────────────────────────────────────────────────────
 
 class TestGetTicker:
     async def test_returns_ticker_on_success(self):
@@ -249,7 +251,7 @@ class TestGetTicker:
         assert conn.exchange.fetch_ticker.call_count == 1
 
 
-# ── get_balance ───────────────────────────────────────────────────────────────
+# ── get_balance ─────────────────────────────────────────────────────────────────────────
 
 class TestGetBalance:
     async def test_returns_balance_on_success(self):
@@ -287,7 +289,7 @@ class TestGetBalance:
             await conn.get_balance(retries=2)
 
 
-# ── create_order — no retry ───────────────────────────────────────────────────
+# ── create_order — no retry ──────────────────────────────────────────────────────────────
 
 class TestCreateOrder:
     async def test_returns_order_on_success(self):
@@ -332,7 +334,7 @@ class TestCreateOrder:
         assert 'price' not in kwargs
 
 
-# ── cancel_order ──────────────────────────────────────────────────────────────
+# ── cancel_order ─────────────────────────────────────────────────────────────────────────
 
 class TestCancelOrder:
     async def test_returns_result_on_success(self):
@@ -360,7 +362,7 @@ class TestCancelOrder:
         assert conn.exchange.cancel_order.call_count == 2
 
 
-# ── get_open_orders ───────────────────────────────────────────────────────────
+# ── get_open_orders ────────────────────────────────────────────────────────────────────────
 
 class TestGetOpenOrders:
     async def test_returns_orders_on_success(self):
@@ -386,7 +388,7 @@ class TestGetOpenOrders:
         conn.exchange.fetch_open_orders.assert_called_once_with(None)
 
 
-# ── get_trades ────────────────────────────────────────────────────────────────
+# ── get_trades ─────────────────────────────────────────────────────────────────────────
 
 class TestGetTrades:
     async def test_returns_trades_on_success(self):
@@ -414,7 +416,7 @@ class TestGetTrades:
         )
 
 
-# ── connect ───────────────────────────────────────────────────────────────────
+# ── connect ─────────────────────────────────────────────────────────────────────────
 
 class TestConnect:
     async def test_calls_load_markets(self):
@@ -439,7 +441,7 @@ class TestConnect:
             await conn.connect(retries=2)
 
 
-# ── fetch_ohlcv_between ───────────────────────────────────────────────────────
+# ── fetch_ohlcv_between ───────────────────────────────────────────────────────────────────────
 
 class TestFetchOhlcvBetween:
     async def test_returns_empty_when_no_data(self):
@@ -497,7 +499,7 @@ class TestFetchOhlcvBetween:
         assert len(result) == 5
 
 
-# ── CircuitBreaker unit tests ─────────────────────────────────────────────────
+# ── CircuitBreaker unit tests ───────────────────────────────────────────────────────────────
 
 class TestCircuitBreakerUnit:
     def test_initially_closed(self):
@@ -572,7 +574,7 @@ class TestCircuitBreakerUnit:
         assert cb.is_open
 
 
-# ── CircuitBreakerOpen.remaining_seconds ──────────────────────────────────────
+# ── CircuitBreakerOpen.remaining_seconds ────────────────────────────────────────────────
 
 class TestCircuitBreakerOpenException:
     def test_default_remaining_seconds_is_zero(self):
@@ -616,7 +618,7 @@ class TestCircuitBreakerOpenException:
         assert isinstance(exc, Exception)
 
 
-# ── CircuitBreaker cooldown escalation ────────────────────────────────────────
+# ── CircuitBreaker cooldown escalation ────────────────────────────────────────────────
 
 class TestCircuitBreakerCooldownEscalation:
     """The circuit escalates cooldown on successive trips: ×1, ×2, ×5."""
@@ -709,7 +711,7 @@ class TestCircuitBreakerCooldownEscalation:
             assert wait <= 300.0, "wait should not exceed the max escalated cooldown"
 
 
-# ── _retry circuit-breaker integration ───────────────────────────────────────
+# ── _retry circuit-breaker integration ───────────────────────────────────────────────
 
 def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> ExchangeConnection:
     """ExchangeConnection with a custom threshold for easier testing."""
@@ -726,6 +728,8 @@ def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> Excha
     conn.exchange.fetch_trades = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
     conn._circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    conn._data_circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    conn._order_circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
     return conn
 
 
@@ -806,17 +810,17 @@ class TestRetryCircuitIntegration:
         assert not conn._circuit.is_open
 
 
-# ── fetch_ohlcv propagates CircuitBreakerOpen ─────────────────────────────────
+# ── fetch_ohlcv propagates CircuitBreakerOpen ─────────────────────────────────────────────
 
 class TestFetchOhlcvCircuitBreaker:
     async def test_fetch_ohlcv_propagates_circuit_breaker_open(self):
         """fetch_ohlcv must NOT swallow CircuitBreakerOpen (unlike other errors)."""
         conn = _make_conn_with_circuit(threshold=1, cooldown=60)
-        # Trip the breaker
+        # Trip the data circuit breaker
         conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("down"))
         result = await conn.fetch_ohlcv('BTC/USD', retries=1)
         assert result == []  # first call exhausts retries → returns []
-        assert conn._circuit.is_open
+        assert conn._data_circuit.is_open   # fetch_ohlcv uses _data_circuit
 
         # Second call must raise CircuitBreakerOpen, not return []
         with pytest.raises(CircuitBreakerOpen):
@@ -830,7 +834,7 @@ class TestFetchOhlcvCircuitBreaker:
         assert result == []
 
 
-# ── KrakenFuturesConnection circuit breaker ───────────────────────────────────
+# ── KrakenFuturesConnection circuit breaker ───────────────────────────────────────────
 
 def _make_futures_conn(threshold: int = 3, cooldown: float = 60.0) -> KrakenFuturesConnection:
     conn = KrakenFuturesConnection.__new__(KrakenFuturesConnection)
@@ -847,6 +851,8 @@ def _make_futures_conn(threshold: int = 3, cooldown: float = 60.0) -> KrakenFutu
     conn.exchange.fetch_positions = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
     conn._circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    conn._data_circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
+    conn._order_circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
     return conn
 
 
@@ -903,7 +909,7 @@ class TestFuturesCircuitBreaker:
         assert conn._circuit.failure_count == 0
 
 
-# ── Rate-limit-specific backoff ───────────────────────────────────────────────
+# ── Rate-limit-specific backoff ──────────────────────────────────────────────────────────────
 
 class TestRateLimitBackoff:
     """RateLimitExceeded must wait ≥30s; other retryable errors use 2^n backoff."""
@@ -972,7 +978,7 @@ class TestRateLimitBackoff:
         assert waits[0] >= 30.0
 
 
-# ── CircuitBreaker cooldown escalation ────────────────────────────────────────
+# ── CircuitBreaker cooldown escalation ────────────────────────────────────────────────
 
 class TestCircuitBreakerEscalation:
     """Cooldown escalates across repeated trips: ×1 → ×2 → ×5 (capped)."""
@@ -1043,7 +1049,7 @@ class TestCircuitBreakerEscalation:
         assert cb.consecutive_open_count == 1
 
 
-# ── Per-call timeout (asyncio.wait_for) ──────────────────────────────────────
+# ── Per-call timeout (asyncio.wait_for) ──────────────────────────────────────────────
 
 
 class TestRetryHangTimeout:
@@ -1240,7 +1246,7 @@ class TestCreateOrderTimeout:
             assert "timed out" in str(exc).lower() or "unknown" in str(exc).lower()
 
 
-# ── KrakenFuturesConnection per-call timeout ──────────────────────────────────
+# ── KrakenFuturesConnection per-call timeout ──────────────────────────────────────────────
 
 
 class TestFuturesRetryHangTimeout:
@@ -1313,3 +1319,78 @@ class TestFuturesCreateOrderTimeout:
         result = await conn.create_order('BTC/USD', 'market', 'buy', 0.01,
                                           order_timeout=None)
         assert result is not None
+
+
+# ── Circuit isolation: data vs order categories ────────────────────────────────────────────
+
+class TestCircuitIsolation:
+    """Data and order circuits are independent — failures in one category must
+    not block the other.  This is critical for live trading: a rate-limited
+    OHLCV feed should never prevent cancelling an open position."""
+
+    async def test_spot_data_circuit_open_does_not_block_cancel_order(self):
+        """Tripping the data circuit via OHLCV failures leaves cancel_order working."""
+        conn = _make_conn_with_circuit(threshold=100)  # _circuit won't open
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn._order_circuit = CircuitBreaker(threshold=100, cooldown_seconds=60.0)
+
+        # Trip the data circuit
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("data down"))
+        await conn.fetch_ohlcv('BTC/USD', retries=1)
+        assert conn._data_circuit.is_open
+
+        # Order circuit should still be closed → cancel_order succeeds
+        conn.exchange.cancel_order = AsyncMock(return_value={'id': 'abc'})
+        result = await conn.cancel_order('order-1', 'BTC/USD')
+        assert result == {'id': 'abc'}
+        assert not conn._order_circuit.is_open
+
+    async def test_spot_order_circuit_open_does_not_block_fetch_ohlcv(self):
+        """Tripping the order circuit via cancel failures leaves OHLCV fetches working."""
+        conn = _make_conn_with_circuit(threshold=100)
+        conn._data_circuit = CircuitBreaker(threshold=100, cooldown_seconds=60.0)
+        conn._order_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+
+        # Trip the order circuit
+        conn.exchange.cancel_order = AsyncMock(side_effect=ccxt.NetworkError("orders down"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn.cancel_order('bad-id', 'BTC/USD')
+        assert conn._order_circuit.is_open
+
+        # Data circuit should still be closed → fetch_ohlcv succeeds
+        candle = [1_700_000_000_000, 50_000.0, 51_000.0, 49_000.0, 50_500.0, 1.5]
+        conn.exchange.fetch_ohlcv = AsyncMock(return_value=[candle])
+        result = await conn.fetch_ohlcv('BTC/USD')
+        assert result == [candle]
+        assert not conn._data_circuit.is_open
+
+    async def test_futures_data_circuit_open_does_not_block_cancel_order(self):
+        """Same isolation guarantee for KrakenFuturesConnection."""
+        conn = _make_futures_conn(threshold=100)
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn._order_circuit = CircuitBreaker(threshold=100, cooldown_seconds=60.0)
+
+        conn.exchange.fetch_ohlcv = AsyncMock(side_effect=ccxt.NetworkError("data down"))
+        await conn.fetch_ohlcv('BTC/USD', retries=1)
+        assert conn._data_circuit.is_open
+
+        conn.exchange.cancel_order = AsyncMock(return_value={'id': 'xyz'})
+        result = await conn.cancel_order('order-1', 'BTC/USD')
+        assert result == {'id': 'xyz'}
+
+    async def test_futures_order_circuit_open_does_not_block_fetch_ohlcv(self):
+        """Order circuit tripped on futures does not mute market data."""
+        conn = _make_futures_conn(threshold=100)
+        conn._data_circuit = CircuitBreaker(threshold=100, cooldown_seconds=60.0)
+        conn._order_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+
+        conn.exchange.cancel_order = AsyncMock(side_effect=ccxt.NetworkError("orders down"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn.cancel_order('bad-id', 'BTC/USD')
+        assert conn._order_circuit.is_open
+
+        candle = [1_700_000_000_000, 50_000.0, 51_000.0, 49_000.0, 50_500.0, 1.5]
+        conn.exchange.fetch_ohlcv = AsyncMock(return_value=[candle])
+        result = await conn.fetch_ohlcv('BTC/USD')
+        assert result == [candle]
+        assert not conn._data_circuit.is_open
