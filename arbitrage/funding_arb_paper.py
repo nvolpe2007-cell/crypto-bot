@@ -39,6 +39,25 @@ MAX_CONCURRENT_POSITIONS = 3
 POSITION_SIZE_USD = 500.0      # per leg (so $1000 capital used per pair)
 FUNDING_CYCLE_HOURS = 8        # standard for Binance/Bybit perps
 
+# Per-venue funding settlement interval. Binance/Bybit settle every 8h, but
+# Kraken Futures settles HOURLY — modeling it as 8h made positions all-or-
+# nothing at the 8h boundary, so a perp whose funding flipped a few hours after
+# entry showed cycles=0 and ate the full entry cost having collected nothing.
+# Hourly accrual banks the funding actually earned before a flip. NOTE: funding
+# APY is annualized, so total funding over a given hold is interval-INDEPENDENT;
+# a shorter interval does not raise expectancy, it only finishes the all-or-
+# nothing cycle-0 wipeouts by accruing in finer increments before a flip.
+KRAKEN_FUNDING_INTERVAL_HOURS = float(
+    os.getenv('FUNDING_ARB_KRAKEN_INTERVAL_HOURS', '1')
+)
+
+
+def _funding_interval_hours(exchange: Optional[str]) -> float:
+    """Funding settlement interval (hours) for a venue. Kraken Futures = 1h."""
+    if exchange and 'kraken' in exchange.lower():
+        return KRAKEN_FUNDING_INTERVAL_HOURS
+    return float(FUNDING_CYCLE_HOURS)
+
 # ── APY cap: skip absurd funding ─────────────────────────────────────────────
 # The scanner's top |APY| names are almost always tiny illiquid alt perps
 # (e.g. 800–2000% APY meme coins). That funding is real on paper but rarely
@@ -152,6 +171,10 @@ class PaperPosition:
     entry_cost: float = 0.0          # round-trip transaction cost, charged at open
     borrow_cost: float = 0.0         # cumulative spot-borrow carry (short-spot legs)
     cycles_collected: int = 0
+    # Funding settlement interval for this position's venue (hours). Persisted
+    # so restored positions keep their cadence. Defaults to the 8h standard;
+    # Kraken Futures positions are stamped 1h at open. See _funding_interval_hours.
+    funding_interval_hours: float = float(FUNDING_CYCLE_HOURS)
     last_funding_ts_iso: Optional[str] = None
     # last_seen_iso tracks the most recent tick on which the scanner returned
     # data for this symbol.  It is ONLY updated when current_opp is not None,
@@ -509,6 +532,7 @@ class FundingArbPaperSim:
             last_funding_ts_iso=now.isoformat(),
             last_seen_iso=now.isoformat(),
             entry_cost=entry_cost,
+            funding_interval_hours=_funding_interval_hours(opp['exchange']),
         )
         self.open_positions[key] = pos
         conviction_pct = pos.size_usd / self.max_position_usd * 100
@@ -526,7 +550,7 @@ class FundingArbPaperSim:
             f"size <b>${pos.size_usd:.0f}</b> "
             f"(conviction {conviction_pct:.0f}% of ${self.max_position_usd:.0f} max) · "
             f"cost ${entry_cost:.2f}\n"
-            f"<i>collects funding every {FUNDING_CYCLE_HOURS}h while open</i>"
+            f"<i>collects funding every {pos.funding_interval_hours:.0f}h while open</i>"
         )
 
     def _accrue_funding(
@@ -549,8 +573,9 @@ class FundingArbPaperSim:
             datetime.fromisoformat(pos.last_funding_ts_iso)
             if pos.last_funding_ts_iso else pos.entry_time
         )
+        interval_h = pos.funding_interval_hours or float(FUNDING_CYCLE_HOURS)
         hours_since = (now - last_ts).total_seconds() / 3600.0
-        cycles_due = int(hours_since // FUNDING_CYCLE_HOURS)
+        cycles_due = int(hours_since // interval_h)
         if cycles_due <= 0:
             return
 
@@ -562,8 +587,11 @@ class FundingArbPaperSim:
             current_rate_per_cycle = pos.entry_rate_8h * 0.25  # conservative
 
         # We collect funding (we're on the receiving side by construction).
-        # Sign of entry_rate tells us which side; magnitude × size = $/cycle.
-        per_cycle_pnl = abs(current_rate_per_cycle) * pos.size_usd
+        # Sign of entry_rate tells us which side; magnitude × size = $/8h-cycle.
+        # Rates are stored per 8h; scale to this venue's interval so total funding
+        # over a given hold is the same regardless of cadence (annualized rate).
+        interval_frac = interval_h / float(FUNDING_CYCLE_HOURS)
+        per_cycle_pnl = abs(current_rate_per_cycle) * pos.size_usd * interval_frac
         pos.funding_collected += per_cycle_pnl * cycles_due
         pos.cycles_collected += cycles_due
 
@@ -576,11 +604,11 @@ class FundingArbPaperSim:
             borrow_apy = (BORROW_APY_MAJOR if _base_symbol(pos.symbol) in MAJOR_SYMBOLS
                           else BORROW_APY_ALT)
             borrow_per_cycle = (borrow_apy / 100.0) * pos.size_usd * \
-                (FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+                (interval_h / (24.0 * 365.0))
             pos.borrow_cost += borrow_per_cycle * cycles_due
 
         pos.last_funding_ts_iso = (
-            last_ts + timedelta(hours=cycles_due * FUNDING_CYCLE_HOURS)
+            last_ts + timedelta(hours=cycles_due * interval_h)
         ).isoformat()
 
     def _should_exit(
@@ -664,8 +692,9 @@ class FundingArbPaperSim:
             return 0.0
         borrow_apy = (BORROW_APY_MAJOR if _base_symbol(pos.symbol) in MAJOR_SYMBOLS
                       else BORROW_APY_ALT)
+        interval_h = pos.funding_interval_hours or float(FUNDING_CYCLE_HOURS)
         return ((borrow_apy / 100.0) * pos.size_usd
-                * (pos.cycles_collected * FUNDING_CYCLE_HOURS / (24.0 * 365.0)))
+                * (pos.cycles_collected * interval_h / (24.0 * 365.0)))
 
     def borrow_corrected_pnl(self) -> float:
         """Lifetime NET P&L with EVERY short-spot leg charged the borrow it owes

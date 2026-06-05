@@ -255,6 +255,48 @@ def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
     assert abs(pos.net_pnl - (pos.funding_collected - pos.entry_cost)) < 1e-9
 
 
+# ── per-venue funding interval (#2) ──────────────────────────────────────────
+
+def test_kraken_interval_is_hourly_others_8h():
+    assert fap._funding_interval_hours("Kraken Futures") == fap.KRAKEN_FUNDING_INTERVAL_HOURS
+    assert fap._funding_interval_hours("Binance") == float(fap.FUNDING_CYCLE_HOURS)
+    assert fap._funding_interval_hours(None) == float(fap.FUNDING_CYCLE_HOURS)
+
+
+def test_kraken_position_stamped_hourly_at_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+    sim._open_position(_opp("PF_XBTUSD", 40.0, exchange="Kraken Futures"),
+                       datetime.now(timezone.utc))
+    pos = next(iter(sim.open_positions.values()))
+    assert pos.funding_interval_hours == fap.KRAKEN_FUNDING_INTERVAL_HOURS
+
+
+def test_total_funding_invariant_to_interval():
+    """Funding APY is annualized: over the same hold, total funding collected is
+    the same whether accrued in 1h or 8h increments. Shorter interval only changes
+    granularity (banking partial funding before a flip), not expectancy."""
+    now = datetime.now(timezone.utc)
+    sim = FundingArbPaperSim.__new__(FundingArbPaperSim)  # no I/O needed
+    opp = _opp("X", 40.0)
+
+    def collect(interval_h):
+        pos = PaperPosition(
+            symbol="X", exchange="e", direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=40.0, entry_rate_8h=40.0 / 1095.0 / 100.0, size_usd=1000.0,
+            entry_time_iso=now.isoformat(), last_funding_ts_iso=now.isoformat(),
+            last_seen_iso=now.isoformat(), funding_interval_hours=interval_h,
+        )
+        # 24h later — an exact multiple of both 1h and 8h.
+        sim._accrue_funding(pos, opp, now + timedelta(hours=24))
+        return pos.funding_collected, pos.cycles_collected
+
+    f8, c8 = collect(8.0)
+    f1, c1 = collect(1.0)
+    assert abs(f8 - f1) < 1e-9          # same total funding
+    assert c8 == 3 and c1 == 24         # finer granularity at 1h
+
+
 # ── _should_exit — exit condition tests ──────────────────────────────────────
 
 def _open_pos(entry_apy: float = 40.0,

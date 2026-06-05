@@ -958,11 +958,39 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # (~0.08%). Trades rarely, but every trade is genuinely retail-
             # executable, so its P&L is a believable estimate. Separate ledger +
             # alert label so the two arms can be compared side by side.
+            # Persistence gate (was OFF) — the live ledger showed the majors arm
+            # repeating the cycle-0 flip bleed the Kraken arm was fixed for: it
+            # opened OP/NEAR/ETC at 28-43% APY and every loss closed
+            # reason=funding_flipped cycles=0, eating the entry cost having
+            # collected nothing. Verifying funding actually held positive for N
+            # cycles (FundingHistory) before entry structurally removes those
+            # traps. Shares the same history tracker as the Kraken arm.
+            _maj_min_persist = float(
+                os.getenv('FUNDING_ARB_MAJORS_MIN_PERSISTENCE_CYCLES', '2')
+            )
+            _maj_max_flips = int(os.getenv('FUNDING_ARB_MAJORS_MAX_FLIPS', '6'))
+            _maj_flip_cooldown = float(
+                os.getenv('FUNDING_ARB_MAJORS_FLIP_COOLDOWN_HOURS', '48')
+            )
+            # Size bump (user-requested): with the persistence gate now filtering
+            # entries down to verified-stable funding, more notional lands on the
+            # surviving (higher-quality) trades rather than the flip traps.
+            # Dedicated knobs so this arm scales independently and is reversible.
+            _maj_min_size = float(os.getenv('FUNDING_ARB_MAJORS_MIN_SIZE', '375'))
+            _maj_max_size = float(os.getenv('FUNDING_ARB_MAJORS_MAX_SIZE', '1500'))
+            _maj_max_total = float(os.getenv('FUNDING_ARB_MAJORS_MAX_TOTAL', '4500'))
             _funding_arb_majors = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=True,
                 symbol_allowlist=MAJOR_SYMBOLS,
                 cost_frac=0.0008,
+                min_position_usd=_maj_min_size,
+                max_position_usd=_maj_max_size,
+                max_total_notional=_maj_max_total,
+                history=_funding_history,
+                min_persistence_cycles=_maj_min_persist,
+                max_flips=_maj_max_flips,
+                flip_cooldown_hours=_maj_flip_cooldown,
                 state_file=_Path('data/funding_arb_majors_state.json'),
                 label="Funding Arb (majors)",
             )
