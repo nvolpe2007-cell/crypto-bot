@@ -1327,6 +1327,24 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     last_eval_time:    Dict[str, float]        = {}   # throttle per symbol
     EVAL_INTERVAL = 2.0   # seconds between strategy evaluations per symbol
 
+    # ── Directional engine kill-switch ────────────────────────────────────────
+    # The intraday directional stack (microstructure scalper + MR/OFI fast-track
+    # → ProbabilityGate → execution) is a PROVEN loser at this size: the proof
+    # scorecard read 229 trades, expectancy -$0.088/trade, t-stat -8.82 (FAILED)
+    # — cost dominates the move at 2s timeframes, structurally, and no amount of
+    # gate-stacking fixes negative-EV signals. Shelved off the live loop while we
+    # concentrate on the swing strategy (the only executable, non-disproven edge).
+    # Data feeds and OPEN-position exits still run below; only NEW directional
+    # entry-signal generation + execution are disabled. Re-enable with
+    # DIRECTIONAL_ENABLED=1. See [[directional_cost_bleed_fix]] / proof_scorecard.
+    DIRECTIONAL_ENABLED = os.getenv('DIRECTIONAL_ENABLED', '0') == '1'
+    logger.info(
+        "[DIRECTIONAL] entry engine %s",
+        "ENABLED" if DIRECTIONAL_ENABLED else
+        "SHELVED (proof_scorecard: 229 trades, t=-8.82, FAILED) — "
+        "set DIRECTIONAL_ENABLED=1 to restore"
+    )
+
     # ── Risk-control state ───────────────────────────────────────────────────────
     # Cooldowns prevent re-entering the same losing setup. Bar-dedup prevents
     # multiple entries per bar from intra-bar signal flicker (live-price injection
@@ -1760,6 +1778,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 if just_halted and notifier:
                                     notifier.send_message(halt_msg)
                         continue   # skip entry logic this tick after an exit
+
+                # ── Directional entry engine (shelved by default) ──────────────
+                # Everything above (data feeds, microstructure book updates, open-
+                # position exits) still runs; only NEW entry signal generation +
+                # execution are gated. The funnel records the shelving so the
+                # heartbeat stays honest about why nothing fires.
+                if not DIRECTIONAL_ENABLED:
+                    funnel.bump('signals_seen')
+                    funnel.bump('skip:directional_shelved')
+                    continue
 
                 # ── Strategy evaluation ────────────────────────────────────────
                 sig = strategy.evaluate(df, symbol, ofi_calc, lead_lag,

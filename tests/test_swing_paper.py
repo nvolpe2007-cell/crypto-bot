@@ -13,6 +13,15 @@ from src.swing_strategy import SwingStrategy
 from src.decision_log import DecisionLog
 
 
+# The runner namespaces state per (symbol, timeframe) as "BASE@INTERVAL".
+KEY, BASE, TF = "BTC@240", "BTC", 240
+
+
+def _proc(bars, state, strat, dlog):
+    """Process one (BTC, 4h) slot with the namespaced-key signature."""
+    return swing_paper.process_symbol(KEY, BASE, TF, bars, state, strat, dlog)
+
+
 def _bars_from_closes(closes, hl_spread=1.0):
     return [{"t": i * 14400, "o": closes[i - 1] if i else c,
              "h": c + hl_spread, "l": c - hl_spread, "c": c}
@@ -28,10 +37,10 @@ def _entry_bars():
     return _bars_from_closes(closes)
 
 
-def _fresh_state(bars, base="BTC"):
+def _fresh_state(bars, key=KEY):
     # baseline set to the SECOND-TO-LAST bar, so the final (entry) bar is "new"
     return {"positions": {}, "closed": [], "started_at": "x",
-            "last_bar_t": {base: bars[-2]["t"]}}
+            "last_bar_t": {key: bars[-2]["t"]}}
 
 
 def _dlog(tmp_path):
@@ -41,19 +50,19 @@ def _dlog(tmp_path):
 def test_first_run_sets_baseline_no_trade(tmp_path):
     bars = _entry_bars()
     state = {"positions": {}, "closed": [], "last_bar_t": {}, "started_at": "x"}
-    n = swing_paper.process_symbol("BTC", bars, state, SwingStrategy(), _dlog(tmp_path))
+    n = _proc(bars, state, SwingStrategy(), _dlog(tmp_path))
     assert n == 0                                  # forward-only: no replay
-    assert state["last_bar_t"]["BTC"] == bars[-1]["t"]
+    assert state["last_bar_t"][KEY] == bars[-1]["t"]
     assert state["positions"] == {}
 
 
 def test_opens_on_entry_bar(tmp_path):
     bars = _entry_bars()
     state = _fresh_state(bars)
-    n = swing_paper.process_symbol("BTC", bars, state, SwingStrategy(), _dlog(tmp_path))
+    n = _proc(bars, state, SwingStrategy(), _dlog(tmp_path))
     assert n == 1
-    assert "BTC" in state["positions"]
-    pos = state["positions"]["BTC"]
+    assert KEY in state["positions"]
+    pos = state["positions"][KEY]
     assert pos["target"] > pos["entry"] > pos["stop"]
 
 
@@ -61,12 +70,12 @@ def test_closes_on_target(tmp_path):
     bars = _entry_bars()
     state = _fresh_state(bars)
     strat, dlog = SwingStrategy(), _dlog(tmp_path)
-    swing_paper.process_symbol("BTC", bars, state, strat, dlog)
-    pos = state["positions"]["BTC"]
+    _proc(bars, state, strat, dlog)
+    pos = state["positions"][KEY]
     # next closed bar spikes through the target → win
     nxt = {"t": bars[-1]["t"] + 14400, "o": pos["entry"],
            "h": pos["target"] + 5, "l": pos["entry"] - 0.5, "c": pos["target"] + 3}
-    swing_paper.process_symbol("BTC", bars + [nxt], state, strat, dlog)
+    _proc(bars + [nxt], state, strat, dlog)
     assert state["positions"] == {}
     assert len(state["closed"]) == 1
     assert state["closed"][0]["won"] is True
@@ -77,10 +86,10 @@ def test_idempotent_no_new_bars(tmp_path):
     bars = _entry_bars()
     state = _fresh_state(bars)
     strat, dlog = SwingStrategy(), _dlog(tmp_path)
-    swing_paper.process_symbol("BTC", bars, state, strat, dlog)
+    _proc(bars, state, strat, dlog)
     open_after_first = dict(state["positions"])
     # same bars again → nothing new to process
-    n = swing_paper.process_symbol("BTC", bars, state, strat, dlog)
+    n = _proc(bars, state, strat, dlog)
     assert n == 0
     assert state["positions"] == open_after_first
 
@@ -90,11 +99,11 @@ def test_equity_tracks_closed_pnl(tmp_path):
     state = _fresh_state(bars)
     state["equity"] = state["starting_equity"] = 500.0
     strat, dlog = SwingStrategy(), _dlog(tmp_path)
-    swing_paper.process_symbol("BTC", bars, state, strat, dlog)
-    pos = state["positions"]["BTC"]
+    _proc(bars, state, strat, dlog)
+    pos = state["positions"][KEY]
     nxt = {"t": bars[-1]["t"] + 14400, "o": pos["entry"],
            "h": pos["target"] + 5, "l": pos["entry"] - 0.5, "c": pos["target"] + 3}
-    swing_paper.process_symbol("BTC", bars + [nxt], state, strat, dlog)
+    _proc(bars + [nxt], state, strat, dlog)
     net = state["closed"][0]["pnl"]
     assert state["equity"] == pytest.approx(500.0 + net)
     assert state["closed"][0]["equity_after"] == pytest.approx(500.0 + net, abs=0.01)
@@ -104,11 +113,11 @@ def test_stop_loss_exit(tmp_path):
     bars = _entry_bars()
     state = _fresh_state(bars)
     strat, dlog = SwingStrategy(), _dlog(tmp_path)
-    swing_paper.process_symbol("BTC", bars, state, strat, dlog)
-    pos = state["positions"]["BTC"]
+    _proc(bars, state, strat, dlog)
+    pos = state["positions"][KEY]
     nxt = {"t": bars[-1]["t"] + 14400, "o": pos["entry"],
            "h": pos["entry"] + 0.5, "l": pos["stop"] - 5, "c": pos["stop"] - 4}
-    swing_paper.process_symbol("BTC", bars + [nxt], state, strat, dlog)
+    _proc(bars + [nxt], state, strat, dlog)
     assert len(state["closed"]) == 1
     assert state["closed"][0]["reason"] == "stop"
     assert state["closed"][0]["won"] is False
