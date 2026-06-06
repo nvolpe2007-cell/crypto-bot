@@ -27,7 +27,7 @@ import src.task_supervisor as _ts_mod
 from src.task_supervisor import supervised, _safe_notify, get_health
 
 
-# ── fixtures ──────────────────────────────────────────────────────────────────────────────
+# ── fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
@@ -41,7 +41,7 @@ def _make_notifier():
     return n
 
 
-# ── clean-exit behaviour ────────────────────────────────────────────────────────────────────────────
+# ── clean-exit behaviour ──────────────────────────────────────────────────────
 
 class TestCleanExit:
     async def test_factory_called_once_on_clean_exit(self):
@@ -61,7 +61,7 @@ class TestCleanExit:
         notifier.send.assert_not_awaited()
 
 
-# ── single crash → restart ──────────────────────────────────────────────────────────────────────────
+# ── single crash → restart ────────────────────────────────────────────────────
 
 class TestSingleCrash:
     async def test_factory_called_twice_after_one_crash(self):
@@ -100,7 +100,7 @@ class TestSingleCrash:
         assert "#1" in msg
 
 
-# ── multiple crashes ──────────────────────────────────────────────────────────────────────────────
+# ── multiple crashes ──────────────────────────────────────────────────────────
 
 class TestMultipleCrashes:
     async def test_two_crashes_calls_factory_three_times(self):
@@ -137,7 +137,7 @@ class TestMultipleCrashes:
         assert notifier.send.await_count == 2
 
 
-# ── give-up after max_restarts ────────────────────────────────────────────────────────────────────────────
+# ── give-up after max_restarts ────────────────────────────────────────────────
 
 class TestGiveUp:
     async def test_stops_after_max_restarts_exceeded(self):
@@ -169,7 +169,7 @@ class TestGiveUp:
         assert asyncio.sleep.await_count == 1
 
 
-# ── CancelledError ────────────────────────────────────────────────────────────────────────────────────
+# ── CancelledError ────────────────────────────────────────────────────────────
 
 class TestCancelledError:
     async def test_cancelled_error_propagates(self):
@@ -197,7 +197,7 @@ class TestCancelledError:
         notifier.send.assert_not_awaited()
 
 
-# ── notifier robustness ─────────────────────────────────────────────────────────────────────────────
+# ── notifier robustness ───────────────────────────────────────────────────────
 
 class TestNotifierRobustness:
     async def test_notifier_failure_does_not_crash_supervisor(self):
@@ -214,7 +214,7 @@ class TestNotifierRobustness:
         assert factory.await_count == 2
 
 
-# ── _safe_notify ────────────────────────────────────────────────────────────────────────────────────
+# ── _safe_notify ──────────────────────────────────────────────────────────────
 
 class TestSafeNotify:
     async def test_no_op_when_notifier_is_none(self):
@@ -231,7 +231,7 @@ class TestSafeNotify:
         await _safe_notify(notifier, "msg")   # should not raise
 
 
-# ── custom max_restarts ────────────────────────────────────────────────────────────────────────────
+# ── custom max_restarts ───────────────────────────────────────────────────────
 
 class TestCustomMaxRestarts:
     async def test_max_restarts_zero_gives_up_after_one_crash(self):
@@ -247,7 +247,7 @@ class TestCustomMaxRestarts:
         assert factory.await_count == 2
 
 
-# ── recovery_window_secs ────────────────────────────────────────────────────────────────────────────
+# ── recovery_window_secs ──────────────────────────────────────────────────────
 
 class TestRecoveryWindow:
     @pytest.fixture(autouse=True)
@@ -313,7 +313,7 @@ class TestRecoveryWindow:
         assert call_count == 4   # crashed 3×, each time counter reset → never gave up
 
 
-# ── get_health() ────────────────────────────────────────────────────────────────────────────────────
+# ── get_health() ──────────────────────────────────────────────────────────────
 
 class TestGetHealth:
     @pytest.fixture(autouse=True)
