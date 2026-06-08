@@ -1,1 +1,1039 @@
-"""\nTests for the cost-aware funding-rate arbitrage paper simulator.\n\nFocus: the round-trip cost model, the cost-aware entry gate, and the exit\nlogic (_should_exit).  The exit conditions were previously completely untested;\nthey are also where the off_scanner_24h bug lived (last_funding_ts_iso was used\nas a proxy for \"last scanner sighting\" but was updated even on off-scanner\ndecayed-rate ticks, so the 24h gate never fired).\n"""\n\nfrom datetime import datetime, timezone, timedelta\n\nimport arbitrage.funding_arb_paper as fap\nfrom arbitrage.funding_arb_paper import FundingArbPaperSim, PaperPosition\n\n\nclass _FakeScanner:\n    \"\"\"Stand-in for FundingScanner: returns a fixed opportunity list.\"\"\"\n\n    def __init__(self, opps):\n        self._opps = opps\n\n    def get_state(self):\n        return self._opps\n\n\ndef _opp(symbol, apy, exchange=\"Binance\"):\n    \"\"\"Build an opportunity dict matching FundingScanner.get_state() shape.\n\n    The scanner stores rate_8h as a PERCENT; apy = rate_8h_frac * 3 * 365 * 100,\n    so rate_8h_percent = apy / 1095.\n    \"\"\"\n    return {\n        \"exchange\": exchange,\n        \"symbol\": symbol,\n        \"rate_8h\": round(apy / 1095.0, 6),  # percent\n        \"apy\": apy,\n        \"action\": \"SHORT PERP + LONG SPOT\" if apy > 0 else \"LONG PERP + SHORT SPOT\",\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n    }\n\n\ndef _make_sim(tmp_path, opps, monkeypatch):\n    # Isolate persistence so the test never touches real state.\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"funding_arb_state.json\")\n    return FundingArbPaperSim(scanner=_FakeScanner(opps), notifier=None)\n\n\ndef test_net_pnl_is_funding_minus_cost():\n    pos = PaperPosition(\n        symbol=\"BTCUSDT\", exchange=\"Binance\", direction=\"LONG_SPOT_SHORT_PERP\",\n        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,\n        entry_time_iso=datetime.now(timezone.utc).isoformat(),\n        funding_collected=2.50, entry_cost=1.10,\n    )\n    assert abs(pos.net_pnl - (2.50 - 1.10)) < 1e-9\n\n\ndef test_entry_charges_round_trip_cost(tmp_path, monkeypatch):\n    # apy=30% → ~8 breakeven cycles at default 0.22% cost → passes the gate.\n    sim = _make_sim(tmp_path, [_opp(\"BTCUSDT\", 30.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n    pos = next(iter(sim.open_positions.values()))\n    # Invariant: entry cost is always the round-trip fraction of the (now\n    # conviction-weighted) position size.\n    expected_cost = fap.ROUND_TRIP_COST_FRAC * pos.size_usd\n    assert abs(pos.entry_cost - expected_cost) < 1e-9\n    # No funding accrued yet → net PnL starts negative (we paid to open).\n    assert pos.net_pnl < 0\n\n\ndef test_conviction_sizing_scales_with_apy(tmp_path, monkeypatch):\n    sim = _make_sim(tmp_path, [], monkeypatch)\n    low  = sim._size_for_apy(30)    # just above the cost floor\n    high = sim._size_for_apy(140)   # near the cap\n    assert fap.MIN_POSITION_USD <= low < high <= fap.MAX_POSITION_USD\n    # Clamps: below floor → MIN, above cap → MAX.\n    assert sim._size_for_apy(5) == fap.MIN_POSITION_USD\n    assert sim._size_for_apy(5000) == fap.MAX_POSITION_USD\n\n\ndef test_cost_gate_rejects_marginal_apy(tmp_path, monkeypatch):\n    # apy=20% clears the 15% APY floor but NOT the cost gate:\n    # breakeven = 0.0022 / (20/109500) ≈ 12 cycles > 10 → skip.\n    sim = _make_sim(tmp_path, [_opp(\"ETHUSDT\", 20.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_cost_gate_accepts_rich_apy(tmp_path, monkeypatch):\n    # apy=40% → breakeven ≈ 6 cycles < 10 → open.\n    sim = _make_sim(tmp_path, [_opp(\"SOLUSDT\", 40.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n\n\ndef test_apy_cap_rejects_absurd_funding(tmp_path, monkeypatch):\n    # apy=2000% is an illiquid meme perp — above the 150% cap → skip.\n    sim = _make_sim(tmp_path, [_opp(\"LITEUSDT\", 2000.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_apy_within_band_opens(tmp_path, monkeypatch):\n    # apy=80% is elevated-but-plausible: clears min (15%), cap (150%), cost gate.\n    sim = _make_sim(tmp_path, [_opp(\"DOGEUSDT\", 80.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n\n\ndef _make_majors_sim(tmp_path, opps, monkeypatch):\n    # Mirrors the deployed majors arm: Kraken Futures only (the executable venue)\n    # at a realistic ~0.54% round-trip cost. See the realism fix in paper_trading.\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n    return FundingArbPaperSim(\n        scanner=_FakeScanner(opps), notifier=None,\n        positive_funding_only=True,\n        symbol_allowlist=fap.MAJOR_SYMBOLS,\n        source_allowlist={\"Kraken Futures\"},\n        cost_frac=0.0054,\n        state_file=tmp_path / \"majors_state.json\",\n        label=\"Funding Arb (majors)\",\n    )\n\n\ndef _kf_opp(symbol, apy):\n    \"\"\"A Kraken-Futures opportunity (the only venue the majors arm executes).\"\"\"\n    return _opp(symbol, apy, exchange=\"Kraken Futures\")\n\n\ndef test_majors_arm_rejects_non_major(tmp_path, monkeypatch):\n    # ENJ isn't in the majors allowlist → conservative arm skips it.\n    sim = _make_majors_sim(tmp_path, [_kf_opp(\"ENJUSDT\", 80.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_majors_arm_rejects_negative_funding(tmp_path, monkeypatch):\n    # Negative funding would need a spot short (borrow) → conservative arm skips.\n    sim = _make_majors_sim(tmp_path, [_kf_opp(\"BTCUSDT\", -80.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_majors_arm_rejects_non_executable_venue(tmp_path, monkeypatch):\n    # A positive major well above the floor, but on Binance — not executable for\n    # a US-restricted account. The source allowlist must reject it.\n    sim = _make_majors_sim(tmp_path, [_opp(\"BTCUSDT\", 80.0, exchange=\"Binance\")],\n                           monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_majors_arm_opens_rich_executable_major(tmp_path, monkeypatch):\n    # Positive major on Kraken Futures, above the realistic-cost floor (~59%) → opens.\n    sim = _make_majors_sim(tmp_path, [_kf_opp(\"BTCUSDT\", 80.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n\n\ndef test_majors_arm_skips_below_realistic_floor(tmp_path, monkeypatch):\n    # 15% APY cleared the old 0.08%-cost floor but not the realistic 0.54% one\n    # (~59%): at honest cost it doesn't break even in time, so the arm passes.\n    sim = _make_majors_sim(tmp_path, [_kf_opp(\"BTCUSDT\", 15.0)], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_majors_arm_realistic_cost_floor(tmp_path, monkeypatch):\n    # Realistic Kraken round-trip cost (~0.54%) lifts the APY floor far above the\n    # old optimistic ~9%: 0.0054 / 10 cycles × 3 × 365 × 100 ≈ 59%.\n    sim = _make_majors_sim(tmp_path, [], monkeypatch)\n    assert 50.0 < sim._apy_floor() < 65.0\n\n\ndef _make_kraken_sim(tmp_path, opps, monkeypatch, max_be=2.0):\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n    return FundingArbPaperSim(\n        scanner=_FakeScanner(opps), notifier=None,\n        positive_funding_only=True,\n        source_allowlist={\"Kraken Futures\"},\n        cost_frac=0.0064,\n        max_breakeven_cycles=max_be,\n        state_file=tmp_path / \"kraken_state.json\",\n        label=\"Funding Arb (Kraken)\",\n    )\n\n\ndef test_kraken_persistence_gate_rejects_microcap(tmp_path, monkeypatch):\n    # 140% APY microcap on Kraken: at 0.64% cost, breakeven ≈ 5 cycles. The\n    # strict 2-cycle persistence gate rejects it (funding won't survive long\n    # enough to clear honest cost) — this is the funding_arb_kraken_bleed fix.\n    opp = _opp(\"PF_OMIUSD\", 140.0, exchange=\"Kraken Futures\")\n    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=2.0)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_kraken_arm_with_lax_gate_would_open(tmp_path, monkeypatch):\n    # Same opportunity under the lax 10-cycle gate WOULD open — proves the\n    # per-arm threshold (not the cost/cap/sign filters) is what gates it out.\n    opp = _opp(\"PF_OMIUSD\", 140.0, exchange=\"Kraken Futures\")\n    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=10.0)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n\n\ndef test_default_arm_breakeven_gate_unchanged(tmp_path, monkeypatch):\n    # Arms that don't pass max_breakeven_cycles keep the module default (10).\n    sim = _make_sim(tmp_path, [], monkeypatch)\n    assert sim.max_breakeven_cycles == fap.MAX_BREAKEVEN_CYCLES\n\n\ndef _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0):\n    # Mirrors the live aggressive Kraken config: all-in single position,\n    # maker-only cost, gate relaxed to 6 cycles, cap raised to 300%.\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n    return FundingArbPaperSim(\n        scanner=_FakeScanner(opps), notifier=None,\n        positive_funding_only=True,\n        source_allowlist={\"Kraken Futures\"},\n        cost_frac=0.0054,\n        max_breakeven_cycles=6.0,\n        max_entry_apy=300.0,\n        max_positions=1,\n        min_position_usd=alloc, max_position_usd=alloc, max_total_notional=alloc,\n        state_file=tmp_path / \"kraken_state.json\",\n        label=\"Funding Arb (Kraken)\",\n    )\n\n\ndef test_aggressive_kraken_goes_all_in_one_position(tmp_path, monkeypatch):\n    # Two rich opportunities, but max_positions=1 → only one opens, sized at the\n    # full allocation (no conviction scaling since min==max==total).\n    opps = [\n        _opp(\"PF_OMIUSD\", 160.0, exchange=\"Kraken Futures\"),\n        _opp(\"PF_DEXEUSD\", 145.0, exchange=\"Kraken Futures\"),\n    ]\n    sim = _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n    pos = next(iter(sim.open_positions.values()))\n    assert abs(pos.size_usd - 500.0) < 1e-9          # all-in, full alloc\n    assert abs(pos.entry_cost - 0.0054 * 500.0) < 1e-9  # maker-only cost\n\n\ndef test_aggressive_kraken_relaxed_gate_admits_rich_apy(tmp_path, monkeypatch):\n    # 150% APY: at 0.54% maker cost, breakeven ≈ 3.9 cycles < 6 → the relaxed\n    # gate admits it (the strict 2-cycle gate would have rejected it).\n    opp = _opp(\"PF_OMIUSD\", 150.0, exchange=\"Kraken Futures\")\n    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n\n\ndef test_aggressive_kraken_still_rejects_thin_funding(tmp_path, monkeypatch):\n    # 60% APY: breakeven = 0.0054 / (60/109500) ≈ 9.9 cycles > 6 → still skipped.\n    # Proves the +EV gate survives the relax — it's aggressive, not blind.\n    opp = _opp(\"PF_THINUSD\", 60.0, exchange=\"Kraken Futures\")\n    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)\n    sim._tick()\n    assert len(sim.open_positions) == 0\n\n\ndef test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):\n    sim = _make_sim(tmp_path, [_opp(\"BTCUSDT\", 40.0)], monkeypatch)\n    sim._tick()\n    pos = next(iter(sim.open_positions.values()))\n\n    # Simulate 9 funding cycles elapsing, then accrue.\n    pos.last_funding_ts_iso = (\n        datetime.now(timezone.utc) - timedelta(hours=9 * fap.FUNDING_CYCLE_HOURS)\n    ).isoformat()\n    sim._accrue_funding(pos, _opp(\"BTCUSDT\", 40.0), datetime.now(timezone.utc))\n\n    assert pos.funding_collected > 0\n    # Cumulative total must equal gross funding minus costs.\n    assert abs(sim._total_pnl()\n               - (sim._total_gross_funding() - sim._total_costs())) < 1e-9\n    assert abs(pos.net_pnl - (pos.funding_collected - pos.entry_cost)) < 1e-9\n\n\n# ── per-venue funding interval (#2) ──────────────────────────────────────────\n\ndef test_kraken_interval_is_hourly_others_8h():\n    assert fap._funding_interval_hours(\"Kraken Futures\") == fap.KRAKEN_FUNDING_INTERVAL_HOURS\n    assert fap._funding_interval_hours(\"Binance\") == float(fap.FUNDING_CYCLE_HOURS)\n    assert fap._funding_interval_hours(None) == float(fap.FUNDING_CYCLE_HOURS)\n\n\ndef test_kraken_position_stamped_hourly_at_open(tmp_path, monkeypatch):\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)\n    sim._open_position(_opp(\"PF_XBTUSD\", 40.0, exchange=\"Kraken Futures\"),\n                       datetime.now(timezone.utc))\n    pos = next(iter(sim.open_positions.values()))\n    assert pos.funding_interval_hours == fap.KRAKEN_FUNDING_INTERVAL_HOURS\n\n\ndef test_total_funding_invariant_to_interval():\n    \"\"\"Funding APY is annualized: over the same hold, total funding collected is\n    the same whether accrued in 1h or 8h increments. Shorter interval only changes\n    granularity (banking partial funding before a flip), not expectancy.\"\"\"\n    now = datetime.now(timezone.utc)\n    sim = FundingArbPaperSim.__new__(FundingArbPaperSim)  # no I/O needed\n    opp = _opp(\"X\", 40.0)\n\n    def collect(interval_h):\n        pos = PaperPosition(\n            symbol=\"X\", exchange=\"e\", direction=\"LONG_SPOT_SHORT_PERP\",\n            entry_apy=40.0, entry_rate_8h=40.0 / 1095.0 / 100.0, size_usd=1000.0,\n            entry_time_iso=now.isoformat(), last_funding_ts_iso=now.isoformat(),\n            last_seen_iso=now.isoformat(), funding_interval_hours=interval_h,\n        )\n        # 24h later — an exact multiple of both 1h and 8h.\n        sim._accrue_funding(pos, opp, now + timedelta(hours=24))\n        return pos.funding_collected, pos.cycles_collected\n\n    f8, c8 = collect(8.0)\n    f1, c1 = collect(1.0)\n    assert abs(f8 - f1) < 1e-9          # same total funding\n    assert c8 == 3 and c1 == 24         # finer granularity at 1h\n\n\ndef test_off_scanner_accrues_no_phantom_funding(tmp_path, monkeypatch):\n    \"\"\"A position that's fallen off the scanner must NOT keep booking funding —\n    off-scanner means its rate dropped below the scanner's threshold, so any\n    credit is phantom income. Default OFFSCANNER_RATE_FRAC=0 → zero funding.\"\"\"\n    sim = _sim_for_exit(tmp_path, monkeypatch)\n    now = datetime.now(timezone.utc)\n    pos = _open_pos(entry_apy=40.0)           # long-spot → no borrow either\n    pos.last_funding_ts_iso = now.isoformat()\n    sim._accrue_funding(pos, None, now + timedelta(hours=24))  # 3 cycles, off-scanner\n    assert pos.cycles_collected == 3          # time still advances\n    assert pos.funding_collected == 0.0       # but no phantom funding booked\n\n\n# ── _should_exit — exit condition tests ──────────────────────────────────────\n\ndef _open_pos(entry_apy: float = 40.0,\n              hours_old: float = 0.0,\n              last_seen_hours_ago: float = 0.0) -> PaperPosition:\n    \"\"\"Build an open PaperPosition with controllable age and scanner-visibility.\"\"\"\n    now = datetime.now(timezone.utc)\n    entry_time = now - timedelta(hours=hours_old)\n    last_seen  = now - timedelta(hours=last_seen_hours_ago)\n    return PaperPosition(\n        symbol=\"BTCUSDT\", exchange=\"Binance\",\n        direction=\"LONG_SPOT_SHORT_PERP\",\n        entry_apy=entry_apy,\n        entry_rate_8h=entry_apy / 1095.0 / 100.0,  # fraction\n        size_usd=500.0,\n        entry_time_iso=entry_time.isoformat(),\n        last_seen_iso=last_seen.isoformat(),\n    )\n\n\ndef _sim_for_exit(tmp_path, monkeypatch) -> FundingArbPaperSim:\n    monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)\n\n\nclass TestShouldExit:\n\n    def test_no_exit_healthy_position(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0, hours_old=24.0)\n        opp = _opp(\"BTCUSDT\", 40.0)  # rate unchanged, on scanner\n        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None\n\n    # ── exit 1: max hold ──────────────────────────────────────────────────────\n\n    def test_exits_after_max_hold_days(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 + 1)\n        opp = _opp(\"BTCUSDT\", 40.0)\n        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))\n        assert reason is not None and \"max_hold\" in reason\n\n    def test_no_exit_just_under_max_hold(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 - 1)\n        opp = _opp(\"BTCUSDT\", 40.0)\n        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None\n\n    # ── exit 2: funding flipped sign ──────────────────────────────────────────\n\n    def test_exits_when_positive_funding_flips_negative(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0)   # entered as LONG_SPOT_SHORT_PERP\n        opp = _opp(\"BTCUSDT\", -10.0)     # rate is now negative\n        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))\n        assert reason == \"funding_flipped\"\n\n    def test_exits_when_negative_funding_flips_positive(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=-40.0)  # entered SHORT_SPOT_LONG_PERP\n        opp = _opp(\"BTCUSDT\", 10.0)      # rate is now positive\n        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))\n        assert reason == \"funding_flipped\"\n\n    def test_no_exit_when_sign_unchanged(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0)\n        opp = _opp(\"BTCUSDT\", 20.0)     # positive but lower — sign same\n        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None\n\n    # ── exit 3: APY decayed below threshold ───────────────────────────────────\n\n    def test_exits_when_apy_decays_below_fraction(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0)\n        # EXIT_APY_FRACTION=0.40: exit when current < 40% of entry (40*0.40=16%)\n        # Use 15% — just below the threshold.\n        opp = _opp(\"BTCUSDT\", 15.0)\n        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))\n        assert reason is not None and \"apy_decayed\" in reason\n\n    def test_no_exit_when_apy_above_fraction(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0)\n        # 17% > 40*0.40=16% → stays open\n        opp = _opp(\"BTCUSDT\", 17.0)\n        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None\n\n    def test_exits_on_exact_decay_boundary(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(entry_apy=40.0)\n        # Exactly at boundary (40 * 0.40 = 16.0) — abs(16.0) < abs(16.0) is False,\n        # so it should NOT exit at the exact threshold (strict <).\n        opp = _opp(\"BTCUSDT\", 16.0)\n        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None\n\n    # ── exit 4: off scanner 24h (the previously broken gate) ─────────────────\n\n    def test_exits_when_off_scanner_over_24h(self, tmp_path, monkeypatch):\n        \"\"\"Core regression test for the off_scanner_24h bug.\n\n        Before the fix, _should_exit used last_funding_ts_iso, which gets\n        updated on every decayed-rate accrual tick. That reset the 24h clock\n        continuously, making the gate never fire. Now it uses last_seen_iso\n        (updated only when scanner data is present), so the gate correctly\n        fires after 25h of scanner absence.\n        \"\"\"\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(last_seen_hours_ago=25.0)  # last seen 25h ago\n        reason = sim._should_exit(pos, None, datetime.now(timezone.utc))\n        assert reason == \"off_scanner_24h\"\n\n    def test_no_exit_when_off_scanner_under_24h(self, tmp_path, monkeypatch):\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        pos = _open_pos(last_seen_hours_ago=23.0)\n        assert sim._should_exit(pos, None, datetime.now(timezone.utc)) is None\n\n    def test_off_scanner_gate_survives_decayed_accruals(self, tmp_path, monkeypatch):\n        \"\"\"Verify that calling _accrue_funding with current_opp=None (decayed rate)\n        does NOT update last_seen_iso and therefore does NOT reset the 24h clock.\"\"\"\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        now = datetime.now(timezone.utc)\n        pos = _open_pos(last_seen_hours_ago=20.0)  # seen 20h ago\n        # Simulate three 8h off-scanner accrual ticks: only last_funding_ts_iso\n        # should change, not last_seen_iso.\n        for i in range(1, 4):\n            tick_now = now + timedelta(hours=i * 8)\n            pos.last_funding_ts_iso = (now - timedelta(hours=20 - i * 8)).isoformat()\n            sim._accrue_funding(pos, None, tick_now)\n\n        # last_seen_iso must still be 20h before 'now', not updated.\n        last_seen = datetime.fromisoformat(pos.last_seen_iso)\n        assert (now - last_seen).total_seconds() >= 20 * 3600 - 1\n\n        # After 25h total, the exit should fire (20h already elapsed + 5h gap).\n        final_now = now + timedelta(hours=5)\n        reason = sim._should_exit(pos, None, final_now)\n        assert reason == \"off_scanner_24h\"\n\n    def test_on_scanner_resets_last_seen(self, tmp_path, monkeypatch):\n        \"\"\"When the symbol comes back onto the scanner, last_seen_iso is refreshed\n        via _accrue_funding — resetting the 24h clock correctly.\"\"\"\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        now = datetime.now(timezone.utc)\n        pos = _open_pos(last_seen_hours_ago=23.0)\n        # Scanner returns data → _accrue_funding updates last_seen_iso.\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", 40.0), now)\n        # Now last_seen_iso ≈ now; the 25h check should NOT fire.\n        reason = sim._should_exit(pos, None, now + timedelta(hours=2))\n        assert reason is None\n\n    # ── fallback: no last_seen_iso (old persisted positions) ─────────────────\n\n    def test_no_last_seen_iso_uses_entry_time(self, tmp_path, monkeypatch):\n        \"\"\"Positions persisted before last_seen_iso was added have last_seen_iso=None.\n        The exit check must fall back to entry_time to avoid crashing and should\n        close the position if entry was more than 24h ago with no current scanner data.\"\"\"\n        sim = _sim_for_exit(tmp_path, monkeypatch)\n        now = datetime.now(timezone.utc)\n        pos = _open_pos(hours_old=26.0)\n        pos.last_seen_iso = None    # simulate old serialized state\n        reason = sim._should_exit(pos, None, now)\n        assert reason == \"off_scanner_24h\"\n\n    # ── source_allowlist — Kraken-only arm ────────────────────────────────────\n\n    def test_source_allowlist_rejects_non_allowlisted_exchange(self, tmp_path, monkeypatch):\n        \"\"\"Kraken-only arm must reject Binance/Bybit opportunities.\"\"\"\n        monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n        sim = FundingArbPaperSim(\n            scanner=_FakeScanner([_opp(\"BTCUSDT\", 40.0, exchange=\"Binance\")]),\n            notifier=None,\n            source_allowlist={\"Kraken Futures\"},\n            state_file=tmp_path / \"kraken_state.json\",\n        )\n        sim._tick()\n        assert len(sim.open_positions) == 0\n\n    def test_source_allowlist_accepts_allowlisted_exchange(self, tmp_path, monkeypatch):\n        \"\"\"Kraken-only arm must accept opportunities from Kraken Futures.\"\"\"\n        monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n        sim = FundingArbPaperSim(\n            scanner=_FakeScanner([_opp(\"PF_XBTUSD\", 40.0, exchange=\"Kraken Futures\")]),\n            notifier=None,\n            source_allowlist={\"Kraken Futures\"},\n            state_file=tmp_path / \"kraken_state.json\",\n        )\n        sim._tick()\n        assert len(sim.open_positions) == 1\n\n    # ── max positions cap ─────────────────────────────────────────────────────\n\n    def test_max_positions_blocks_new_entries(self, tmp_path, monkeypatch):\n        \"\"\"Once max_positions is reached, no further entries are opened.\"\"\"\n        opps = [_opp(f\"COIN{i}USDT\", 40.0) for i in range(5)]\n        monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"state.json\")\n        sim = FundingArbPaperSim(\n            scanner=_FakeScanner(opps), notifier=None,\n            max_positions=2,\n            state_file=tmp_path / \"cap_state.json\",\n        )\n        sim._tick()\n        assert len(sim.open_positions) == 2\n\n    # ── state persistence round-trip ──────────────────────────────────────────\n\n    def test_state_persists_and_reloads(self, tmp_path, monkeypatch):\n        \"\"\"Save state, reload into a fresh sim instance, and verify positions survive.\"\"\"\n        state_file = tmp_path / \"persist_state.json\"\n        monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n\n        sim1 = FundingArbPaperSim(\n            scanner=_FakeScanner([_opp(\"BTCUSDT\", 40.0)]),\n            notifier=None,\n            state_file=state_file,\n        )\n        sim1._tick()\n        assert len(sim1.open_positions) == 1\n        # State is saved inside _tick(); no extra call needed.\n\n        sim2 = FundingArbPaperSim(\n            scanner=_FakeScanner([]),\n            notifier=None,\n            state_file=state_file,\n        )\n        assert len(sim2.open_positions) == 1\n        pos1 = next(iter(sim1.open_positions.values()))\n        pos2 = next(iter(sim2.open_positions.values()))\n        assert pos1.symbol == pos2.symbol\n        assert abs(pos1.entry_cost - pos2.entry_cost) < 1e-9\n        # last_seen_iso must survive the round-trip.\n        assert pos2.last_seen_iso is not None\n\n\n# ── _base_symbol — symbol normalisation ──────────────────────────────────────\n\nclass TestBaseSymbol:\n    \"\"\"_base_symbol strips exchange-specific prefixes/suffixes and normalises\n    venue aliases (XBT→BTC, XDG→DOGE) so that symbol allowlists work across\n    Binance, Bybit, and Kraken Futures without per-venue special-casing.\"\"\"\n\n    def test_binance_usdt_pair(self):\n        assert fap._base_symbol(\"BTCUSDT\") == \"BTC\"\n\n    def test_binance_usd_pair(self):\n        assert fap._base_symbol(\"ETHUSD\") == \"ETH\"\n\n    def test_binance_usdc_pair(self):\n        assert fap._base_symbol(\"SOLUSDC\") == \"SOL\"\n\n    def test_kraken_futures_pf_prefix_stripped(self):\n        assert fap._base_symbol(\"PF_SOLUSD\") == \"SOL\"\n\n    def test_kraken_xbt_alias_normalised_to_btc(self):\n        \"\"\"Kraken lists Bitcoin as XBT; without normalisation PF_XBTUSD never\n        matches a 'BTC' entry in the symbol allowlist.\"\"\"\n        assert fap._base_symbol(\"PF_XBTUSD\") == \"BTC\"\n\n    def test_kraken_xdg_alias_normalised_to_doge(self):\n        \"\"\"Kraken lists Dogecoin as XDG.\"\"\"\n        assert fap._base_symbol(\"PF_XDGUSD\") == \"DOGE\"\n\n    def test_lowercase_input(self):\n        assert fap._base_symbol(\"btcusdt\") == \"BTC\"\n\n    def test_no_quote_suffix_returned_as_upper(self):\n        \"\"\"Symbol with no recognised quote suffix is returned uppercased as-is.\"\"\"\n        assert fap._base_symbol(\"BTC\") == \"BTC\"\n\n    def test_quote_priority_usdt_before_usd(self):\n        \"\"\"USDT must be stripped before USD so 'BTCUSDT' → 'BTC' not 'BTCUS'.\"\"\"\n        result = fap._base_symbol(\"BTCUSDT\")\n        assert result == \"BTC\"\n\n    def test_kraken_eth_pf_prefix(self):\n        assert fap._base_symbol(\"PF_ETHUSD\") == \"ETH\"\n\n\n# ── _accrue_funding — borrow cost model ──────────────────────────────────────\n\nclass TestBorrowCostAccrual:\n    \"\"\"The borrow cost model for SHORT_SPOT_LONG_PERP (negative-funding) trades.\n\n    Shorting spot requires borrowing the asset; the old model charged only a\n    one-off entry cost and ignored carry, inflating the aggressive arm's P&L\n    on microcap shorts.  These tests pin the corrected behaviour.\n    \"\"\"\n\n    def _short_pos(self, symbol: str = \"BTCUSDT\", size_usd: float = 500.0) -> PaperPosition:\n        \"\"\"Return a SHORT_SPOT_LONG_PERP position with 1 funding cycle due.\"\"\"\n        now = datetime.now(timezone.utc)\n        entry = now - timedelta(hours=9)   # 9h ago → int(9/8)=1 cycle due\n        return PaperPosition(\n            symbol=symbol,\n            exchange=\"Binance\",\n            direction=\"SHORT_SPOT_LONG_PERP\",\n            entry_apy=-40.0,\n            entry_rate_8h=-40.0 / 109500.0,  # fraction; 109500 = 1095*100\n            size_usd=size_usd,\n            entry_time_iso=entry.isoformat(),\n            last_funding_ts_iso=entry.isoformat(),\n        )\n\n    def _long_pos(self) -> PaperPosition:\n        \"\"\"Return a LONG_SPOT_SHORT_PERP position with 1 funding cycle due.\"\"\"\n        now = datetime.now(timezone.utc)\n        entry = now - timedelta(hours=9)\n        return PaperPosition(\n            symbol=\"BTCUSDT\",\n            exchange=\"Binance\",\n            direction=\"LONG_SPOT_SHORT_PERP\",\n            entry_apy=40.0,\n            entry_rate_8h=40.0 / 109500.0,\n            size_usd=500.0,\n            entry_time_iso=entry.isoformat(),\n            last_funding_ts_iso=entry.isoformat(),\n        )\n\n    def _sim(self, tmp_path, monkeypatch) -> FundingArbPaperSim:\n        monkeypatch.setattr(fap, \"STATE_FILE\", tmp_path / \"s.json\")\n        return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)\n\n    def test_long_position_never_accrues_borrow_cost(self, tmp_path, monkeypatch):\n        \"\"\"LONG_SPOT_SHORT_PERP owns the spot asset outright — zero borrow needed.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._long_pos()\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", 40.0), datetime.now(timezone.utc))\n        assert pos.borrow_cost == 0.0\n\n    def test_short_major_uses_major_borrow_rate(self, tmp_path, monkeypatch):\n        \"\"\"SHORT_SPOT on a liquid major (BTC) charges BORROW_APY_MAJOR per cycle.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"BTCUSDT\", size_usd=500.0)\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", -40.0), datetime.now(timezone.utc))\n\n        expected = (\n            (fap.BORROW_APY_MAJOR / 100.0)\n            * 500.0\n            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n        )\n        assert abs(pos.borrow_cost - expected) < 1e-9\n\n    def test_short_alt_uses_higher_alt_borrow_rate(self, tmp_path, monkeypatch):\n        \"\"\"SHORT_SPOT on an illiquid alt charges the steeper BORROW_APY_ALT.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"OBSCUREUSDT\", size_usd=500.0)\n        sim._accrue_funding(pos, _opp(\"OBSCUREUSDT\", -40.0), datetime.now(timezone.utc))\n\n        expected = (\n            (fap.BORROW_APY_ALT / 100.0)\n            * 500.0\n            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n        )\n        assert abs(pos.borrow_cost - expected) < 1e-9\n\n    def test_alt_borrow_rate_is_higher_than_major(self, tmp_path, monkeypatch):\n        \"\"\"Sanity: alt borrow APY must exceed major borrow APY.\"\"\"\n        assert fap.BORROW_APY_ALT > fap.BORROW_APY_MAJOR\n\n    def test_borrow_scales_with_multiple_cycles(self, tmp_path, monkeypatch):\n        \"\"\"Three elapsed cycles → 3× the per-cycle borrow charge.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        now = datetime.now(timezone.utc)\n        pos = self._short_pos(symbol=\"BTCUSDT\", size_usd=500.0)\n        # Override last timestamp so 3 cycles are due\n        pos.last_funding_ts_iso = (now - timedelta(hours=25)).isoformat()\n        pos.entry_time_iso = pos.last_funding_ts_iso\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", -40.0), now)\n\n        cycles = int(25 // fap.FUNDING_CYCLE_HOURS)   # = 3\n        expected = (\n            (fap.BORROW_APY_MAJOR / 100.0)\n            * 500.0\n            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n            * cycles\n        )\n        assert abs(pos.borrow_cost - expected) < 1e-9\n\n    def test_borrow_cost_accrues_off_scanner(self, tmp_path, monkeypatch):\n        \"\"\"Borrow must keep accruing even when the symbol drops off the scanner\n        (current_opp=None) — the short is still open and the borrow is still owed.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"BTCUSDT\", size_usd=500.0)\n        sim._accrue_funding(pos, None, datetime.now(timezone.utc))  # off-scanner\n\n        expected = (\n            (fap.BORROW_APY_MAJOR / 100.0)\n            * 500.0\n            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n        )\n        assert abs(pos.borrow_cost - expected) < 1e-9\n\n    def test_net_pnl_deducts_borrow_from_short_position(self, tmp_path, monkeypatch):\n        \"\"\"net_pnl must equal funding_collected − entry_cost − borrow_cost.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"BTCUSDT\", size_usd=500.0)\n        pos.entry_cost = 1.50\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", -40.0), datetime.now(timezone.utc))\n\n        assert pos.borrow_cost > 0.0    # sanity: borrow was charged\n        assert abs(\n            pos.net_pnl - (pos.funding_collected - pos.entry_cost - pos.borrow_cost)\n        ) < 1e-9\n\n    def test_total_costs_includes_borrow_for_short(self, tmp_path, monkeypatch):\n        \"\"\"_total_costs() must aggregate entry_cost + borrow_cost so that\n        _total_pnl() == _total_gross_funding() - _total_costs() holds.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"BTCUSDT\", size_usd=500.0)\n        pos.entry_cost = 1.50\n        sim.open_positions[\"Binance:BTCUSDT\"] = pos\n        sim._accrue_funding(pos, _opp(\"BTCUSDT\", -40.0), datetime.now(timezone.utc))\n\n        assert abs(\n            sim._total_costs() - (pos.entry_cost + pos.borrow_cost)\n        ) < 1e-9\n        assert abs(\n            sim._total_pnl() - (sim._total_gross_funding() - sim._total_costs())\n        ) < 1e-9\n\n    def test_kraken_xbt_symbol_uses_major_borrow_rate(self, tmp_path, monkeypatch):\n        \"\"\"PF_XBTUSD: Kraken's XBT alias must map to BTC → major borrow rate.\"\"\"\n        sim = self._sim(tmp_path, monkeypatch)\n        pos = self._short_pos(symbol=\"PF_XBTUSD\", size_usd=500.0)\n        sim._accrue_funding(pos, _opp(\"PF_XBTUSD\", -40.0, exchange=\"Kraken Futures\"),\n                            datetime.now(timezone.utc))\n\n        expected = (\n            (fap.BORROW_APY_MAJOR / 100.0)\n            * 500.0\n            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n        )\n        assert abs(pos.borrow_cost - expected) < 1e-9\n\n\n# ── Post-loss re-entry cooldown (realized-outcome feedback loop) ───────────────\n\ndef _cooldown_sim(tmp_path, opps, hours):\n    \"\"\"A both-sides sim with the flip-cooldown enabled and isolated state.\"\"\"\n    return FundingArbPaperSim(\n        scanner=_FakeScanner(opps), notifier=None,\n        flip_cooldown_hours=hours,\n        state_file=tmp_path / \"cooldown_state.json\",\n    )\n\n\ndef test_net_loss_close_arms_cooldown(tmp_path):\n    opps = [_opp(\"PF_DEXEUSD\", 140.0, exchange=\"Kraken Futures\")]\n    sim = _cooldown_sim(tmp_path, opps, hours=48)\n    sim._tick()                                   # opens (no funding yet)\n    key = \"Kraken Futures:PF_DEXEUSD\"\n    assert key in sim.open_positions\n    # Funding flips negative → funding_flipped close at a net loss.\n    sim.scanner = _FakeScanner([_opp(\"PF_DEXEUSD\", -140.0, exchange=\"Kraken Futures\")])\n    sim._tick()\n    assert key not in sim.open_positions\n    assert key in sim._flip_cooldowns             # cooldown stamped\n\n\ndef test_cooldown_blocks_reentry(tmp_path):\n    key = \"Kraken Futures:PF_DEXEUSD\"\n    sim = _cooldown_sim(tmp_path, [_opp(\"PF_DEXEUSD\", 140.0, exchange=\"Kraken Futures\")], hours=48)\n    sim._tick(); sim.scanner = _FakeScanner([_opp(\"PF_DEXEUSD\", -140.0, exchange=\"Kraken Futures\")]); sim._tick()\n    assert key in sim._flip_cooldowns\n    # A fresh, attractive positive opp on the SAME symbol must be refused.\n    sim.scanner = _FakeScanner([_opp(\"PF_DEXEUSD\", 140.0, exchange=\"Kraken Futures\")])\n    sim._tick()\n    assert key not in sim.open_positions          # cooldown held the line\n\n\ndef test_cooldown_expires_and_is_pruned(tmp_path):\n    key = \"Kraken Futures:PF_DEXEUSD\"\n    sim = _cooldown_sim(tmp_path, [], hours=24)\n    old = datetime.now(timezone.utc) - timedelta(hours=30)\n    sim._flip_cooldowns[key] = old.isoformat()\n    now = datetime.now(timezone.utc)\n    assert sim._cooldown_remaining_h(key, now) is None   # 30h > 24h → expired\n    assert key not in sim._flip_cooldowns                 # pruned on read\n\n\ndef test_cooldown_remaining_is_positive_within_window(tmp_path):\n    key = \"Kraken Futures:PF_DEXEUSD\"\n    sim = _cooldown_sim(tmp_path, [], hours=48)\n    sim._flip_cooldowns[key] = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()\n    rem = sim._cooldown_remaining_h(key, datetime.now(timezone.utc))\n    assert 37.0 < rem < 39.0                              # ~38h left\n\n\ndef test_cooldown_disabled_by_default(tmp_path):\n    # hours=0 → never records, never blocks (the module/arm default for arms\n    # that don't opt in).\n    sim = _cooldown_sim(tmp_path, [_opp(\"PF_DEXEUSD\", 140.0, exchange=\"Kraken Futures\")], hours=0)\n    sim._tick(); sim.scanner = _FakeScanner([_opp(\"PF_DEXEUSD\", -140.0, exchange=\"Kraken Futures\")]); sim._tick()\n    assert sim._flip_cooldowns == {}\n    assert sim._cooldown_remaining_h(\"Kraken Futures:PF_DEXEUSD\", datetime.now(timezone.utc)) is None\n\n\ndef test_cooldown_persists_across_reload(tmp_path):\n    key = \"Kraken Futures:PF_DEXEUSD\"\n    sim = _cooldown_sim(tmp_path, [], hours=48)\n    sim._flip_cooldowns[key] = datetime.now(timezone.utc).isoformat()\n    sim._save_state()\n    sim2 = _cooldown_sim(tmp_path, [], hours=48)          # reloads same state file\n    assert key in sim2._flip_cooldowns\n\n\n# ── Rolling-window net P&L (feedback / observability) ─────────────────────────\n\ndef test_net_pnl_since_windows_closed_positions(tmp_path):\n    sim = _cooldown_sim(tmp_path, [], hours=0)\n    now = datetime.now(timezone.utc)\n    def _closed(net, age_days):\n        # net_pnl = funding_collected - entry_cost - borrow_cost; pin cost at 1.0\n        # and solve funding for the exact net we want.\n        p = PaperPosition(\n            symbol=\"X\", exchange=\"Kraken Futures\", direction=\"LONG_SPOT_SHORT_PERP\",\n            entry_apy=140.0, entry_rate_8h=0.001, size_usd=100.0,\n            entry_time_iso=(now - timedelta(days=age_days + 1)).isoformat(),\n            funding_collected=net + 1.0, entry_cost=1.0,\n        )\n        p.close_time_iso = (now - timedelta(days=age_days)).isoformat()\n        return p\n    sim.closed_positions = [_closed(-20.0, age_days=20), _closed(5.0, age_days=2)]\n    cutoff = now - timedelta(days=7)\n    # Only the 2-day-old +5 falls in the window; the 20-day-old -20 is excluded.\n    assert abs(sim.net_pnl_since(cutoff) - 5.0) < 1e-9\n    # Lifetime still includes the legacy loss.\n    assert abs(sim._total_pnl() - (-15.0)) < 1e-9\n\n\n# ── Borrow-corrected P&L (unpaid-carry exposure) ──────────────────────────────\n\ndef test_borrow_owed_zero_for_long_spot(tmp_path):\n    sim = _cooldown_sim(tmp_path, [], hours=0)\n    p = PaperPosition(\n        symbol=\"BTCUSDT\", exchange=\"Binance\", direction=\"LONG_SPOT_SHORT_PERP\",\n        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,\n        entry_time_iso=datetime.now(timezone.utc).isoformat(),\n        funding_collected=5.0, entry_cost=1.0, cycles_collected=10,\n    )\n    assert sim._borrow_owed(p) == 0.0          # own the asset → no borrow\n\n\ndef test_borrow_owed_uses_alt_tier_for_microcap(tmp_path):\n    sim = _cooldown_sim(tmp_path, [], hours=0)\n    p = PaperPosition(\n        symbol=\"XCNUSDT\", exchange=\"Binance\", direction=\"SHORT_SPOT_LONG_PERP\",\n        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,\n        entry_time_iso=datetime.now(timezone.utc).isoformat(),\n        funding_collected=11.0, entry_cost=2.0, cycles_collected=21,\n    )\n    # 50% alt APY × $900 × (21×8h / 8760h)\n    expected = (fap.BORROW_APY_ALT / 100.0) * 900.0 * (21 * fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))\n    assert abs(sim._borrow_owed(p) - expected) < 1e-9\n\n\ndef test_borrow_corrected_strips_unpaid_carry(tmp_path):\n    sim = _cooldown_sim(tmp_path, [], hours=0)\n    # A legacy short-spot winner charged $0 borrow (pre-model) but owes plenty.\n    legacy = PaperPosition(\n        symbol=\"XCNUSDT\", exchange=\"Binance\", direction=\"SHORT_SPOT_LONG_PERP\",\n        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,\n        entry_time_iso=datetime.now(timezone.utc).isoformat(),\n        funding_collected=11.69, entry_cost=2.0, borrow_cost=0.0, cycles_collected=21,\n    )\n    sim.closed_positions = [legacy]\n    booked = sim._total_pnl()\n    corrected = sim.borrow_corrected_pnl()\n    assert booked > 0                          # looks profitable as booked\n    assert corrected < booked                  # honest carry deflates it\n    owed = sim._borrow_owed(legacy)\n    assert abs(corrected - (booked - owed)) < 1e-9\n\n\ndef test_borrow_corrected_equals_total_for_positive_only(tmp_path):\n    # An arm with no short-spot legs: corrected == booked (nothing to charge).\n    sim = _cooldown_sim(tmp_path, [], hours=0)\n    sim.closed_positions = [PaperPosition(\n        symbol=\"BTCUSDT\", exchange=\"Binance\", direction=\"LONG_SPOT_SHORT_PERP\",\n        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,\n        entry_time_iso=datetime.now(timezone.utc).isoformat(),\n        funding_collected=4.0, entry_cost=1.1, cycles_collected=8,\n    )]\n    assert abs(sim.borrow_corrected_pnl() - sim._total_pnl()) < 1e-9\n\n\n# ── state persistence (_save_state / _load_state) ────────────────────────────\n\ndef test_open_positions_survive_save_load(tmp_path, monkeypatch):\n    \"\"\"Open positions written by _save_state are fully restored by _load_state.\"\"\"\n    state_file = tmp_path / \"state.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n\n    sim = FundingArbPaperSim(scanner=_FakeScanner([_opp(\"BTCUSDT\", 40.0)]),\n                              notifier=None)\n    sim._tick()\n    assert len(sim.open_positions) == 1\n    key = next(iter(sim.open_positions))\n    original = sim.open_positions[key]\n\n    # Simulate restart: create a fresh instance that loads from the same file.\n    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,\n                               state_file=state_file)\n    assert len(sim2.open_positions) == 1\n    restored = sim2.open_positions[key]\n    assert restored.symbol == original.symbol\n    assert restored.exchange == original.exchange\n    assert abs(restored.size_usd - original.size_usd) < 1e-9\n    assert abs(restored.entry_cost - original.entry_cost) < 1e-9\n    assert abs(restored.entry_apy - original.entry_apy) < 1e-9\n\n\ndef test_closed_positions_survive_save_load(tmp_path, monkeypatch):\n    \"\"\"Closed positions are also persisted and restored.\"\"\"\n    state_file = tmp_path / \"state.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n    now = datetime.now(timezone.utc)\n\n    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)\n    closed = PaperPosition(\n        symbol=\"ETHUSDT\", exchange=\"Binance\",\n        direction=\"LONG_SPOT_SHORT_PERP\",\n        entry_apy=50.0, entry_rate_8h=50.0 / 1095.0 / 100.0,\n        size_usd=300.0,\n        entry_time_iso=now.isoformat(),\n        funding_collected=3.0, entry_cost=0.66,\n        closed=True, close_time_iso=now.isoformat(), close_reason=\"max_hold\",\n    )\n    sim.closed_positions = [closed]\n    sim._save_state()\n\n    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,\n                               state_file=state_file)\n    assert len(sim2.closed_positions) == 1\n    r = sim2.closed_positions[0]\n    assert r.symbol == \"ETHUSDT\"\n    assert r.close_reason == \"max_hold\"\n    assert abs(r.funding_collected - 3.0) < 1e-9\n\n\ndef test_flip_cooldowns_survive_save_load(tmp_path, monkeypatch):\n    \"\"\"Flip cooldown timestamps persist so a restarted bot honours the cooldown.\"\"\"\n    state_file = tmp_path / \"state.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n    now = datetime.now(timezone.utc)\n\n    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)\n    sim._flip_cooldowns[\"Binance:BTCUSDT\"] = now.isoformat()\n    sim._save_state()\n\n    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,\n                               state_file=state_file)\n    assert \"Binance:BTCUSDT\" in sim2._flip_cooldowns\n    assert sim2._flip_cooldowns[\"Binance:BTCUSDT\"] == now.isoformat()\n\n\ndef test_save_state_writes_via_tmp_file(tmp_path, monkeypatch):\n    \"\"\"_save_state must use an atomic temp-file rename, not a direct overwrite.\n\n    If the process crashes mid-write, the original state file must remain intact.\n    We verify the pattern indirectly: the final file is valid JSON and the .tmp\n    file does not linger after a successful save.\n    \"\"\"\n    import json\n    state_file = tmp_path / \"state.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n\n    sim = FundingArbPaperSim(scanner=_FakeScanner([_opp(\"SOLUSDT\", 40.0)]),\n                              notifier=None)\n    sim._tick()\n    sim._save_state()\n\n    # The real file must be valid JSON.\n    data = json.loads(state_file.read_text())\n    assert \"open\" in data and \"closed\" in data\n\n    # The .tmp file must not linger after a successful save.\n    tmp_file = state_file.with_suffix(\".tmp\")\n    assert not tmp_file.exists(), \"temp file should be renamed away, not left behind\"\n\n\ndef test_load_state_tolerates_missing_file(tmp_path, monkeypatch):\n    \"\"\"A fresh install with no state file must start cleanly (no crash).\"\"\"\n    state_file = tmp_path / \"no_such_file.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,\n                              state_file=state_file)\n    assert sim.open_positions == {}\n    assert sim.closed_positions == []\n\n\ndef test_load_state_tolerates_corrupt_json(tmp_path, monkeypatch):\n    \"\"\"A corrupted state file must not crash the bot — it logs and starts fresh.\"\"\"\n    state_file = tmp_path / \"state.json\"\n    monkeypatch.setattr(fap, \"STATE_FILE\", state_file)\n    state_file.write_text(\"{ this is not valid JSON }\")\n\n    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,\n                              state_file=state_file)\n    assert sim.open_positions == {}\n    assert sim.closed_positions == []\n
+"""
+Tests for the cost-aware funding-rate arbitrage paper simulator.
+
+Focus: the round-trip cost model, the cost-aware entry gate, and the exit
+logic (_should_exit).  The exit conditions were previously completely untested;
+they are also where the off_scanner_24h bug lived (last_funding_ts_iso was used
+as a proxy for "last scanner sighting" but was updated even on off-scanner
+decayed-rate ticks, so the 24h gate never fired).
+"""
+
+from datetime import datetime, timezone, timedelta
+
+import arbitrage.funding_arb_paper as fap
+from arbitrage.funding_arb_paper import FundingArbPaperSim, PaperPosition
+
+
+class _FakeScanner:
+    """Stand-in for FundingScanner: returns a fixed opportunity list."""
+
+    def __init__(self, opps):
+        self._opps = opps
+
+    def get_state(self):
+        return self._opps
+
+
+def _opp(symbol, apy, exchange="Binance"):
+    """Build an opportunity dict matching FundingScanner.get_state() shape.
+
+    The scanner stores rate_8h as a PERCENT; apy = rate_8h_frac * 3 * 365 * 100,
+    so rate_8h_percent = apy / 1095.
+    """
+    return {
+        "exchange": exchange,
+        "symbol": symbol,
+        "rate_8h": round(apy / 1095.0, 6),  # percent
+        "apy": apy,
+        "action": "SHORT PERP + LONG SPOT" if apy > 0 else "LONG PERP + SHORT SPOT",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _make_sim(tmp_path, opps, monkeypatch):
+    # Isolate persistence so the test never touches real state.
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "funding_arb_state.json")
+    return FundingArbPaperSim(scanner=_FakeScanner(opps), notifier=None)
+
+
+def test_net_pnl_is_funding_minus_cost():
+    pos = PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=2.50, entry_cost=1.10,
+    )
+    assert abs(pos.net_pnl - (2.50 - 1.10)) < 1e-9
+
+
+def test_entry_charges_round_trip_cost(tmp_path, monkeypatch):
+    # apy=30% → ~8 breakeven cycles at default 0.22% cost → passes the gate.
+    sim = _make_sim(tmp_path, [_opp("BTCUSDT", 30.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+    pos = next(iter(sim.open_positions.values()))
+    # Invariant: entry cost is always the round-trip fraction of the (now
+    # conviction-weighted) position size.
+    expected_cost = fap.ROUND_TRIP_COST_FRAC * pos.size_usd
+    assert abs(pos.entry_cost - expected_cost) < 1e-9
+    # No funding accrued yet → net PnL starts negative (we paid to open).
+    assert pos.net_pnl < 0
+
+
+def test_conviction_sizing_scales_with_apy(tmp_path, monkeypatch):
+    sim = _make_sim(tmp_path, [], monkeypatch)
+    low  = sim._size_for_apy(30)    # just above the cost floor
+    high = sim._size_for_apy(140)   # near the cap
+    assert fap.MIN_POSITION_USD <= low < high <= fap.MAX_POSITION_USD
+    # Clamps: below floor → MIN, above cap → MAX.
+    assert sim._size_for_apy(5) == fap.MIN_POSITION_USD
+    assert sim._size_for_apy(5000) == fap.MAX_POSITION_USD
+
+
+def test_cost_gate_rejects_marginal_apy(tmp_path, monkeypatch):
+    # apy=20% clears the 15% APY floor but NOT the cost gate:
+    # breakeven = 0.0022 / (20/109500) ≈ 12 cycles > 10 → skip.
+    sim = _make_sim(tmp_path, [_opp("ETHUSDT", 20.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_cost_gate_accepts_rich_apy(tmp_path, monkeypatch):
+    # apy=40% → breakeven ≈ 6 cycles < 10 → open.
+    sim = _make_sim(tmp_path, [_opp("SOLUSDT", 40.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_apy_cap_rejects_absurd_funding(tmp_path, monkeypatch):
+    # apy=2000% is an illiquid meme perp — above the 150% cap → skip.
+    sim = _make_sim(tmp_path, [_opp("LITEUSDT", 2000.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_apy_within_band_opens(tmp_path, monkeypatch):
+    # apy=80% is elevated-but-plausible: clears min (15%), cap (150%), cost gate.
+    sim = _make_sim(tmp_path, [_opp("DOGEUSDT", 80.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def _make_majors_sim(tmp_path, opps, monkeypatch):
+    # Mirrors the deployed majors arm: Kraken Futures only (the executable venue)
+    # at a realistic ~0.54% round-trip cost. See the realism fix in paper_trading.
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        symbol_allowlist=fap.MAJOR_SYMBOLS,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0054,
+        state_file=tmp_path / "majors_state.json",
+        label="Funding Arb (majors)",
+    )
+
+
+def _kf_opp(symbol, apy):
+    """A Kraken-Futures opportunity (the only venue the majors arm executes)."""
+    return _opp(symbol, apy, exchange="Kraken Futures")
+
+
+def test_majors_arm_rejects_non_major(tmp_path, monkeypatch):
+    # ENJ isn't in the majors allowlist → conservative arm skips it.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("ENJUSDT", 80.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_rejects_negative_funding(tmp_path, monkeypatch):
+    # Negative funding would need a spot short (borrow) → conservative arm skips.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", -80.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_rejects_non_executable_venue(tmp_path, monkeypatch):
+    # A positive major well above the floor, but on Binance — not executable for
+    # a US-restricted account. The source allowlist must reject it.
+    sim = _make_majors_sim(tmp_path, [_opp("BTCUSDT", 80.0, exchange="Binance")],
+                           monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_opens_rich_executable_major(tmp_path, monkeypatch):
+    # Positive major on Kraken Futures, above the realistic-cost floor (~59%) → opens.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", 80.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_majors_arm_skips_below_realistic_floor(tmp_path, monkeypatch):
+    # 15% APY cleared the old 0.08%-cost floor but not the realistic 0.54% one
+    # (~59%): at honest cost it doesn't break even in time, so the arm passes.
+    sim = _make_majors_sim(tmp_path, [_kf_opp("BTCUSDT", 15.0)], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_majors_arm_realistic_cost_floor(tmp_path, monkeypatch):
+    # Realistic Kraken round-trip cost (~0.54%) lifts the APY floor far above the
+    # old optimistic ~9%: 0.0054 / 10 cycles × 3 × 365 × 100 ≈ 59%.
+    sim = _make_majors_sim(tmp_path, [], monkeypatch)
+    assert 50.0 < sim._apy_floor() < 65.0
+
+
+def _make_kraken_sim(tmp_path, opps, monkeypatch, max_be=2.0):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0064,
+        max_breakeven_cycles=max_be,
+        state_file=tmp_path / "kraken_state.json",
+        label="Funding Arb (Kraken)",
+    )
+
+
+def test_kraken_persistence_gate_rejects_microcap(tmp_path, monkeypatch):
+    # 140% APY microcap on Kraken: at 0.64% cost, breakeven ≈ 5 cycles. The
+    # strict 2-cycle persistence gate rejects it (funding won't survive long
+    # enough to clear honest cost) — this is the funding_arb_kraken_bleed fix.
+    opp = _opp("PF_OMIUSD", 140.0, exchange="Kraken Futures")
+    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=2.0)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_kraken_arm_with_lax_gate_would_open(tmp_path, monkeypatch):
+    # Same opportunity under the lax 10-cycle gate WOULD open — proves the
+    # per-arm threshold (not the cost/cap/sign filters) is what gates it out.
+    opp = _opp("PF_OMIUSD", 140.0, exchange="Kraken Futures")
+    sim = _make_kraken_sim(tmp_path, [opp], monkeypatch, max_be=10.0)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_default_arm_breakeven_gate_unchanged(tmp_path, monkeypatch):
+    # Arms that don't pass max_breakeven_cycles keep the module default (10).
+    sim = _make_sim(tmp_path, [], monkeypatch)
+    assert sim.max_breakeven_cycles == fap.MAX_BREAKEVEN_CYCLES
+
+
+def _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0):
+    # Mirrors the live aggressive Kraken config: all-in single position,
+    # maker-only cost, gate relaxed to 6 cycles, cap raised to 300%.
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        positive_funding_only=True,
+        source_allowlist={"Kraken Futures"},
+        cost_frac=0.0054,
+        max_breakeven_cycles=6.0,
+        max_entry_apy=300.0,
+        max_positions=1,
+        min_position_usd=alloc, max_position_usd=alloc, max_total_notional=alloc,
+        state_file=tmp_path / "kraken_state.json",
+        label="Funding Arb (Kraken)",
+    )
+
+
+def test_aggressive_kraken_goes_all_in_one_position(tmp_path, monkeypatch):
+    # Two rich opportunities, but max_positions=1 → only one opens, sized at the
+    # full allocation (no conviction scaling since min==max==total).
+    opps = [
+        _opp("PF_OMIUSD", 160.0, exchange="Kraken Futures"),
+        _opp("PF_DEXEUSD", 145.0, exchange="Kraken Futures"),
+    ]
+    sim = _make_aggressive_kraken_sim(tmp_path, opps, monkeypatch, alloc=500.0)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+    pos = next(iter(sim.open_positions.values()))
+    assert abs(pos.size_usd - 500.0) < 1e-9          # all-in, full alloc
+    assert abs(pos.entry_cost - 0.0054 * 500.0) < 1e-9  # maker-only cost
+
+
+def test_aggressive_kraken_relaxed_gate_admits_rich_apy(tmp_path, monkeypatch):
+    # 150% APY: at 0.54% maker cost, breakeven ≈ 3.9 cycles < 6 → the relaxed
+    # gate admits it (the strict 2-cycle gate would have rejected it).
+    opp = _opp("PF_OMIUSD", 150.0, exchange="Kraken Futures")
+    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_aggressive_kraken_still_rejects_thin_funding(tmp_path, monkeypatch):
+    # 60% APY: breakeven = 0.0054 / (60/109500) ≈ 9.9 cycles > 6 → still skipped.
+    # Proves the +EV gate survives the relax — it's aggressive, not blind.
+    opp = _opp("PF_THINUSD", 60.0, exchange="Kraken Futures")
+    sim = _make_aggressive_kraken_sim(tmp_path, [opp], monkeypatch)
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_total_pnl_is_net_of_costs(tmp_path, monkeypatch):
+    sim = _make_sim(tmp_path, [_opp("BTCUSDT", 40.0)], monkeypatch)
+    sim._tick()
+    pos = next(iter(sim.open_positions.values()))
+
+    # Simulate 9 funding cycles elapsing, then accrue.
+    pos.last_funding_ts_iso = (
+        datetime.now(timezone.utc) - timedelta(hours=9 * fap.FUNDING_CYCLE_HOURS)
+    ).isoformat()
+    sim._accrue_funding(pos, _opp("BTCUSDT", 40.0), datetime.now(timezone.utc))
+
+    assert pos.funding_collected > 0
+    # Cumulative total must equal gross funding minus costs.
+    assert abs(sim._total_pnl()
+               - (sim._total_gross_funding() - sim._total_costs())) < 1e-9
+    assert abs(pos.net_pnl - (pos.funding_collected - pos.entry_cost)) < 1e-9
+
+
+# ── per-venue funding interval (#2) ──────────────────────────────────────────
+
+def test_kraken_interval_is_hourly_others_8h():
+    assert fap._funding_interval_hours("Kraken Futures") == fap.KRAKEN_FUNDING_INTERVAL_HOURS
+    assert fap._funding_interval_hours("Binance") == float(fap.FUNDING_CYCLE_HOURS)
+    assert fap._funding_interval_hours(None) == float(fap.FUNDING_CYCLE_HOURS)
+
+
+def test_kraken_position_stamped_hourly_at_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+    sim._open_position(_opp("PF_XBTUSD", 40.0, exchange="Kraken Futures"),
+                       datetime.now(timezone.utc))
+    pos = next(iter(sim.open_positions.values()))
+    assert pos.funding_interval_hours == fap.KRAKEN_FUNDING_INTERVAL_HOURS
+
+
+def test_total_funding_invariant_to_interval():
+    """Funding APY is annualized: over the same hold, total funding collected is
+    the same whether accrued in 1h or 8h increments. Shorter interval only changes
+    granularity (banking partial funding before a flip), not expectancy."""
+    now = datetime.now(timezone.utc)
+    sim = FundingArbPaperSim.__new__(FundingArbPaperSim)  # no I/O needed
+    opp = _opp("X", 40.0)
+
+    def collect(interval_h):
+        pos = PaperPosition(
+            symbol="X", exchange="e", direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=40.0, entry_rate_8h=40.0 / 1095.0 / 100.0, size_usd=1000.0,
+            entry_time_iso=now.isoformat(), last_funding_ts_iso=now.isoformat(),
+            last_seen_iso=now.isoformat(), funding_interval_hours=interval_h,
+        )
+        # 24h later — an exact multiple of both 1h and 8h.
+        sim._accrue_funding(pos, opp, now + timedelta(hours=24))
+        return pos.funding_collected, pos.cycles_collected
+
+    f8, c8 = collect(8.0)
+    f1, c1 = collect(1.0)
+    assert abs(f8 - f1) < 1e-9          # same total funding
+    assert c8 == 3 and c1 == 24         # finer granularity at 1h
+
+
+def test_off_scanner_accrues_no_phantom_funding(tmp_path, monkeypatch):
+    """A position that's fallen off the scanner must NOT keep booking funding —
+    off-scanner means its rate dropped below the scanner's threshold, so any
+    credit is phantom income. Default OFFSCANNER_RATE_FRAC=0 → zero funding."""
+    sim = _sim_for_exit(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    pos = _open_pos(entry_apy=40.0)           # long-spot → no borrow either
+    pos.last_funding_ts_iso = now.isoformat()
+    sim._accrue_funding(pos, None, now + timedelta(hours=24))  # 3 cycles, off-scanner
+    assert pos.cycles_collected == 3          # time still advances
+    assert pos.funding_collected == 0.0       # but no phantom funding booked
+
+
+# ── _should_exit — exit condition tests ──────────────────────────────────────
+
+def _open_pos(entry_apy: float = 40.0,
+              hours_old: float = 0.0,
+              last_seen_hours_ago: float = 0.0) -> PaperPosition:
+    """Build an open PaperPosition with controllable age and scanner-visibility."""
+    now = datetime.now(timezone.utc)
+    entry_time = now - timedelta(hours=hours_old)
+    last_seen  = now - timedelta(hours=last_seen_hours_ago)
+    return PaperPosition(
+        symbol="BTCUSDT", exchange="Binance",
+        direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=entry_apy,
+        entry_rate_8h=entry_apy / 1095.0 / 100.0,  # fraction
+        size_usd=500.0,
+        entry_time_iso=entry_time.isoformat(),
+        last_seen_iso=last_seen.isoformat(),
+    )
+
+
+def _sim_for_exit(tmp_path, monkeypatch) -> FundingArbPaperSim:
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+
+
+class TestShouldExit:
+
+    def test_no_exit_healthy_position(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0, hours_old=24.0)
+        opp = _opp("BTCUSDT", 40.0)  # rate unchanged, on scanner
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 1: max hold ──────────────────────────────────────────────────────
+
+    def test_exits_after_max_hold_days(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 + 1)
+        opp = _opp("BTCUSDT", 40.0)
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason is not None and "max_hold" in reason
+
+    def test_no_exit_just_under_max_hold(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 - 1)
+        opp = _opp("BTCUSDT", 40.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 2: funding flipped sign ──────────────────────────────────────────
+
+    def test_exits_when_positive_funding_flips_negative(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)   # entered as LONG_SPOT_SHORT_PERP
+        opp = _opp("BTCUSDT", -10.0)     # rate is now negative
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason == "funding_flipped"
+
+    def test_exits_when_negative_funding_flips_positive(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=-40.0)  # entered SHORT_SPOT_LONG_PERP
+        opp = _opp("BTCUSDT", 10.0)      # rate is now positive
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason == "funding_flipped"
+
+    def test_no_exit_when_sign_unchanged(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        opp = _opp("BTCUSDT", 20.0)     # positive but lower — sign same
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 3: APY decayed below threshold ───────────────────────────────────
+
+    def test_exits_when_apy_decays_below_fraction(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # EXIT_APY_FRACTION=0.40: exit when current < 40% of entry (40*0.40=16%)
+        # Use 15% — just below the threshold.
+        opp = _opp("BTCUSDT", 15.0)
+        reason = sim._should_exit(pos, opp, datetime.now(timezone.utc))
+        assert reason is not None and "apy_decayed" in reason
+
+    def test_no_exit_when_apy_above_fraction(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # 17% > 40*0.40=16% → stays open
+        opp = _opp("BTCUSDT", 17.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    def test_exits_on_exact_decay_boundary(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(entry_apy=40.0)
+        # Exactly at boundary (40 * 0.40 = 16.0) — abs(16.0) < abs(16.0) is False,
+        # so it should NOT exit at the exact threshold (strict <).
+        opp = _opp("BTCUSDT", 16.0)
+        assert sim._should_exit(pos, opp, datetime.now(timezone.utc)) is None
+
+    # ── exit 4: off scanner 24h (the previously broken gate) ─────────────────
+
+    def test_exits_when_off_scanner_over_24h(self, tmp_path, monkeypatch):
+        """Core regression test for the off_scanner_24h bug.
+
+        Before the fix, _should_exit used last_funding_ts_iso, which gets
+        updated on every decayed-rate accrual tick. That reset the 24h clock
+        continuously, making the gate never fire. Now it uses last_seen_iso
+        (updated only when scanner data is present), so the gate correctly
+        fires after 25h of scanner absence.
+        """
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(last_seen_hours_ago=25.0)  # last seen 25h ago
+        reason = sim._should_exit(pos, None, datetime.now(timezone.utc))
+        assert reason == "off_scanner_24h"
+
+    def test_no_exit_when_off_scanner_under_24h(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        pos = _open_pos(last_seen_hours_ago=23.0)
+        assert sim._should_exit(pos, None, datetime.now(timezone.utc)) is None
+
+    def test_off_scanner_gate_survives_decayed_accruals(self, tmp_path, monkeypatch):
+        """Verify that calling _accrue_funding with current_opp=None (decayed rate)
+        does NOT update last_seen_iso and therefore does NOT reset the 24h clock."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(last_seen_hours_ago=20.0)  # seen 20h ago
+        # Simulate three 8h off-scanner accrual ticks: only last_funding_ts_iso
+        # should change, not last_seen_iso.
+        for i in range(1, 4):
+            tick_now = now + timedelta(hours=i * 8)
+            pos.last_funding_ts_iso = (now - timedelta(hours=20 - i * 8)).isoformat()
+            sim._accrue_funding(pos, None, tick_now)
+
+        # last_seen_iso must still be 20h before 'now', not updated.
+        last_seen = datetime.fromisoformat(pos.last_seen_iso)
+        assert (now - last_seen).total_seconds() >= 20 * 3600 - 1
+
+        # After 25h total, the exit should fire (20h already elapsed + 5h gap).
+        final_now = now + timedelta(hours=5)
+        reason = sim._should_exit(pos, None, final_now)
+        assert reason == "off_scanner_24h"
+
+    def test_on_scanner_resets_last_seen(self, tmp_path, monkeypatch):
+        """When the symbol comes back onto the scanner, last_seen_iso is refreshed
+        via _accrue_funding — resetting the 24h clock correctly."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(last_seen_hours_ago=23.0)
+        # Scanner returns data → _accrue_funding updates last_seen_iso.
+        sim._accrue_funding(pos, _opp("BTCUSDT", 40.0), now)
+        # Now last_seen_iso ≈ now; the 25h check should NOT fire.
+        reason = sim._should_exit(pos, None, now + timedelta(hours=2))
+        assert reason is None
+
+    # ── fallback: no last_seen_iso (old persisted positions) ─────────────────
+
+    def test_no_last_seen_iso_uses_entry_time(self, tmp_path, monkeypatch):
+        """Positions persisted before last_seen_iso was added have last_seen_iso=None.
+        The exit check must fall back to entry_time to avoid crashing and should
+        close the position if entry was more than 24h ago with no current scanner data."""
+        sim = _sim_for_exit(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = _open_pos(hours_old=26.0)
+        pos.last_seen_iso = None    # simulate old serialized state
+        reason = sim._should_exit(pos, None, now)
+        assert reason == "off_scanner_24h"
+
+    # ── source_allowlist — Kraken-only arm ────────────────────────────────────
+
+    def test_source_allowlist_rejects_non_allowlisted_exchange(self, tmp_path, monkeypatch):
+        """Kraken-only arm must reject Binance/Bybit opportunities."""
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("BTCUSDT", 40.0, exchange="Binance")]),
+            notifier=None,
+            source_allowlist={"Kraken Futures"},
+            state_file=tmp_path / "kraken_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 0
+
+    def test_source_allowlist_accepts_allowlisted_exchange(self, tmp_path, monkeypatch):
+        """Kraken-only arm must accept opportunities from Kraken Futures."""
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("PF_XBTUSD", 40.0, exchange="Kraken Futures")]),
+            notifier=None,
+            source_allowlist={"Kraken Futures"},
+            state_file=tmp_path / "kraken_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 1
+
+    # ── max positions cap ─────────────────────────────────────────────────────
+
+    def test_max_positions_blocks_new_entries(self, tmp_path, monkeypatch):
+        """Once max_positions is reached, no further entries are opened."""
+        opps = [_opp(f"COIN{i}USDT", 40.0) for i in range(5)]
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+        sim = FundingArbPaperSim(
+            scanner=_FakeScanner(opps), notifier=None,
+            max_positions=2,
+            state_file=tmp_path / "cap_state.json",
+        )
+        sim._tick()
+        assert len(sim.open_positions) == 2
+
+    # ── state persistence round-trip ──────────────────────────────────────────
+
+    def test_state_persists_and_reloads(self, tmp_path, monkeypatch):
+        """Save state, reload into a fresh sim instance, and verify positions survive."""
+        state_file = tmp_path / "persist_state.json"
+        monkeypatch.setattr(fap, "STATE_FILE", state_file)
+
+        sim1 = FundingArbPaperSim(
+            scanner=_FakeScanner([_opp("BTCUSDT", 40.0)]),
+            notifier=None,
+            state_file=state_file,
+        )
+        sim1._tick()
+        assert len(sim1.open_positions) == 1
+        # State is saved inside _tick(); no extra call needed.
+
+        sim2 = FundingArbPaperSim(
+            scanner=_FakeScanner([]),
+            notifier=None,
+            state_file=state_file,
+        )
+        assert len(sim2.open_positions) == 1
+        pos1 = next(iter(sim1.open_positions.values()))
+        pos2 = next(iter(sim2.open_positions.values()))
+        assert pos1.symbol == pos2.symbol
+        assert abs(pos1.entry_cost - pos2.entry_cost) < 1e-9
+        # last_seen_iso must survive the round-trip.
+        assert pos2.last_seen_iso is not None
+
+
+# ── _base_symbol — symbol normalisation ──────────────────────────────────────
+
+class TestBaseSymbol:
+    """_base_symbol strips exchange-specific prefixes/suffixes and normalises
+    venue aliases (XBT→BTC, XDG→DOGE) so that symbol allowlists work across
+    Binance, Bybit, and Kraken Futures without per-venue special-casing."""
+
+    def test_binance_usdt_pair(self):
+        assert fap._base_symbol("BTCUSDT") == "BTC"
+
+    def test_binance_usd_pair(self):
+        assert fap._base_symbol("ETHUSD") == "ETH"
+
+    def test_binance_usdc_pair(self):
+        assert fap._base_symbol("SOLUSDC") == "SOL"
+
+    def test_kraken_futures_pf_prefix_stripped(self):
+        assert fap._base_symbol("PF_SOLUSD") == "SOL"
+
+    def test_kraken_xbt_alias_normalised_to_btc(self):
+        """Kraken lists Bitcoin as XBT; without normalisation PF_XBTUSD never
+        matches a 'BTC' entry in the symbol allowlist."""
+        assert fap._base_symbol("PF_XBTUSD") == "BTC"
+
+    def test_kraken_xdg_alias_normalised_to_doge(self):
+        """Kraken lists Dogecoin as XDG."""
+        assert fap._base_symbol("PF_XDGUSD") == "DOGE"
+
+    def test_lowercase_input(self):
+        assert fap._base_symbol("btcusdt") == "BTC"
+
+    def test_no_quote_suffix_returned_as_upper(self):
+        """Symbol with no recognised quote suffix is returned uppercased as-is."""
+        assert fap._base_symbol("BTC") == "BTC"
+
+    def test_quote_priority_usdt_before_usd(self):
+        """USDT must be stripped before USD so 'BTCUSDT' → 'BTC' not 'BTCUS'."""
+        result = fap._base_symbol("BTCUSDT")
+        assert result == "BTC"
+
+    def test_kraken_eth_pf_prefix(self):
+        assert fap._base_symbol("PF_ETHUSD") == "ETH"
+
+
+# ── _accrue_funding — borrow cost model ──────────────────────────────────────
+
+class TestBorrowCostAccrual:
+    """The borrow cost model for SHORT_SPOT_LONG_PERP (negative-funding) trades.
+
+    Shorting spot requires borrowing the asset; the old model charged only a
+    one-off entry cost and ignored carry, inflating the aggressive arm's P&L
+    on microcap shorts.  These tests pin the corrected behaviour.
+    """
+
+    def _short_pos(self, symbol: str = "BTCUSDT", size_usd: float = 500.0) -> PaperPosition:
+        """Return a SHORT_SPOT_LONG_PERP position with 1 funding cycle due."""
+        now = datetime.now(timezone.utc)
+        entry = now - timedelta(hours=9)   # 9h ago → int(9/8)=1 cycle due
+        return PaperPosition(
+            symbol=symbol,
+            exchange="Binance",
+            direction="SHORT_SPOT_LONG_PERP",
+            entry_apy=-40.0,
+            entry_rate_8h=-40.0 / 109500.0,  # fraction; 109500 = 1095*100
+            size_usd=size_usd,
+            entry_time_iso=entry.isoformat(),
+            last_funding_ts_iso=entry.isoformat(),
+        )
+
+    def _long_pos(self) -> PaperPosition:
+        """Return a LONG_SPOT_SHORT_PERP position with 1 funding cycle due."""
+        now = datetime.now(timezone.utc)
+        entry = now - timedelta(hours=9)
+        return PaperPosition(
+            symbol="BTCUSDT",
+            exchange="Binance",
+            direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=40.0,
+            entry_rate_8h=40.0 / 109500.0,
+            size_usd=500.0,
+            entry_time_iso=entry.isoformat(),
+            last_funding_ts_iso=entry.isoformat(),
+        )
+
+    def _sim(self, tmp_path, monkeypatch) -> FundingArbPaperSim:
+        monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "s.json")
+        return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+
+    def test_long_position_never_accrues_borrow_cost(self, tmp_path, monkeypatch):
+        """LONG_SPOT_SHORT_PERP owns the spot asset outright — zero borrow needed."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._long_pos()
+        sim._accrue_funding(pos, _opp("BTCUSDT", 40.0), datetime.now(timezone.utc))
+        assert pos.borrow_cost == 0.0
+
+    def test_short_major_uses_major_borrow_rate(self, tmp_path, monkeypatch):
+        """SHORT_SPOT on a liquid major (BTC) charges BORROW_APY_MAJOR per cycle."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_short_alt_uses_higher_alt_borrow_rate(self, tmp_path, monkeypatch):
+        """SHORT_SPOT on an illiquid alt charges the steeper BORROW_APY_ALT."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="OBSCUREUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("OBSCUREUSDT", -40.0), datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_ALT / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_alt_borrow_rate_is_higher_than_major(self, tmp_path, monkeypatch):
+        """Sanity: alt borrow APY must exceed major borrow APY."""
+        assert fap.BORROW_APY_ALT > fap.BORROW_APY_MAJOR
+
+    def test_borrow_scales_with_multiple_cycles(self, tmp_path, monkeypatch):
+        """Three elapsed cycles → 3× the per-cycle borrow charge."""
+        sim = self._sim(tmp_path, monkeypatch)
+        now = datetime.now(timezone.utc)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        # Override last timestamp so 3 cycles are due
+        pos.last_funding_ts_iso = (now - timedelta(hours=25)).isoformat()
+        pos.entry_time_iso = pos.last_funding_ts_iso
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), now)
+
+        cycles = int(25 // fap.FUNDING_CYCLE_HOURS)   # = 3
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+            * cycles
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_borrow_cost_accrues_off_scanner(self, tmp_path, monkeypatch):
+        """Borrow must keep accruing even when the symbol drops off the scanner
+        (current_opp=None) — the short is still open and the borrow is still owed."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        sim._accrue_funding(pos, None, datetime.now(timezone.utc))  # off-scanner
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+    def test_net_pnl_deducts_borrow_from_short_position(self, tmp_path, monkeypatch):
+        """net_pnl must equal funding_collected − entry_cost − borrow_cost."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        pos.entry_cost = 1.50
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        assert pos.borrow_cost > 0.0    # sanity: borrow was charged
+        assert abs(
+            pos.net_pnl - (pos.funding_collected - pos.entry_cost - pos.borrow_cost)
+        ) < 1e-9
+
+    def test_total_costs_includes_borrow_for_short(self, tmp_path, monkeypatch):
+        """_total_costs() must aggregate entry_cost + borrow_cost so that
+        _total_pnl() == _total_gross_funding() - _total_costs() holds."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="BTCUSDT", size_usd=500.0)
+        pos.entry_cost = 1.50
+        sim.open_positions["Binance:BTCUSDT"] = pos
+        sim._accrue_funding(pos, _opp("BTCUSDT", -40.0), datetime.now(timezone.utc))
+
+        assert abs(
+            sim._total_costs() - (pos.entry_cost + pos.borrow_cost)
+        ) < 1e-9
+        assert abs(
+            sim._total_pnl() - (sim._total_gross_funding() - sim._total_costs())
+        ) < 1e-9
+
+    def test_kraken_xbt_symbol_uses_major_borrow_rate(self, tmp_path, monkeypatch):
+        """PF_XBTUSD: Kraken's XBT alias must map to BTC → major borrow rate."""
+        sim = self._sim(tmp_path, monkeypatch)
+        pos = self._short_pos(symbol="PF_XBTUSD", size_usd=500.0)
+        sim._accrue_funding(pos, _opp("PF_XBTUSD", -40.0, exchange="Kraken Futures"),
+                            datetime.now(timezone.utc))
+
+        expected = (
+            (fap.BORROW_APY_MAJOR / 100.0)
+            * 500.0
+            * (fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+        )
+        assert abs(pos.borrow_cost - expected) < 1e-9
+
+
+# ── Post-loss re-entry cooldown (realized-outcome feedback loop) ───────────────
+
+def _cooldown_sim(tmp_path, opps, hours):
+    """A both-sides sim with the flip-cooldown enabled and isolated state."""
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        flip_cooldown_hours=hours,
+        state_file=tmp_path / "cooldown_state.json",
+    )
+
+
+def test_net_loss_close_arms_cooldown(tmp_path):
+    opps = [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")]
+    sim = _cooldown_sim(tmp_path, opps, hours=48)
+    sim._tick()                                   # opens (no funding yet)
+    key = "Kraken Futures:PF_DEXEUSD"
+    assert key in sim.open_positions
+    # Funding flips negative → funding_flipped close at a net loss.
+    sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")])
+    sim._tick()
+    assert key not in sim.open_positions
+    assert key in sim._flip_cooldowns             # cooldown stamped
+
+
+def test_cooldown_blocks_reentry(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")], hours=48)
+    sim._tick(); sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")]); sim._tick()
+    assert key in sim._flip_cooldowns
+    # A fresh, attractive positive opp on the SAME symbol must be refused.
+    sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")])
+    sim._tick()
+    assert key not in sim.open_positions          # cooldown held the line
+
+
+def test_cooldown_expires_and_is_pruned(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=24)
+    old = datetime.now(timezone.utc) - timedelta(hours=30)
+    sim._flip_cooldowns[key] = old.isoformat()
+    now = datetime.now(timezone.utc)
+    assert sim._cooldown_remaining_h(key, now) is None   # 30h > 24h → expired
+    assert key not in sim._flip_cooldowns                 # pruned on read
+
+
+def test_cooldown_remaining_is_positive_within_window(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=48)
+    sim._flip_cooldowns[key] = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
+    rem = sim._cooldown_remaining_h(key, datetime.now(timezone.utc))
+    assert 37.0 < rem < 39.0                              # ~38h left
+
+
+def test_cooldown_disabled_by_default(tmp_path):
+    # hours=0 → never records, never blocks (the module/arm default for arms
+    # that don't opt in).
+    sim = _cooldown_sim(tmp_path, [_opp("PF_DEXEUSD", 140.0, exchange="Kraken Futures")], hours=0)
+    sim._tick(); sim.scanner = _FakeScanner([_opp("PF_DEXEUSD", -140.0, exchange="Kraken Futures")]); sim._tick()
+    assert sim._flip_cooldowns == {}
+    assert sim._cooldown_remaining_h("Kraken Futures:PF_DEXEUSD", datetime.now(timezone.utc)) is None
+
+
+def test_cooldown_persists_across_reload(tmp_path):
+    key = "Kraken Futures:PF_DEXEUSD"
+    sim = _cooldown_sim(tmp_path, [], hours=48)
+    sim._flip_cooldowns[key] = datetime.now(timezone.utc).isoformat()
+    sim._save_state()
+    sim2 = _cooldown_sim(tmp_path, [], hours=48)          # reloads same state file
+    assert key in sim2._flip_cooldowns
+
+
+# ── Rolling-window net P&L (feedback / observability) ─────────────────────────
+
+def test_net_pnl_since_windows_closed_positions(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    now = datetime.now(timezone.utc)
+    def _closed(net, age_days):
+        # net_pnl = funding_collected - entry_cost - borrow_cost; pin cost at 1.0
+        # and solve funding for the exact net we want.
+        p = PaperPosition(
+            symbol="X", exchange="Kraken Futures", direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=140.0, entry_rate_8h=0.001, size_usd=100.0,
+            entry_time_iso=(now - timedelta(days=age_days + 1)).isoformat(),
+            funding_collected=net + 1.0, entry_cost=1.0,
+        )
+        p.close_time_iso = (now - timedelta(days=age_days)).isoformat()
+        return p
+    sim.closed_positions = [_closed(-20.0, age_days=20), _closed(5.0, age_days=2)]
+    cutoff = now - timedelta(days=7)
+    # Only the 2-day-old +5 falls in the window; the 20-day-old -20 is excluded.
+    assert abs(sim.net_pnl_since(cutoff) - 5.0) < 1e-9
+    # Lifetime still includes the legacy loss.
+    assert abs(sim._total_pnl() - (-15.0)) < 1e-9
+
+
+# ── Borrow-corrected P&L (unpaid-carry exposure) ──────────────────────────────
+
+def test_borrow_owed_zero_for_long_spot(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    p = PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=5.0, entry_cost=1.0, cycles_collected=10,
+    )
+    assert sim._borrow_owed(p) == 0.0          # own the asset → no borrow
+
+
+def test_borrow_owed_uses_alt_tier_for_microcap(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    p = PaperPosition(
+        symbol="XCNUSDT", exchange="Binance", direction="SHORT_SPOT_LONG_PERP",
+        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=11.0, entry_cost=2.0, cycles_collected=21,
+    )
+    # 50% alt APY × $900 × (21×8h / 8760h)
+    expected = (fap.BORROW_APY_ALT / 100.0) * 900.0 * (21 * fap.FUNDING_CYCLE_HOURS / (24.0 * 365.0))
+    assert abs(sim._borrow_owed(p) - expected) < 1e-9
+
+
+def test_borrow_corrected_strips_unpaid_carry(tmp_path):
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    # A legacy short-spot winner charged $0 borrow (pre-model) but owes plenty.
+    legacy = PaperPosition(
+        symbol="XCNUSDT", exchange="Binance", direction="SHORT_SPOT_LONG_PERP",
+        entry_apy=-137.0, entry_rate_8h=-0.00125, size_usd=900.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=11.69, entry_cost=2.0, borrow_cost=0.0, cycles_collected=21,
+    )
+    sim.closed_positions = [legacy]
+    booked = sim._total_pnl()
+    corrected = sim.borrow_corrected_pnl()
+    assert booked > 0                          # looks profitable as booked
+    assert corrected < booked                  # honest carry deflates it
+    owed = sim._borrow_owed(legacy)
+    assert abs(corrected - (booked - owed)) < 1e-9
+
+
+def test_borrow_corrected_equals_total_for_positive_only(tmp_path):
+    # An arm with no short-spot legs: corrected == booked (nothing to charge).
+    sim = _cooldown_sim(tmp_path, [], hours=0)
+    sim.closed_positions = [PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.000274, size_usd=500.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=4.0, entry_cost=1.1, cycles_collected=8,
+    )]
+    assert abs(sim.borrow_corrected_pnl() - sim._total_pnl()) < 1e-9
+
+
+# ── state persistence (_save_state / _load_state) ────────────────────────────
+
+def test_open_positions_survive_save_load(tmp_path, monkeypatch):
+    """Open positions written by _save_state are fully restored by _load_state."""
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+
+    sim = FundingArbPaperSim(scanner=_FakeScanner([_opp("BTCUSDT", 40.0)]),
+                              notifier=None)
+    sim._tick()
+    assert len(sim.open_positions) == 1
+    key = next(iter(sim.open_positions))
+    original = sim.open_positions[key]
+
+    # Simulate restart: create a fresh instance that loads from the same file.
+    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                               state_file=state_file)
+    assert len(sim2.open_positions) == 1
+    restored = sim2.open_positions[key]
+    assert restored.symbol == original.symbol
+    assert restored.exchange == original.exchange
+    assert abs(restored.size_usd - original.size_usd) < 1e-9
+    assert abs(restored.entry_cost - original.entry_cost) < 1e-9
+    assert abs(restored.entry_apy - original.entry_apy) < 1e-9
+
+
+def test_closed_positions_survive_save_load(tmp_path, monkeypatch):
+    """Closed positions are also persisted and restored."""
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+    now = datetime.now(timezone.utc)
+
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+    closed = PaperPosition(
+        symbol="ETHUSDT", exchange="Binance",
+        direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=50.0, entry_rate_8h=50.0 / 1095.0 / 100.0,
+        size_usd=300.0,
+        entry_time_iso=now.isoformat(),
+        funding_collected=3.0, entry_cost=0.66,
+        closed=True, close_time_iso=now.isoformat(), close_reason="max_hold",
+    )
+    sim.closed_positions = [closed]
+    sim._save_state()
+
+    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                               state_file=state_file)
+    assert len(sim2.closed_positions) == 1
+    r = sim2.closed_positions[0]
+    assert r.symbol == "ETHUSDT"
+    assert r.close_reason == "max_hold"
+    assert abs(r.funding_collected - 3.0) < 1e-9
+
+
+def test_flip_cooldowns_survive_save_load(tmp_path, monkeypatch):
+    """Flip cooldown timestamps persist so a restarted bot honours the cooldown."""
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+    now = datetime.now(timezone.utc)
+
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+    sim._flip_cooldowns["Binance:BTCUSDT"] = now.isoformat()
+    sim._save_state()
+
+    sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                               state_file=state_file)
+    assert "Binance:BTCUSDT" in sim2._flip_cooldowns
+    assert sim2._flip_cooldowns["Binance:BTCUSDT"] == now.isoformat()
+
+
+def test_save_state_writes_via_tmp_file(tmp_path, monkeypatch):
+    """_save_state must use an atomic temp-file rename, not a direct overwrite.
+
+    If the process crashes mid-write, the original state file must remain intact.
+    We verify the pattern indirectly: the final file is valid JSON and the .tmp
+    file does not linger after a successful save.
+    """
+    import json
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+
+    sim = FundingArbPaperSim(scanner=_FakeScanner([_opp("SOLUSDT", 40.0)]),
+                              notifier=None)
+    sim._tick()
+    sim._save_state()
+
+    # The real file must be valid JSON.
+    data = json.loads(state_file.read_text())
+    assert "open" in data and "closed" in data
+
+    # The .tmp file must not linger after a successful save.
+    tmp_file = state_file.with_suffix(".tmp")
+    assert not tmp_file.exists(), "temp file should be renamed away, not left behind"
+
+
+def test_load_state_tolerates_missing_file(tmp_path, monkeypatch):
+    """A fresh install with no state file must start cleanly (no crash)."""
+    state_file = tmp_path / "no_such_file.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                              state_file=state_file)
+    assert sim.open_positions == {}
+    assert sim.closed_positions == []
+
+
+def test_load_state_tolerates_corrupt_json(tmp_path, monkeypatch):
+    """A corrupted state file must not crash the bot — it logs and starts fresh."""
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+    state_file.write_text("{ this is not valid JSON }")
+
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                              state_file=state_file)
+    assert sim.open_positions == {}
+    assert sim.closed_positions == []
