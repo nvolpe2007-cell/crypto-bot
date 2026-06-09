@@ -28,6 +28,14 @@ from src.decision_log import DecisionLog
 from src.volume_profile import volume_profile, DEFAULT_BINS
 from src.event_calendar import blackout_reason
 from src.cot_report import cot_signal
+from src.session_filter import SessionEdge
+
+# Session/time-of-day gate. Default OFF (measure-first): we tag every trade with
+# its session verdict so proof_scorecard can measure per-session edge BEFORE we
+# ever gate on it. Set SESSION_FILTER_HARD=1 to actually veto entries in windows
+# the bot has measured itself losing money in. See src/session_filter.py.
+SESSION_FILTER_HARD = os.getenv("SESSION_FILTER_HARD", "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 # Validated liquid Kraken USD-spot majors (pair codes confirmed live against the
 # OHLC endpoint). A WIDER universe is the fastest, cleanest way to reach the
@@ -181,7 +189,8 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
             # closed record so proof_scorecard / analysis can test win-rate by
             # each signal — measure-first, before either gates a trade.
             for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value", "cot_bias",
-                      "entry_hour", "entry_atr_pct"):
+                      "entry_hour", "entry_atr_pct", "entry_session",
+                      "session_verdict"):
                 if k in pos:
                     rec[k] = pos[k]
             state["closed"].append(rec)
@@ -208,6 +217,21 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
             notify(f"SWING SKIP {label}: event blackout ({blk})")
         return
 
+    # ── session / time-of-day edge gate (measure-first) ───────────────────────
+    # Rate this UTC hour from the bot's OWN realised swing ledger. Default soft:
+    # we only TAG the verdict (carried onto the closed record below) so the proof
+    # scorecard can measure per-session edge. Hard veto only with
+    # SESSION_FILTER_HARD=1, once the per-session sample is large enough to trust.
+    entry_hour = entry_dt.hour
+    sess_verdict = SessionEdge.from_state(state).verdict_for_hour(entry_hour)
+    if sess_verdict == "UNFAVORABLE" and SESSION_FILTER_HARD:
+        sess = SessionEdge.session_of(entry_hour)
+        dlog._write("skip_session", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
+                                     "reason": f"unfavorable session ({sess} hour {entry_hour})"})
+        if notify:
+            notify(f"SWING SKIP {label}: unfavorable session ({sess})")
+        return
+
     # ── #4 fill realism: the latest bar fills at the live price, not the close.
     # Stop/target are ATR offsets, so shift them by the same delta to preserve R:R.
     fill = dec.price
@@ -223,7 +247,6 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
     # UTC session bucket; entry_atr_pct = volatility at entry (= target_pct /
     # atr_target_mult, since target_pct = atr*mult/price). Lets proof_scorecard
     # break P&L down by time-of-day and vol regime once trades accumulate.
-    entry_hour = entry_dt.hour
     entry_atr_pct = (round(dec.target_pct / strat.atr_target_mult * 100.0, 3)
                      if strat.atr_target_mult else 0.0)
     state["positions"][key] = {
@@ -231,7 +254,9 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
         "entry": fill, "stop": stop, "target": target,
         "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr,
         "cot_bias": cot_bias, "entry_hour": entry_hour,
-        "entry_atr_pct": entry_atr_pct, **vp_ctx}
+        "entry_atr_pct": entry_atr_pct,
+        "entry_session": SessionEdge.session_of(entry_hour),
+        "session_verdict": sess_verdict, **vp_ctx}
     dlog.opened(base, str(bar["t"]), fill, TRADE_SIZE, stop, target, dec.rr, dec.reason)
     dlog._write("open_context", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
                                  "fill": fill, "signal_close": dec.price, **vp_ctx})

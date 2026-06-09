@@ -94,16 +94,24 @@ a specialized, high-conviction system."* The five that matter most:
    Two uses: a gate ("don't trade when ATR > X") and a sizer (position ∝ 1/volatility).
 3. **Time-of-day / session filter** — liquidity, participation, news flow are cyclical and
    predictable. Win rates measurably drop in certain windows (thin Asian session, 12–16 UTC
-   US-open chop). Log per-hour win rate, disable worst windows. — *GAP: we don't have this.*
+   US-open chop). Log per-hour win rate, disable worst windows. — *BUILT (2026-06-09):
+   `src/session_filter.py` rates Asia/EU/US sessions from the bot's OWN realised record
+   (Wilson-LB win-rate + expectancy, min-sample guarded, fail-open). Wired as a soft check
+   `_session_favorable` in `entry_checklist.py` and as a measure-first gate in
+   `swing_paper.py`; `SESSION_FILTER_HARD=1` promotes it to a hard veto.*
 4. **Liquidity / spread filter** — don't trade when spread is wide or depth thin; poor fills
-   erase edge. Gate on `spread < X bps` and `top-of-book depth > Y`. — *GAP: add explicit gate.*
+   erase edge. Gate on `spread < X bps` and `top-of-book depth > Y`. — *BUILT: `_spread_normal`
+   + `SpreadTracker` in `entry_checklist.py` (rejects spread > `SPREAD_MAX_MULT`× rolling
+   median).*
 5. **Order-flow / book-imbalance gate** — block entries when OFI is strongly against
    direction. Highest-information short-horizon filter per the research. — *We have this
    (`order_flow.py`, ±0.35) plus CVD-divergence + book-imbalance gates.*
 
 Our stack (regime → strategy → OFI → lead-lag → sentiment → higher-timeframe → K-NN
-learner) implements 4 of these 5. **Main gaps: time-of-day/session filter and an explicit
-spread/liquidity gate.**
+learner) implements **all 5** as of 2026-06-09: the time-of-day/session gate
+(`session_filter.py`) and the spread/liquidity gate (`_spread_normal`) — the two former
+gaps — are now built, joining the regime, volatility (`atr_alive`), and order-flow
+(`_ofi_aligned` / `_vpin_safe`) filters.
 
 ---
 
@@ -164,10 +172,12 @@ losses) rather than a black-box predictor.
 We're already top-decile for retail bot design (regime detection, OFI gate, lead-lag,
 learner-as-confidence-gate, Kelly sizing, loss-streak de-risk). Highest-value additions:
 
-1. **Add a time-of-day/session filter** — log per-hour win rate from the journal, disable the
-   worst windows. Cheapest edge available; we don't have it yet.
-2. **Add an explicit spread/liquidity gate** — block entries when spread > N bps or top-of-book
-   depth is thin. Strongly supported by microstructure research.
+1. ~~**Add a time-of-day/session filter**~~ — DONE (2026-06-09). `src/session_filter.py`
+   rates Asia/EU/US sessions from the realised journal + swing ledger; soft check in the
+   entry checklist + measure-first gate in `swing_paper.py`. The proof scorecard now breaks
+   P&L down "by session verdict" so the edge can be confirmed before `SESSION_FILTER_HARD=1`.
+2. ~~**Add an explicit spread/liquidity gate**~~ — DONE. `_spread_normal` + `SpreadTracker`
+   in `entry_checklist.py` veto entries when the spread blows out past its rolling median.
 3. **Lean into funding-rate arb** — most structural (durable) edge, best Sharpe profile.
    Directional scalping is the harder, more crowded game.
 4. **Verify maker-side execution** — confirm paper fills assume realistic (taker/maker) fees +

@@ -166,6 +166,7 @@ def _bucket_skip(reason: str) -> str:
     r = reason.lower()
     if "noisy tape" in r or "both directions pass" in r: return "dual_noisy"
     if "no retail shorting" in r: return "spot_short_blocked"
+    if "session" in r:    return "session"
     if "vpin" in r:       return "vpin_safe"
     if "spread" in r:     return "spread_normal"
     if "atr/px" in r or "atr_alive" in r: return "atr_alive"
@@ -360,6 +361,51 @@ def recommendations(trades: List[dict], log_stats: dict, calib: dict, kraken: di
     return recs
 
 
+# ── Section 7: proof scorecard (family-wise verdicts) ─────────────────────────
+
+def proof_status() -> List[str]:
+    """Each strategy arm's PRE-REGISTERED proof verdict, now judged against the
+    Šidák family-wise t-bar (guards against best-of-k selection bias). Read-only
+    — imports proof_scorecard and rebuilds the same arm list its main() does."""
+    try:
+        import proof_scorecard as ps
+    except Exception as e:  # pragma: no cover - defensive
+        return [f"proof_scorecard unavailable: {e}"]
+    arms = [a for a in [
+        ps._arm('Aggressive funding', 'funding_arb_state.json', executable=False, borrow_correct=True),
+        ps._arm('Majors funding', 'funding_arb_majors_state.json', executable=False, borrow_correct=False),
+        ps._arm('Kraken funding', 'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
+        ps._swing_forward(),
+        ps._tsmom_forward(),
+        ps._directional(),
+    ] if a]
+    if not arms:
+        return ["no arms with data yet"]
+    k = len(arms)
+    t_family = ps._family_t_bar(k)
+    lines = [f"family-wise bar (k={k}): clustered t&gt;{t_family:.2f}"]
+    for a in arms:
+        lines.append(f"{a['label']}: {ps._verdict(a, t_family, k)}")
+    return lines
+
+
+# ── Section 8: session / time-of-day edge ─────────────────────────────────────
+
+def session_edge_status() -> List[str]:
+    """Per-session realised win-rate / expectancy / verdict from SessionEdge."""
+    try:
+        from src.session_filter import SessionEdge, SESSIONS
+        stats = SessionEdge.from_files().session_stats()
+    except Exception as e:  # pragma: no cover - defensive
+        return [f"session edge unavailable: {e}"]
+    lines = []
+    for s in SESSIONS:
+        d = stats.get(s, {})
+        lines.append(f"{s}: n={d.get('n', 0)} win={d.get('win_rate', 0) * 100:.0f}% "
+                     f"exp=${d.get('expectancy', 0):+.4f} → {d.get('verdict', '?')}")
+    return lines
+
+
 # ── Build + send ─────────────────────────────────────────────────────────────
 
 def render_report(trades: List[dict], log_stats: dict, calib: dict, kraken: dict) -> str:
@@ -429,6 +475,16 @@ def render_report(trades: List[dict], log_stats: dict, calib: dict, kraken: dict
     # 6. Recommendations
     lines.append("\n<b>6. Recommendations</b>:")
     for r in recommendations(trades, log_stats, calib, kraken):
+        lines.append(f"  • {r}")
+
+    # 7. Proof scorecard (family-wise verdicts)
+    lines.append("\n<b>7. Proof scorecard</b>:")
+    for r in proof_status():
+        lines.append(f"  • {r}")
+
+    # 8. Session edge (time-of-day ratings)
+    lines.append("\n<b>8. Session edge</b>:")
+    for r in session_edge_status():
         lines.append(f"  • {r}")
 
     return "\n".join(lines)

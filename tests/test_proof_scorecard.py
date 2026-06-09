@@ -44,3 +44,47 @@ def test_eff_n_helper_floors_negative_icc():
     eff = ps._design_effect_eff_n(nets, clusters)
     assert eff <= len(nets) + 1e-9
     assert eff > len(nets) * 0.8               # negligible penalty
+
+
+# ── family-wise (multiple-testing) correction ────────────────────────────────
+
+def test_family_bar_k1_reproduces_original():
+    # k<=1 must return the pre-registered T_MIN exactly (no regression).
+    assert ps._family_t_bar(1) == ps.T_MIN
+    assert ps._family_t_bar(0) == ps.T_MIN
+
+
+def test_family_bar_rises_with_k():
+    # More strategies tested → stricter per-arm bar (Šidák tightening).
+    assert ps._family_t_bar(6) > ps._family_t_bar(2) > ps._family_t_bar(1)
+    assert ps._family_t_bar(2) > ps.T_MIN
+
+
+def _arm(t):
+    return dict(executable=True, n=40, expectancy=0.5, t_stat=t, t_clustered=t,
+                eff_n=40.0)
+
+
+def test_verdict_default_reproduces_proven():
+    # Default call (t_family=T_MIN, k=1): clears the single-arm bar → PROVEN ✓.
+    v = ps._verdict(_arm(2.2))
+    assert v.startswith('PROVEN ✓')
+
+
+def test_verdict_clears_single_but_not_family():
+    # t=2.2 clears T_MIN=2.0 but not a family bar of 2.5 → 'PROVEN (single)'.
+    v = ps._verdict(_arm(2.2), t_family=2.5, k=6)
+    assert v.startswith('PROVEN (single)')
+    assert 'NOT family-wise robust' in v
+    assert not v.startswith('PROVEN ✓')
+
+
+def test_verdict_clears_family_bar():
+    v = ps._verdict(_arm(3.0), t_family=2.5, k=6)
+    assert v.startswith('PROVEN ✓')
+    assert 'family-wise' in v
+
+
+def test_verdict_below_t_min_not_proven():
+    v = ps._verdict(_arm(1.5), t_family=2.5, k=6)
+    assert v.startswith('NOT PROVEN')
