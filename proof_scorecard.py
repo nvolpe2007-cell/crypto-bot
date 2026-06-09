@@ -169,6 +169,29 @@ def _swing_forward() -> dict | None:
     return dict(label='Swing (long majors, FORWARD)', executable=True, **s)
 
 
+def _tsmom_forward() -> dict | None:
+    """Trend-following ALLOCATION forward record (tsmom_paper.py). Long/cash on
+    BTC/ETH/SOL by SMA200+band — the low-turnover candidate that survives the cost
+    wall. Judged on the same pre-registered bar; entry-week clustered like swing
+    (the 3 majors co-trend, so episodes aren't fully independent bets)."""
+    path = DATA / 'tsmom_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Trend-follow BTC/ETH/SOL (FORWARD)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -267,6 +290,7 @@ def main():
         _arm('Majors funding',     'funding_arb_majors_state.json', executable=False, borrow_correct=False),
         _arm('Kraken funding',     'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
         _swing_forward(),
+        _tsmom_forward(),
         _directional(),
     ] if a]
 

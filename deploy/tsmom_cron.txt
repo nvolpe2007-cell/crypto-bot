@@ -1,0 +1,8 @@
+# Canonical trend-following forward-test cron line (source of truth).
+# Installed by deploy/setup_vps.sh. Runs daily at 00:30 UTC, after the Kraken
+# daily bar closes (00:00 UTC). tsmom_paper.py is idempotent — it only acts on a
+# newly-CLOSED daily bar, so an extra run is a no-op. Spec is fixed in the script
+# (BTC/ETH/SOL, long>SMA200 with 2% band, equal weight). See memory
+# trend-following-candidate. This is the low-turnover allocation candidate that
+# survives the 0.54% cost wall — the real-money path after directional died.
+30 0 * * * cd /opt/crypto-bot && /usr/bin/python3 tsmom_paper.py >> logs/tsmom_paper.log 2>&1

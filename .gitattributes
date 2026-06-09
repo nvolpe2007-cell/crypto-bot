@@ -5,3 +5,4 @@
 # The canonical cron line is installed verbatim into the VPS crontab — a CRLF
 # would corrupt the schedule. Force LF.
 deploy/swing_cron.txt text eol=lf
+deploy/tsmom_cron.txt text eol=lf

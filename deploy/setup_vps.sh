@@ -32,17 +32,24 @@ systemctl daemon-reload
 systemctl enable crypto-bot
 systemctl start crypto-bot
 
-# Install swing-strategy forward-test cron (idempotent: only adds if missing).
-# Canonical line lives in deploy/swing_cron.txt so a VPS rebuild restores the
-# 1h+4h+daily bands instead of silently reverting to 4h/daily.
-SWING_CRON_LINE="$(grep -v '^#' deploy/swing_cron.txt | grep swing_paper.py)"
-if ! crontab -l 2>/dev/null | grep -qF 'swing_paper.py'; then
-  ( crontab -l 2>/dev/null; echo "$SWING_CRON_LINE" ) | crontab -
-  echo "Installed swing cron: $SWING_CRON_LINE"
-else
-  echo "Swing cron already present; leaving as-is. Canonical line:"
-  echo "  $SWING_CRON_LINE"
-fi
+# Install forward-test crons (idempotent: only add if missing). Canonical lines
+# live in deploy/*_cron.txt so a VPS rebuild restores the exact schedules.
+#   swing  = 4h-majors directional forward test (note: one-year backtest is
+#            negative — see memory swing-one-year-backtest-negative).
+#   tsmom  = trend-following allocation (BTC/ETH/SOL, long>SMA200+band) — the
+#            low-turnover candidate that survives the cost wall.
+install_cron() {  # $1 = cron file, $2 = unique grep token, $3 = label
+  local line; line="$(grep -v '^#' "$1" | grep "$2")"
+  if ! crontab -l 2>/dev/null | grep -qF "$2"; then
+    ( crontab -l 2>/dev/null; echo "$line" ) | crontab -
+    echo "Installed $3 cron: $line"
+  else
+    echo "$3 cron already present; leaving as-is. Canonical line:"
+    echo "  $line"
+  fi
+}
+install_cron deploy/swing_cron.txt swing_paper.py swing
+install_cron deploy/tsmom_cron.txt tsmom_paper.py tsmom
 
 echo ""
 echo "=== Setup complete ==="
