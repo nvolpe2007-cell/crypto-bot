@@ -32,6 +32,18 @@ systemctl daemon-reload
 systemctl enable crypto-bot
 systemctl start crypto-bot
 
+# Install swing-strategy forward-test cron (idempotent: only adds if missing).
+# Canonical line lives in deploy/swing_cron.txt so a VPS rebuild restores the
+# 1h+4h+daily bands instead of silently reverting to 4h/daily.
+SWING_CRON_LINE="$(grep -v '^#' deploy/swing_cron.txt | grep swing_paper.py)"
+if ! crontab -l 2>/dev/null | grep -qF 'swing_paper.py'; then
+  ( crontab -l 2>/dev/null; echo "$SWING_CRON_LINE" ) | crontab -
+  echo "Installed swing cron: $SWING_CRON_LINE"
+else
+  echo "Swing cron already present; leaving as-is. Canonical line:"
+  echo "  $SWING_CRON_LINE"
+fi
+
 echo ""
 echo "=== Setup complete ==="
 echo "Bot status: $(systemctl is-active crypto-bot)"

@@ -1,0 +1,7 @@
+# Canonical swing-strategy forward-test cron line (source of truth).
+# Installed by deploy/setup_vps.sh. Runs hourly at :15; swing_paper.py only
+# acts on bars that have CLOSED, so hourly is enough to catch every 1h/4h/daily
+# close. SWING_INTERVALS=60,240,1440 = 1h + 4h + daily bands (1h added
+# 2026-06-08 to lift setup frequency toward 2-3/day; see memory
+# swing-frequency-1h-band). SWING_SYMBOLS unset = all 16 Kraken majors.
+15 * * * * cd /opt/crypto-bot && SWING_INTERVALS=60,240,1440 /usr/bin/python3 swing_paper.py >> logs/swing_paper.log 2>&1
