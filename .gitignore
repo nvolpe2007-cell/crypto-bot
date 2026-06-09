@@ -19,3 +19,4 @@ venv/
 # archive/: junk-drawer of removed one-off scripts, kept locally for reference
 Modelfile
 archive/
+_swing_1y.jsonl
