@@ -205,6 +205,62 @@ def _verdict(a: dict) -> str:
             f'clustered t={t:.2f} (eff_n≈{a.get("eff_n", a["n"]):.0f})')
 
 
+def _swing_attribution() -> None:
+    """P&L attribution for the swing forward record, broken down per symbol,
+    timeframe, UTC session, and volatility tercile. Attribution is how we found
+    the edge was 4h-majors-only (2026-06-08); this keeps that lens live as
+    trades accumulate. Read-only — never gates anything."""
+    path = DATA / 'swing_paper_state.json'
+    if not path.exists():
+        return
+    closed = json.loads(path.read_text()).get('closed', [])
+    if not closed:
+        print('\n' + '-' * 78)
+        print('SWING ATTRIBUTION: no closed trades yet — breakdown activates once '
+              'trades accumulate.')
+        return
+
+    def _show(title: str, keyfn) -> None:
+        groups: dict = {}
+        for p in closed:
+            try:
+                k = keyfn(p)
+            except (TypeError, ValueError, KeyError):
+                k = 'unknown'
+            if k is not None:
+                groups.setdefault(k, []).append(float(p.get('pnl', 0.0)))
+        if not groups:
+            return
+        print(f'\n  by {title}:')
+        for k in sorted(groups, key=lambda g: sum(groups[g]), reverse=True):
+            v = groups[k]
+            wins = sum(1 for x in v if x > 0)
+            print(f"    {str(k):<14} n={len(v):<3} net=${sum(v):+8.2f} "
+                  f"win={wins/len(v)*100:3.0f}% exp=${sum(v)/len(v):+.4f}")
+
+    # volatility tercile thresholds from the entry_atr_pct distribution
+    vols = sorted(float(p['entry_atr_pct']) for p in closed if 'entry_atr_pct' in p)
+    def _vol_bucket(p):
+        if not vols or 'entry_atr_pct' not in p:
+            return None
+        v = float(p['entry_atr_pct']); lo = vols[len(vols)//3]; hi = vols[2*len(vols)//3]
+        return 'low-vol' if v <= lo else ('high-vol' if v >= hi else 'mid-vol')
+    def _session(p):
+        h = p.get('entry_hour')
+        if h is None:
+            return None
+        h = int(h)
+        return ('Asia (0-7h)' if h < 8 else 'EU (8-15h)' if h < 16 else 'US (16-23h)')
+
+    print('\n' + '-' * 78)
+    print(f'SWING ATTRIBUTION  ({len(closed)} closed trades)')
+    _show('symbol', lambda p: p.get('symbol'))
+    _show('timeframe', lambda p: f"{p.get('tf')}m")
+    _show('session', _session)
+    _show('volatility', _vol_bucket)
+    _show('VP zone', lambda p: p.get('vp_zone'))
+
+
 def main():
     arms = [a for a in [
         _arm('Aggressive funding', 'funding_arb_state.json', executable=False, borrow_correct=True),
@@ -231,6 +287,8 @@ def main():
             print(f"   borrow-corrected net=${a['corrected_total']:+8.2f}  "
                   f"(unpaid-carry illusion = ${a['total'] - a['corrected_total']:+.2f})")
         print(f"   → {_verdict(a)}")
+
+    _swing_attribution()
 
     proven = [a for a in arms if _verdict(a).startswith('PROVEN')]
     print('\n' + '=' * 78)

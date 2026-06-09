@@ -180,7 +180,8 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
             # carry entry research context (VP zone + COT macro bias) onto the
             # closed record so proof_scorecard / analysis can test win-rate by
             # each signal — measure-first, before either gates a trade.
-            for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value", "cot_bias"):
+            for k in ("vp_zone", "vp_dist_poc_pct", "vp_in_value", "cot_bias",
+                      "entry_hour", "entry_atr_pct"):
                 if k in pos:
                     rec[k] = pos[k]
             state["closed"].append(rec)
@@ -218,11 +219,19 @@ def _step(key: str, base: str, tf: int, window: list[dict], bar: dict, state: di
     # ── #9 volume-profile annotation (logged, NOT acted on) ───────────────────
     vp_ctx = _vp_context(window, fill)
 
+    # Attribution tags (annotation only — never gate on these). entry_hour =
+    # UTC session bucket; entry_atr_pct = volatility at entry (= target_pct /
+    # atr_target_mult, since target_pct = atr*mult/price). Lets proof_scorecard
+    # break P&L down by time-of-day and vol regime once trades accumulate.
+    entry_hour = entry_dt.hour
+    entry_atr_pct = (round(dec.target_pct / strat.atr_target_mult * 100.0, 3)
+                     if strat.atr_target_mult else 0.0)
     state["positions"][key] = {
         "symbol": base, "tf": tf,
         "entry": fill, "stop": stop, "target": target,
         "entry_ts": str(bar["t"]), "size_usd": TRADE_SIZE, "rr": dec.rr,
-        "cot_bias": cot_bias, **vp_ctx}
+        "cot_bias": cot_bias, "entry_hour": entry_hour,
+        "entry_atr_pct": entry_atr_pct, **vp_ctx}
     dlog.opened(base, str(bar["t"]), fill, TRADE_SIZE, stop, target, dec.rr, dec.reason)
     dlog._write("open_context", {"symbol": base, "tf": tf, "ts": str(bar["t"]),
                                  "fill": fill, "signal_close": dec.price, **vp_ctx})
