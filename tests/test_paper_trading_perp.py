@@ -17,7 +17,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from src.paper_trading import PaperTrader, PaperPosition
 
-# ── Fixtures ───────────────────────────────────────────────────────────────────
+# ── Fixtures ─────────────────────────────────────────────────────────────────────────────────
 
 def _perp_trader(initial_capital: float = 1_000.0,
                  fee_pct: float = 0.26,
@@ -38,7 +38,7 @@ SYMBOL = "BTC/USD"
 PRICE  = 50_000.0
 
 
-# ── execute_buy (perp long open) ───────────────────────────────────────────────
+# ── execute_buy (perp long open) ──────────────────────────────────────────────────────────────────
 
 class TestPerpExecuteBuy:
     def test_returns_position(self):
@@ -83,7 +83,7 @@ class TestPerpExecuteBuy:
         assert pos is None
 
 
-# ── execute_sell (perp long close) ────────────────────────────────────────────
+# ── execute_sell (perp long close) ────────────────────────────────────────────────────────────────
 
 class TestPerpExecuteSell:
     def test_returns_trade(self):
@@ -125,7 +125,7 @@ class TestPerpExecuteSell:
         assert trade.pnl < 0
 
 
-# ── Perp accounting identity (long) ───────────────────────────────────────────
+# ── Perp accounting identity (long) ────────────────────────────────────────────────────────────────────────
 
 class TestPerpAccountingIdentityLong:
     """
@@ -194,7 +194,7 @@ class TestPerpAccountingIdentityLong:
         assert abs(s["total_equity"] - (5_000.0 + s["total_pnl"])) < 1e-6
 
 
-# ── Perp accounting identity (short) ──────────────────────────────────────────
+# ── Perp accounting identity (short) ─────────────────────────────────────────────────────────────────────
 
 class TestPerpAccountingIdentityShort:
     """
@@ -234,7 +234,7 @@ class TestPerpAccountingIdentityShort:
         assert abs(trade.pnl - 5.0) < 1e-6
 
 
-# ── get_account_summary with open perp position ────────────────────────────────
+# ── get_account_summary with open perp position ────────────────────────────────────────────────
 
 class TestPerpGetAccountSummaryOpen:
     """
@@ -303,7 +303,7 @@ class TestPerpGetAccountSummaryOpen:
         assert abs(s["total_equity"] - 1_000.0) < 1e-6
 
 
-# ── accrue_funding ─────────────────────────────────────────────────────────────
+# ── accrue_funding ───────────────────────────────────────────────────────────────────────────────────────
 
 class TestPerpAccrueFunding:
     def test_no_accrual_for_spot_mode(self):
@@ -371,7 +371,7 @@ class TestPerpAccrueFunding:
         assert abs(trade.pnl - (-0.01)) < 1e-9
 
 
-# ── update_unrealized_pnl includes funding_accrued for perp ───────────────────
+# ── update_unrealized_pnl includes funding_accrued for perp ─────────────────────────────────
 
 class TestPerpUnrealizedPnlIncludesFunding:
     """
@@ -480,7 +480,7 @@ class TestPerpUnrealizedPnlIncludesFunding:
         assert abs(s["total_equity"] - 1_004.98) < 1e-6
 
 
-# ── Liquidation price tracking ─────────────────────────────────────────────────
+# ── Liquidation price tracking ───────────────────────────────────────────────────────────────────────
 
 class TestPerpLiquidation:
     """
@@ -492,7 +492,7 @@ class TestPerpLiquidation:
       Short liq = entry × (1 + (1−MAINT) / leverage)
     """
 
-    # ── liquidation_price set at entry ────────────────────────────────────────
+    # ── liquidation_price set at entry ─────────────────────────────────────────────────────────────────────────────
 
     def test_long_liquidation_price_computed_on_entry(self):
         t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
@@ -513,7 +513,7 @@ class TestPerpLiquidation:
         pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
         assert pos.liquidation_price == 0.0
 
-    # ── liquidation fires via update_unrealized_pnl ───────────────────────────
+    # ── liquidation fires via update_unrealized_pnl ─────────────────────────────────────────────────────────────────────────────────────
 
     def test_long_liquidated_when_price_drops_to_liq(self):
         t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
@@ -558,7 +558,7 @@ class TestPerpLiquidation:
         assert liquidated == []
         assert SYMBOL in t.account.positions
 
-    # ── accounting after liquidation ──────────────────────────────────────────
+    # ── accounting after liquidation ─────────────────────────────────────────────────────────────────────────────────────
 
     def test_liquidated_trade_recorded_with_side_liquidation(self):
         t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
@@ -598,3 +598,105 @@ class TestPerpLiquidation:
         t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
         result = t.update_unrealized_pnl({SYMBOL: PRICE * 0.99})
         assert result == []
+
+
+# ── Liquidation price tracks funding accrual ─────────────────────────────────────────────────────
+
+class TestPerpLiquidationPriceTracksFunding:
+    """
+    accrue_funding must update pos.liquidation_price when funding costs erode
+    (or grow) the effective margin, so the liquidation boundary stays accurate.
+
+    Without the fix: liq_price is frozen at entry; a long paying heavy funding
+    can survive past its true margin-exhaustion point.
+
+    Key numbers (leverage=2, fee=0, size_usd=100, PRICE=50_000):
+      size = 0.002 BTC, margin = $50
+      initial long  liq = 50000 × (1 − 0.98/2) = 25_500
+      initial short liq = 50000 × (1 + 0.98/2) = 74_500
+      per-cycle shift at rate=0.001: Δ = (1−MAINT) × |delta| / size
+                                     = 0.98 × 0.1 / 0.002 = 49
+    """
+
+    def test_long_liq_rises_after_paying_funding(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price
+        t.set_funding_rate(SYMBOL, 0.001)
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=8))
+        assert pos.liquidation_price > initial_liq
+        assert abs(pos.liquidation_price - (initial_liq + 49.0)) < 0.001
+
+    def test_long_liq_falls_when_collecting_negative_funding(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price
+        t.set_funding_rate(SYMBOL, -0.001)  # negative → long collects, margin grows
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=8))
+        assert pos.liquidation_price < initial_liq
+        assert abs(pos.liquidation_price - (initial_liq - 49.0)) < 0.001
+
+    def test_short_liq_rises_when_collecting_funding(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price  # 74_500
+        t.set_funding_rate(SYMBOL, 0.001)   # positive → short collects
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=8))
+        assert pos.liquidation_price > initial_liq
+        assert abs(pos.liquidation_price - (initial_liq + 49.0)) < 0.001
+
+    def test_short_liq_falls_when_paying_negative_funding(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_short(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price
+        t.set_funding_rate(SYMBOL, -0.001)  # negative → short pays, margin erodes
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=8))
+        assert pos.liquidation_price < initial_liq
+
+    def test_liq_shift_scales_with_cycles(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price
+        t.set_funding_rate(SYMBOL, 0.001)
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=24))  # 3 cycles → shift = 3 × 49 = 147
+        assert abs(pos.liquidation_price - (initial_liq + 147.0)) < 0.001
+
+    def test_long_liquidates_at_funding_adjusted_price(self):
+        """
+        Price sits between original liq and funding-adjusted liq.
+        With the fix: position is liquidated. Without the fix: position survives.
+
+        Leverage=10 puts liq at 45_100; one cycle at 0.1% shifts it to ~45_149.
+        Price=45_120 is above the original boundary but below the adjusted one.
+        """
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=10.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        # liq = 50000 × (1 − 0.98/10) = 45_100; size=0.002, notional=100
+        original_liq = pos.liquidation_price
+        t.set_funding_rate(SYMBOL, 0.001)  # shift ≈ +49 per cycle
+        pos.last_funding_ts = T0
+        t.accrue_funding(T0 + timedelta(hours=8))
+        # new_liq ≈ 45_149; test price is above original liq but below new liq
+        price = original_liq + 20.0
+        assert price < pos.liquidation_price, "test precondition: price < adjusted liq"
+        liquidated = t.update_unrealized_pnl({SYMBOL: price})
+        assert SYMBOL in liquidated
+
+    def test_no_liq_adjustment_for_spot_positions(self):
+        from src.paper_trading import PaperTrader as PT
+        t = PT(initial_capital=1_000.0, fee_pct=0.0, slippage_pct=0.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        assert pos.liquidation_price == 0.0  # spot has no liq price; nothing to adjust
+
+    def test_no_liq_adjustment_without_funding_rate(self):
+        t = _perp_trader(fee_pct=0.0, slippage_pct=0.0, leverage=2.0)
+        pos = t.execute_buy(SYMBOL, PRICE, T0, size_usd=100.0)
+        initial_liq = pos.liquidation_price
+        # No set_funding_rate call → rate is None → accrue_funding is a no-op
+        t.accrue_funding(T0 + timedelta(hours=8))
+        assert pos.liquidation_price == initial_liq

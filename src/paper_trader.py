@@ -96,7 +96,7 @@ class PaperTrader:
         self._started_at: Optional[str] = None
         # Live spread cache populated by paper_trading main loop; used for realistic slippage
         self.live_spreads: Dict[str, float] = {}   # symbol → current spread in price units
-        # ── Perp mode state ───────────────────────────────────────────────────
+        # ── Perp mode state ───────────────────────────────────────────────
         self.perp_mode        = perp_mode
         self.leverage         = max(1.0, float(leverage)) if perp_mode else 1.0
         # Fee defaults match Kraken Pro lowest tier ($0–10K 30d vol): 0.40% spot
@@ -114,7 +114,7 @@ class PaperTrader:
         if perp_mode:
             logger.info(f"[PaperTrader] PERP mode ON  leverage={self.leverage:.1f}x")
 
-    # ── Perp funding helpers ──────────────────────────────────────────────────
+    # ── Perp funding helpers ──────────────────────────────────────────────
 
     def set_funding_rate(self, symbol: str, rate_8h_fraction: float) -> None:
         """Update the current 8h funding rate (as a fraction, e.g. 0.0001 = 0.01%)."""
@@ -146,6 +146,16 @@ class PaperTrader:
             delta = sign * rate * notional * cycles
             pos.funding_accrued += delta
             pos.last_funding_ts = last_ts + timedelta(hours=cycles * 8)
+            # Funding erodes (or grows) effective margin, which shifts the
+            # liquidation boundary. For longs paying funding (delta < 0), margin
+            # shrinks so liq_price rises toward entry. For shorts collecting
+            # funding (delta > 0), margin grows so liq_price also rises (moves
+            # further above entry, making liquidation harder to trigger).
+            if pos.liquidation_price > 0 and pos.size > 0:
+                if pos.side == 'buy':
+                    pos.liquidation_price -= (1.0 - _PERP_MAINT_MARGIN) * delta / pos.size
+                else:
+                    pos.liquidation_price += (1.0 - _PERP_MAINT_MARGIN) * delta / pos.size
 
     def _liquidate(self, symbol: str, liq_price: float, timestamp: datetime) -> Optional['Trade']:
         """Force-close a perp position at exactly liq_price (no additional slippage).
@@ -483,5 +493,4 @@ class PaperTrader:
         print("=" * 50)
 
 
-# ── Entry-funnel instrumentation ────────────────────────────────────────────────
-
+# ── Entry-funnel instrumentation ─────────────────────────────────────────────────────────────────────────────────
