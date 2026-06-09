@@ -23,6 +23,8 @@ from typing import Dict, Optional, Tuple
 import pandas as pd
 import pandas_ta as ta
 
+from .exchange import CircuitBreakerOpen
+
 logger = logging.getLogger(__name__)
 
 _CACHE_TTL_S = 60    # refresh 5m df at most once per minute
@@ -60,6 +62,8 @@ class MultiTimeframeFilter:
             df.set_index('timestamp', inplace=True)
             self._cache[symbol] = (time.time(), df)
             return df
+        except CircuitBreakerOpen:
+            raise
         except Exception as e:
             logger.debug(f"[MTF] fetch failed for {symbol}: {e}")
             return None

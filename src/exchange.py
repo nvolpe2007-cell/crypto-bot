@@ -300,6 +300,25 @@ class ExchangeConnection:
         logger.info(f"Fetched {len(all_data)} total candles for {symbol}")
         return all_data
 
+    async def fetch_order_book(self, symbol: str, limit: int = 20,
+                               retries: int = 3) -> Dict:
+        """Fetch order book with retry and circuit-breaker protection.
+
+        Returns {} (empty bids/asks) when all retries are exhausted.
+        CircuitBreakerOpen propagates unchanged so callers can detect outages.
+        """
+        try:
+            return await self._retry(
+                self.exchange.fetch_order_book, symbol, limit,
+                retries=retries, label=f'fetch_order_book({symbol})',
+                circuit=self._data_circuit,
+            )
+        except CircuitBreakerOpen:
+            raise
+        except Exception as exc:
+            logger.error(f"fetch_order_book({symbol}) exhausted retries: {exc}")
+            return {}
+
     async def get_ticker(self, symbol: str, retries: int = 3) -> Dict:
         """Get current ticker price with retry."""
         return await self._retry(
@@ -509,6 +528,26 @@ class KrakenFuturesConnection:
         except Exception as exc:
             logger.error(f"futures.fetch_ohlcv({perp}) exhausted retries: {exc}")
             return []
+
+    async def fetch_order_book(self, symbol: str, limit: int = 20,
+                               retries: int = 3) -> Dict:
+        """Fetch futures order book with retry and circuit-breaker protection.
+
+        Returns {} when all retries are exhausted.
+        CircuitBreakerOpen propagates unchanged.
+        """
+        perp = self.perp_symbol(symbol)
+        try:
+            return await self._retry(
+                self.exchange.fetch_order_book, perp, limit,
+                retries=retries, label=f'futures.fetch_order_book({perp})',
+                circuit=self._data_circuit,
+            )
+        except CircuitBreakerOpen:
+            raise
+        except Exception as exc:
+            logger.error(f"futures.fetch_order_book({perp}) exhausted retries: {exc}")
+            return {}
 
     async def get_ticker(self, symbol: str, retries: int = 3) -> Dict:
         """Get futures ticker with retry."""
