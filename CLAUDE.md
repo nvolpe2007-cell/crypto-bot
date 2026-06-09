@@ -65,7 +65,14 @@ ssh crypto-bot-vps "journalctl -u crypto-bot -f"             # watch live
 ## Funding-arb env knobs (no code change)
 `FUNDING_ARB_MAX_APY` (cap, 150), `FUNDING_ARB_MIN_SIZE`/`MAX_SIZE`/`MAX_TOTAL`,
 `FUNDING_ARB_COST_FRAC`, `FUNDING_ARB_ROLLUP_HOURS`, `FUNDING_ARB_NOTIFY_PER_TRADE`,
-`FUNDING_ARB_ENABLED`. **Spot-borrow carry (short-spot legs, i.e. negative-funding
+`FUNDING_ARB_ENABLED` (master switch for all arms),
+`FUNDING_ARB_AGGRESSIVE_ENABLED` (default **0** — the Binance/Bybit "aggressive"
+arm is FANTASY/not capturable for a US account and is QUARANTINED by default; set
+1 to restore it as a research baseline),
+`FUNDING_ARB_EXIT_CONFIRM_HOURS` (default **2.0** — a soft exit, funding_flipped or
+apy_decayed, must hold continuously this long before closing, so one noisy snapshot
+can't churn a position into a costly round-trip; 0 = fire on first snapshot; also a
+per-arm constructor arg `exit_confirm_hours`). **Spot-borrow carry (short-spot legs, i.e. negative-funding
 SHORT_SPOT_LONG_PERP trades — only the aggressive arm takes these):**
 `FUNDING_ARB_BORROW_APY_MAJOR` (default 10), `FUNDING_ARB_BORROW_APY_ALT` (default 50);
 set both 0 to restore the old borrow-free optimistic baseline. Without this the sim
