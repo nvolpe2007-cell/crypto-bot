@@ -55,6 +55,7 @@ from .entry_checklist import (
     build_long_checklist,
     build_short_checklist,
 )
+from .session_filter import SessionEdge
 from .task_supervisor import supervised, get_health as _get_subsystem_health
 
 logger = logging.getLogger(__name__)
@@ -413,6 +414,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     logger.info(f"[EXPECTANCY] {expectancy_gate.status()}")
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
+    # Time-of-day edge ratings from the bot's own realised record (journal +
+    # swing ledger). Loaded once at session start; UNFAVORABLE windows soft-
+    # reject in the checklist (hard with SESSION_FILTER_HARD=1). See
+    # src/session_filter.py.
+    session_edge    = SessionEdge.from_files()
     spread_tracker  = SpreadTracker()
     # VPIN toxic-flow monitor — fed by the WS v2 trade tape (taker side per
     # Kraken docs). Hooked below if trade_feed is provided.
@@ -1560,6 +1566,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         median_spread_pct=spread_tracker.median(symbol),
                         vpin=vpin_monitor.current(symbol),
                         vpin_threshold=_VPIN_THRESH,
+                        entry_hour=time.gmtime(now_ts).tm_hour,
+                        session_verdict=session_edge.verdict_for_hour(
+                            time.gmtime(now_ts).tm_hour),
                     )
                     cl_result = long_checklist.run(long_ctx)
                     if not cl_result.passed:
@@ -1693,6 +1702,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         median_spread_pct=spread_tracker.median(symbol),
                         vpin=vpin_monitor.current(symbol),
                         vpin_threshold=_VPIN_THRESH,
+                        entry_hour=time.gmtime(now_ts).tm_hour,
+                        session_verdict=session_edge.verdict_for_hour(
+                            time.gmtime(now_ts).tm_hour),
                     )
                     cl_result = short_checklist.run(short_ctx)
                     if not cl_result.passed:

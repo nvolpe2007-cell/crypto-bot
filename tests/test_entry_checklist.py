@@ -29,7 +29,7 @@ from src.entry_checklist import (
     _ws_fresh, _max_positions, _ofi_aligned, _sentiment,
     _kill_filter, _regime_short_block, _rsi_healthy, _adx_strong,
     _volume_strong, _atr_alive, _lead_lag_aligned, _funding_favorable,
-    _spread_normal, _vpin_safe, SpreadTracker, SPREAD_MAX_MULT,
+    _spread_normal, _vpin_safe, _session_favorable, SpreadTracker, SPREAD_MAX_MULT,
     _ATR_ALIVE_FLOOR,
 )
 
@@ -117,6 +117,38 @@ class TestMinConfidence:
     def test_reason_contains_values(self):
         _, reason = _min_confidence(_ctx(sig=_Sig(confidence=20.0), min_confidence=50.0))
         assert "20" in reason and "50" in reason
+
+
+# ── Session check: session_favorable ─────────────────────────────────────────
+
+class TestSessionFavorable:
+    def test_passes_when_no_verdict(self):
+        ok, _ = _session_favorable(_ctx())            # session_verdict defaults None
+        assert ok is True
+
+    def test_passes_on_favorable(self):
+        ctx = _ctx(); ctx.session_verdict = "FAVORABLE"; ctx.entry_hour = 18
+        ok, _ = _session_favorable(ctx)
+        assert ok is True
+
+    def test_passes_on_neutral(self):
+        ctx = _ctx(); ctx.session_verdict = "NEUTRAL"
+        ok, _ = _session_favorable(ctx)
+        assert ok is True
+
+    def test_fails_on_unfavorable(self):
+        ctx = _ctx(); ctx.session_verdict = "UNFAVORABLE"; ctx.entry_hour = 3
+        ok, reason = _session_favorable(ctx)
+        assert ok is False
+        assert "unfavorable" in reason.lower()
+
+    def test_in_long_checklist_as_soft_by_default(self):
+        # Default (no SESSION_FILTER_HARD) → the check is registered SOFT so it
+        # never single-handedly vetoes a setup.
+        cl = build_long_checklist()
+        sess = [c for c in cl.checks if c.name == "session_favorable"]
+        assert len(sess) == 1
+        assert sess[0].kind == "soft"
 
 
 # ── Hard check: circuit_breaker ───────────────────────────────────────────────
@@ -570,8 +602,9 @@ class TestChecklistSoftScore:
         #   volume_strong:     1.0
         #   lead_lag_aligned:  2.0
         #   funding_favorable: 1.0
-        # total weight = 8.0
-        # If only rsi (2) and volume (1) pass → hit = 3 → score = 3/8 = 0.375
+        #   session_favorable: 1.0  (PASS by default — no session verdict in ctx)
+        # total weight = 9.0
+        # rsi (2) + volume (1) + session (1) pass → hit = 4 → score = 4/9
         sig = _Sig(
             rsi=50.0,             # buy, rsi<70 → PASS (weight 2)
             adx=10.0,             # FAIL (weight 2)
@@ -581,7 +614,7 @@ class TestChecklistSoftScore:
         )
         cl = build_long_checklist()
         result = cl.run(_ctx(sig=sig))
-        assert result.score == pytest.approx(3.0 / 8.0, rel=1e-6)
+        assert result.score == pytest.approx(4.0 / 9.0, rel=1e-6)
 
     def test_soft_misses_listed_correctly(self):
         sig = _Sig(adx=5.0, lead_lag_dir="SELL")

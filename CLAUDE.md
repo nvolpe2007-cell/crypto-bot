@@ -45,7 +45,8 @@ src/bot.py                  # ScalpingBot entry; starts the paper session
 src/paper_trading.py        # THE live loop: signals, gates, execution, funding arms, funnel
 src/microstructure_strategy.py  # OFI/CVD/lead-lag confluence (dormant on REST)
 src/probability_gate.py     # edge-stacking + Kelly/tier sizing + calibration
-src/entry_checklist.py      # hard/soft entry gates (atr_alive lives here)
+src/entry_checklist.py      # hard/soft entry gates (atr_alive, spread, vpin, session live here)
+src/session_filter.py       # time-of-day edge: rates Asia/EU/US from the bot's own realised record
 src/regime_detector.py      # trending/ranging/volatile/crash classification
 src/order_flow.py / ofi_v2.py   # OFI v1 (book imbalance) / v2 (delta) — v1 feeds fast-track
 arbitrage/funding_scanner.py    # real Binance/Bybit funding → state.json
@@ -82,6 +83,25 @@ gate, default 2; 0 disables), `FUNDING_ARB_KRAKEN_MAX_FLIPS` (serial-flipper
 blacklist, default 6). Funding-history tracker (`arbitrage/funding_history.py`,
 `data/funding_history.json`) tuned via `FUNDING_HISTORY_RETENTION_DAYS`/
 `_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`. See memory `funding_arb_kraken_bleed`.
+
+## Session-filter env knobs (no code change)
+Time-of-day gate (`src/session_filter.py`): `SESSION_MIN_SAMPLES` (default 20 — below this a
+session is NEUTRAL/fail-open), `SESSION_WINRATE_FLOOR` (default 0.40 — Wilson lower-bound
+floor; a window is only UNFAVORABLE when it BOTH loses money on average AND its win-rate LB
+sits below this). `SESSION_FILTER_HARD=1` flips the gate from soft (measure-first: tag-only
+in `swing_paper.py`, down-score in `entry_checklist.py`) to a hard veto — do this only after
+the proof scorecard's "by session verdict" attribution confirms FAVORABLE windows out-earn
+UNFAVORABLE ones. The gate reads the realised record only (`data/trade_journal.csv` +
+`data/swing_paper_state.json`) — it never fabricates an edge.
+
+## Proof bar (proof_scorecard.py)
+Pre-registered bar unchanged (executable & n≥30 & expectancy>0 & correlation-adjusted t>2)
+but now **selection-bias aware**: with k arms judged at once it also requires a Šidák
+family-wise t-bar (`_family_t_bar(k)`), so "best of k strategies cleared t>2" no longer
+counts as proof. An arm clearing the single bar but not the family bar reads `PROVEN
+(single) — NOT family-wise robust`; only `PROVEN ✓` counts in the final verdict. k=1
+reproduces the original bar exactly. The weekly Telegram report (`scripts/weekly_report.py`)
+now surfaces both the per-arm verdicts (§7) and the session-edge table (§8).
 
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.

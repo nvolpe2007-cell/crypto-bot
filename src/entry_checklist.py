@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional
 
+from .session_filter import SessionEdge
+
 CheckKind = Literal["hard", "soft"]
 
 # ── Cost-aware volatility floor ──────────────────────────────────────────────
@@ -43,6 +45,12 @@ _ROUND_TRIP_COST_FRAC = float(os.getenv("ROUND_TRIP_COST_FRAC", "0.003"))  # 0.3
 # blocked every loser in that sample); 0.0 restores the legacy 0.05% floor.
 _ATR_ALIVE_COST_MULT = float(os.getenv("ATR_ALIVE_COST_MULT", "0.5"))
 _ATR_ALIVE_FLOOR = max(0.0005, _ATR_ALIVE_COST_MULT * _ROUND_TRIP_COST_FRAC)
+
+# Session/time-of-day gate. Default SOFT (down-scores an UNFAVORABLE window but
+# never single-handedly vetoes) — measure-first. Set SESSION_FILTER_HARD=1 to
+# promote it to a hard veto once the per-session sample is large enough to trust.
+_SESSION_FILTER_HARD = os.getenv("SESSION_FILTER_HARD", "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 @dataclass
@@ -79,6 +87,13 @@ class CheckContext:
     # the tape is being adversely selected and entries get knife-caught.
     vpin: Optional[float] = None
     vpin_threshold: float = 0.55
+    # Session/time-of-day guard: caller passes the UTC hour of the would-be
+    # entry and the SessionEdge verdict for that hour ("FAVORABLE"/"NEUTRAL"/
+    # "UNFAVORABLE"). The _session_favorable check soft-rejects UNFAVORABLE
+    # windows — ones where the bot has measured ITSELF losing money. Both
+    # optional so older call sites (and tests) still work; None ⇒ fail-open.
+    entry_hour: Optional[int] = None
+    session_verdict: Optional[str] = None
 
 
 @dataclass
@@ -367,6 +382,19 @@ def _lead_lag_aligned(ctx: CheckContext):
     return False, f"lead={ctx.sig.lead_lag_dir} opposes"
 
 
+def _session_favorable(ctx: CheckContext):
+    """Reject entries in a time-of-day window where the bot has measured ITSELF
+    losing money (SessionEdge UNFAVORABLE). Passes on FAVORABLE/NEUTRAL and on
+    no verdict (warm-up / fail-open). Soft by default; hard when
+    SESSION_FILTER_HARD=1. See src/session_filter.py."""
+    v = ctx.session_verdict
+    if v is None or v in ("NEUTRAL", "FAVORABLE"):
+        sess = SessionEdge.session_of(ctx.entry_hour) if ctx.entry_hour is not None else None
+        return True, (v.lower() if v else "no session data") + (f" ({sess})" if sess else "")
+    sess = SessionEdge.session_of(ctx.entry_hour)
+    return False, f"session {v.lower()}" + (f" ({sess} hour {ctx.entry_hour})" if sess else "")
+
+
 def _funding_favorable(ctx: CheckContext):
     fr = getattr(ctx.sig, "funding_rate", None)
     if fr is None:
@@ -394,6 +422,8 @@ def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("atr_alive",         "hard", _atr_alive),
         Check("spread_normal",     "hard", _spread_normal),
         Check("vpin_safe",         "hard", _vpin_safe),
+        Check("session_favorable", "hard" if _SESSION_FILTER_HARD else "soft",
+              _session_favorable, weight=1.0),
         Check("rsi_healthy",       "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",        "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",     "soft", _volume_strong,     weight=1.0),
@@ -416,6 +446,8 @@ def build_short_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("atr_alive",          "hard", _atr_alive),
         Check("spread_normal",      "hard", _spread_normal),
         Check("vpin_safe",          "hard", _vpin_safe),
+        Check("session_favorable",  "hard" if _SESSION_FILTER_HARD else "soft",
+              _session_favorable, weight=1.0),
         Check("rsi_healthy",        "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",         "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",      "soft", _volume_strong,     weight=1.0),

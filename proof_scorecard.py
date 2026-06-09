@@ -54,6 +54,23 @@ DATA = Path(__file__).parent / 'data'
 N_MIN, T_MIN = 30, 2.0
 
 
+def _family_t_bar(k: int, alpha: float = 0.05) -> float:
+    """Šidák-corrected two-sided t-bar for judging k arms simultaneously.
+
+    A per-arm t>2 read off the BEST of k strategies is far weaker evidence than
+    a single pre-registered t>2 — this is the multiple-comparisons trap, the
+    exact selection-bias / overfitting failure that blows up retail bots
+    (RESEARCH_strategies_and_filters.md §1). The Šidák correction tightens the
+    per-arm threshold so the FAMILY-wise false-positive rate stays at `alpha`:
+    per-arm alpha' = 1 - (1-alpha)^(1/k). Never returns below the pre-registered
+    T_MIN, so k<=1 reproduces the original bar exactly (no regression)."""
+    if k <= 1:
+        return T_MIN
+    alpha_family = 1.0 - (1.0 - alpha) ** (1.0 / k)
+    z = st.NormalDist().inv_cdf(1.0 - alpha_family / 2.0)
+    return max(T_MIN, z)
+
+
 def _design_effect_eff_n(nets: list[float], clusters: list) -> float:
     """Kish design effect → EFFECTIVE sample size for correlated trades.
 
@@ -210,7 +227,7 @@ def _directional() -> dict | None:
     return dict(label='Directional (long-only majors)', executable=True, **s)
 
 
-def _verdict(a: dict) -> str:
+def _verdict(a: dict, t_family: float = T_MIN, k: int = 1) -> str:
     if not a['executable']:
         return 'FANTASY (not executable on a US Kraken-spot account)'
     if a['n'] < N_MIN:
@@ -224,8 +241,16 @@ def _verdict(a: dict) -> str:
         return (f'NOT PROVEN — clustered t={t:.2f} (need >{T_MIN}; '
                 f'raw t={a["t_stat"]:.2f} but only ~{a.get("eff_n", a["n"]):.0f} '
                 f'independent bets across correlated majors)')
+    # Family-wise bar: clearing the single-arm T_MIN is NOT enough when k arms are
+    # judged at once — the best of k inflates significance. Only an arm that also
+    # clears the Šidák-corrected family bar is called PROVEN.
+    if t <= t_family:
+        return (f'PROVEN (single) — NOT family-wise robust: clustered t={t:.2f} '
+                f'< family bar {t_family:.2f} ({k} strategies tested). A CANDIDATE, '
+                f'not proof — best-of-{k} can clear a single t>2 by chance.')
     return (f'PROVEN ✓ exp={a["expectancy"]:+.4f}/trade  '
-            f'clustered t={t:.2f} (eff_n≈{a.get("eff_n", a["n"]):.0f})')
+            f'clustered t={t:.2f} (eff_n≈{a.get("eff_n", a["n"]):.0f}) — '
+            f'survives family-wise bar t>{t_family:.2f} across {k} tested')
 
 
 def _swing_attribution() -> None:
@@ -282,6 +307,13 @@ def _swing_attribution() -> None:
     _show('session', _session)
     _show('volatility', _vol_bucket)
     _show('VP zone', lambda p: p.get('vp_zone'))
+    # Did the session gate's ratings actually predict P&L? Breaks the realised
+    # record down by the SessionEdge verdict each trade was tagged with at entry.
+    # If FAVORABLE buckets out-earn UNFAVORABLE ones, the time-of-day gate has a
+    # real, measured edge and SESSION_FILTER_HARD=1 is justified. (Only populated
+    # once trades opened after the session-tagging change accumulate.)
+    if any(p.get('session_verdict') for p in closed):
+        _show('session verdict', lambda p: p.get('session_verdict'))
 
 
 def main():
@@ -294,8 +326,12 @@ def main():
         _directional(),
     ] if a]
 
+    k = len(arms)
+    t_family = _family_t_bar(k)
     print('=' * 78)
     print(f'PROOF SCORECARD  (bar: executable & n>={N_MIN} & expectancy>0 & t>{T_MIN})')
+    print(f'  family-wise bar (Šidák, {k} arms judged): clustered t must exceed '
+          f'{t_family:.2f} to be PROVEN — guards against best-of-{k} selection bias')
     print('=' * 78)
     for a in arms:
         print(f"\n▌ {a['label']}   [{'EXECUTABLE' if a['executable'] else 'FANTASY'}]")
@@ -310,11 +346,12 @@ def main():
         if 'corrected_total' in a:
             print(f"   borrow-corrected net=${a['corrected_total']:+8.2f}  "
                   f"(unpaid-carry illusion = ${a['total'] - a['corrected_total']:+.2f})")
-        print(f"   → {_verdict(a)}")
+        print(f"   → {_verdict(a, t_family, k)}")
 
     _swing_attribution()
 
-    proven = [a for a in arms if _verdict(a).startswith('PROVEN')]
+    # Only family-wise-robust arms ('PROVEN ✓') count; 'PROVEN (single)' does not.
+    proven = [a for a in arms if _verdict(a, t_family, k).startswith('PROVEN ✓')]
     print('\n' + '=' * 78)
     if proven:
         print('VERDICT: ' + ', '.join(a['label'] for a in proven) + ' cleared the bar.')
