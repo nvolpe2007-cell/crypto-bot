@@ -16,6 +16,8 @@ import time
 from collections import deque
 from typing import Dict, Optional
 
+from .exchange import CircuitBreakerOpen
+
 logger = logging.getLogger(__name__)
 
 _LEVELS       = 10
@@ -48,9 +50,13 @@ class OrderFlowImbalance:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     async def fetch(self, symbol: str) -> Optional[float]:
-        """Fetch order book and return fresh OFI. Returns None on failure."""
+        """Fetch order book and return fresh OFI. Returns None on failure.
+
+        CircuitBreakerOpen propagates to the caller so background prefetchers
+        can detect exchange outages and back off rather than hammering a closed circuit.
+        """
         try:
-            ob = await self._exchange.exchange.fetch_order_book(symbol, limit=_LEVELS)
+            ob = await self._exchange.fetch_order_book(symbol, limit=_LEVELS)
             bids = ob.get('bids', [])
             asks = ob.get('asks', [])
 
@@ -76,6 +82,8 @@ class OrderFlowImbalance:
             logger.debug(f"[OFI] {symbol}  {ofi:+.3f}  (bid {bid_vol:.4f}  ask {ask_vol:.4f})")
             return ofi
 
+        except CircuitBreakerOpen:
+            raise
         except Exception as e:
             logger.debug(f"[OFI] fetch failed for {symbol}: {e}")
             return None

@@ -38,8 +38,9 @@ SYMBOL = "BTC/USD"
 def _make_ofi(symbols=None) -> OrderFlowImbalance:
     """Return an OFI instance with a mock exchange (no inner exchange calls yet)."""
     mock_exchange = MagicMock()
-    mock_exchange.exchange = MagicMock()
-    mock_exchange.exchange.fetch_order_book = AsyncMock(return_value={
+    # OFI now calls the wrapped fetch_order_book() method (with circuit-breaker
+    # protection) rather than the raw ccxt exchange attribute directly.
+    mock_exchange.fetch_order_book = AsyncMock(return_value={
         "bids": [[50000.0, 1.0]],
         "asks": [[50010.0, 1.0]],
     })
@@ -93,7 +94,7 @@ class TestOFIFetch:
     async def test_ofi_math_all_bids(self):
         """All bids, no asks → OFI = +1.0."""
         ofi = _make_ofi()
-        ofi._exchange.exchange.fetch_order_book = AsyncMock(return_value={
+        ofi._exchange.fetch_order_book = AsyncMock(return_value={
             "bids": [[50000.0, 2.0]],
             "asks": [],
         })
@@ -103,7 +104,7 @@ class TestOFIFetch:
     async def test_ofi_math_all_asks(self):
         """All asks, no bids → OFI = -1.0."""
         ofi = _make_ofi()
-        ofi._exchange.exchange.fetch_order_book = AsyncMock(return_value={
+        ofi._exchange.fetch_order_book = AsyncMock(return_value={
             "bids": [],
             "asks": [[50010.0, 3.0]],
         })
@@ -113,7 +114,7 @@ class TestOFIFetch:
     async def test_zero_total_volume_returns_none(self):
         """Empty order book → should return None, not crash."""
         ofi = _make_ofi()
-        ofi._exchange.exchange.fetch_order_book = AsyncMock(return_value={
+        ofi._exchange.fetch_order_book = AsyncMock(return_value={
             "bids": [], "asks": [],
         })
         result = await ofi.fetch(SYMBOL)
@@ -121,7 +122,7 @@ class TestOFIFetch:
 
     async def test_exchange_error_returns_none(self):
         ofi = _make_ofi()
-        ofi._exchange.exchange.fetch_order_book = AsyncMock(
+        ofi._exchange.fetch_order_book = AsyncMock(
             side_effect=Exception("network error")
         )
         result = await ofi.fetch(SYMBOL)

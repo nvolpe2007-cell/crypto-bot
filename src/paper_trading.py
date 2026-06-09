@@ -831,10 +831,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _ofi_prefetcher():
         consecutive_failures = 0
         while trader.running:
+            circuit_paused = False
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
                     consecutive_failures = 0
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[OFI] Exchange circuit breaker open — pausing prefetcher "
+                        f"{wait:.0f}s (symbol={sym})"
+                    )
+                    await asyncio.sleep(wait)
+                    circuit_paused = True
+                    break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
                     consecutive_failures += 1
                     logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
@@ -845,7 +855,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"trading without live order flow data"
                         )
                 await asyncio.sleep(2)
-            await asyncio.sleep(20)   # full cycle every ~26s
+            if not circuit_paused:
+                await asyncio.sleep(20)   # full cycle every ~26s
 
     asyncio.create_task(supervised('ofi_prefetcher', _ofi_prefetcher, notifier=notifier))
 
@@ -853,10 +864,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _htf_fetcher():
         consecutive_failures = 0
         while trader.running:
+            circuit_paused = False
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
                     consecutive_failures = 0
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[HTF] Exchange circuit breaker open — pausing prefetcher "
+                        f"{wait:.0f}s (symbol={sym})"
+                    )
+                    await asyncio.sleep(wait)
+                    circuit_paused = True
+                    break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
                     consecutive_failures += 1
                     logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
@@ -867,7 +888,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"multi-timeframe alignment unavailable"
                         )
                 await asyncio.sleep(3)
-            await asyncio.sleep(45)   # full cycle every ~54s
+            if not circuit_paused:
+                await asyncio.sleep(45)   # full cycle every ~54s
 
     asyncio.create_task(supervised('htf_fetcher', _htf_fetcher, notifier=notifier))
 
@@ -1248,7 +1270,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     if book_feed is not None and book_feed.staleness(symbol) < 3.0:
                         bids_raw, asks_raw = book_feed.get_top(symbol, depth=10)
                     if not (bids_raw and asks_raw):
-                        ob = await ofi_calc._exchange.exchange.fetch_order_book(symbol, limit=20)
+                        ob = await ofi_calc._exchange.fetch_order_book(symbol, limit=20)
                         if ob:
                             bids_raw = ob.get('bids', [])
                             asks_raw = ob.get('asks', [])

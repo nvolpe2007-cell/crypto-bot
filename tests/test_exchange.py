@@ -212,6 +212,64 @@ class TestFetchOhlcv:
         )
 
 
+# ── fetch_order_book ────────────────────────────────────────────────────────────────────
+
+class TestFetchOrderBook:
+    BOOK = {'bids': [[50000.0, 1.0], [49990.0, 2.0]], 'asks': [[50010.0, 1.0], [50020.0, 2.0]]}
+
+    async def test_returns_book_on_success(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order_book = AsyncMock(return_value=self.BOOK)
+        result = await conn.fetch_order_book('BTC/USD')
+        assert result == self.BOOK
+
+    async def test_passes_symbol_and_limit(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order_book = AsyncMock(return_value=self.BOOK)
+        await conn.fetch_order_book('ETH/USD', limit=10)
+        conn.exchange.fetch_order_book.assert_called_once_with('ETH/USD', 10)
+
+    async def test_returns_empty_dict_after_all_retries_fail(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order_book = AsyncMock(
+            side_effect=ccxt.NetworkError("down")
+        )
+        result = await conn.fetch_order_book('BTC/USD', retries=2)
+        assert result == {}
+        assert conn.exchange.fetch_order_book.call_count == 2
+
+    async def test_retries_on_network_error_then_succeeds(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order_book = AsyncMock(
+            side_effect=[ccxt.NetworkError("blip"), self.BOOK]
+        )
+        result = await conn.fetch_order_book('BTC/USD', retries=3)
+        assert result == self.BOOK
+        assert conn.exchange.fetch_order_book.call_count == 2
+
+    async def test_propagates_circuit_breaker_open(self):
+        """CircuitBreakerOpen must not be swallowed — callers use it to detect outages."""
+        conn = _make_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_order_book = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        # Trip the circuit (1 failure = threshold)
+        conn._data_circuit.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.fetch_order_book('BTC/USD')
+        # The underlying exchange must NOT have been called (CB short-circuits)
+        conn.exchange.fetch_order_book.assert_not_called()
+
+    async def test_non_retryable_error_returns_empty_dict(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order_book = AsyncMock(
+            side_effect=ccxt.ExchangeError("symbol not found")
+        )
+        result = await conn.fetch_order_book('FAKE/USD', retries=2)
+        assert result == {}
+
+
 # ── get_ticker ─────────────────────────────────────────────────────────────────────────
 
 class TestGetTicker:
