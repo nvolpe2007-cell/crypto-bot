@@ -581,6 +581,99 @@ class TestSendMessage:
         assert result is False
 
 
+# ── TelegramNotifier.send_message — 429 rate limit ─────────────────────────────
+
+def _resp(status_code, json_data=None):
+    r = MagicMock()
+    r.status_code = status_code
+    r.json = MagicMock(return_value=json_data or {})
+    r.text = ""
+    r.raise_for_status = MagicMock()
+    return r
+
+
+class TestSendMessageRateLimit:
+    def test_429_retries_and_succeeds(self):
+        notifier = _enabled()
+        rate_limited = _resp(429, {"parameters": {"retry_after": 2}})
+        ok = _resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]) as mock_post, \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is True
+        assert mock_post.call_count == 2
+        mock_sleep.assert_called_once_with(2.0)
+        ok.raise_for_status.assert_called_once()
+
+    def test_429_retry_after_is_capped(self):
+        notifier = _enabled()
+        rate_limited = _resp(429, {"parameters": {"retry_after": 120}})
+        ok = _resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            notifier.send_message("hello")
+        from src.notifications import _MAX_RETRY_AFTER
+        mock_sleep.assert_called_once_with(_MAX_RETRY_AFTER)
+
+    def test_429_missing_retry_after_defaults_to_one_second(self):
+        notifier = _enabled()
+        rate_limited = _resp(429, {})
+        ok = _resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            notifier.send_message("hello")
+        mock_sleep.assert_called_once_with(1.0)
+
+    def test_429_unparseable_body_defaults_to_one_second(self):
+        notifier = _enabled()
+        rate_limited = _resp(429)
+        rate_limited.json.side_effect = ValueError("not json")
+        ok = _resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            notifier.send_message("hello")
+        mock_sleep.assert_called_once_with(1.0)
+
+    def test_429_retry_still_failing_returns_false(self):
+        notifier = _enabled()
+        rate_limited = _resp(429, {"parameters": {"retry_after": 1}})
+        still_failing = _resp(429, {"parameters": {"retry_after": 1}})
+        still_failing.raise_for_status.side_effect = Exception("429 Too Many Requests")
+        with patch("requests.post", side_effect=[rate_limited, still_failing]), \
+                patch("src.notifications.time.sleep"):
+            result = notifier.send_message("hello")
+        assert result is False
+
+    def test_no_sleep_when_not_rate_limited(self):
+        notifier = _enabled()
+        ok = _resp(200)
+        with patch("requests.post", return_value=ok), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is True
+        mock_sleep.assert_not_called()
+
+
+# ── _retry_after_seconds ─────────────────────────────────────────────────────
+
+class TestRetryAfterSeconds:
+    def test_reads_retry_after_from_parameters(self):
+        from src.notifications import _retry_after_seconds
+        assert _retry_after_seconds(_resp(429, {"parameters": {"retry_after": 5}})) == 5.0
+
+    def test_caps_large_values(self):
+        from src.notifications import _retry_after_seconds, _MAX_RETRY_AFTER
+        assert _retry_after_seconds(_resp(429, {"parameters": {"retry_after": 999}})) == _MAX_RETRY_AFTER
+
+    def test_floors_negative_values_at_zero(self):
+        from src.notifications import _retry_after_seconds
+        assert _retry_after_seconds(_resp(429, {"parameters": {"retry_after": -5}})) == 0.0
+
+    def test_defaults_when_missing(self):
+        from src.notifications import _retry_after_seconds
+        assert _retry_after_seconds(_resp(429, {})) == 1.0
+
+
 # ── send_trade_alert ──────────────────────────────────────────────────────────
 
 class TestSendTradeAlert:

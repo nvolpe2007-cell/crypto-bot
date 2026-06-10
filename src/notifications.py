@@ -4,11 +4,32 @@ Telegram Notifications — plain-English trade alerts.
 
 import html
 import logging
+import time
 import requests
 from typing import Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# Telegram's 429 retry_after can occasionally be large (tens of seconds) under
+# heavy global load. send_message() is called synchronously from the bot's
+# async loop, so cap how long a single call will block waiting it out — past
+# this we'd rather drop the message than stall trading.
+_MAX_RETRY_AFTER = 10.0
+
+
+def _retry_after_seconds(response) -> float:
+    """Extract Telegram's `retry_after` (seconds) from a 429 response body.
+
+    Falls back to 1s if the body is missing/unparseable, and caps at
+    _MAX_RETRY_AFTER so a large server-side value can't block the caller
+    for too long.
+    """
+    try:
+        retry_after = float(response.json().get("parameters", {}).get("retry_after", 1))
+    except Exception:
+        retry_after = 1.0
+    return min(max(retry_after, 0.0), _MAX_RETRY_AFTER)
 
 
 def _esc(text) -> str:
@@ -172,6 +193,19 @@ class TelegramNotifier:
                 response = requests.post(
                     f"{self.base_url}/sendMessage",
                     json={"chat_id": self.chat_id, "text": message},
+                    timeout=10,
+                )
+            # 429 = Too Many Requests. Telegram tells us how long to back off via
+            # `parameters.retry_after`. Wait it out (capped) and retry once rather
+            # than dropping the alert outright — losing a circuit-breaker halt or
+            # crash notice silently is worse than a few seconds of latency.
+            if response.status_code == 429:
+                wait = _retry_after_seconds(response)
+                logger.warning(f"Telegram 429 rate-limited — retrying after {wait:.1f}s")
+                time.sleep(wait)
+                response = requests.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message, "parse_mode": parse_mode},
                     timeout=10,
                 )
             response.raise_for_status()
