@@ -16,7 +16,10 @@ Covers:
 - KrakenPerpsExecutor._amount_from_usd: size_usd / price; price=0 guard
 - KrakenSpotExecutor: supports_shorts returns False
 - KrakenSpotExecutor: open_short/close_short return error OrderResult (not raise)
-- KrakenSpotExecutor: open_long/close_long raise NotImplementedError (stub)
+- KrakenSpotExecutor: open_long/close_long place market orders, track _open_size,
+  extract filled_price/fee from ccxt response, zero-amount/no-position guards,
+  and exchange-exception → error OrderResult (with balance-based ghost-position
+  recovery on open_long)
 - make_executor: paper mode returns PaperExecutor; spot mode returns KrakenSpotExecutor;
   perps mode returns KrakenPerpsExecutor; missing client raises ValueError;
   unknown mode raises ValueError
@@ -510,15 +513,116 @@ class TestKrakenSpotExecutor:
         assert result.success is False
         assert result.error is not None
 
-    def test_open_long_raises_not_implemented(self):
-        ex = KrakenSpotExecutor(MagicMock())
-        with pytest.raises(NotImplementedError):
-            ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+    def test_open_long_places_buy_market_order(self):
+        client = _mock_ccxt()
+        ex = KrakenSpotExecutor(client)
+        ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        client.create_order.assert_called_once()
+        args, kwargs = client.create_order.call_args
+        assert args[0] == "BTC/USD"
+        assert kwargs["side"] == "buy"
+        assert kwargs["type"] == "market"
 
-    def test_close_long_raises_not_implemented(self):
-        ex = KrakenSpotExecutor(MagicMock())
-        with pytest.raises(NotImplementedError):
-            ex.close_long("BTC/USD", 51_000.0, NOW)
+    def test_open_long_success_result(self):
+        client = _mock_ccxt(order_id="x1", average=50_100.0, filled=0.002, fee_cost=1.5)
+        ex = KrakenSpotExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is True
+        assert result.order_id == "x1"
+        assert result.filled_price == pytest.approx(50_100.0)
+        assert result.filled_size == pytest.approx(0.002)
+        assert result.fee == pytest.approx(1.5)
+        assert result.is_leveraged is False
+
+    def test_open_long_tracks_size(self):
+        client = _mock_ccxt(filled=0.002)
+        ex = KrakenSpotExecutor(client)
+        ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert ex._open_size.get("BTC/USD", 0.0) == pytest.approx(0.002)
+
+    def test_open_long_accumulates_size_on_second_call(self):
+        client = _mock_ccxt(filled=0.001)
+        ex = KrakenSpotExecutor(client)
+        ex.open_long("BTC/USD", 50_000.0, 50.0, NOW)
+        ex.open_long("BTC/USD", 50_000.0, 50.0, NOW)
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.002)
+
+    def test_open_long_zero_amount_returns_error(self):
+        client = _mock_ccxt()
+        ex = KrakenSpotExecutor(client)
+        result = ex.open_long("BTC/USD", 0.0, 100.0, NOW)
+        assert result.success is False
+        client.create_order.assert_not_called()
+
+    def test_open_long_exchange_exception_returns_error(self):
+        client = MagicMock()
+        client.create_order.side_effect = RuntimeError("network blip")
+        client.fetch_balance.return_value = {"free": {"BTC": 0.0}}
+        ex = KrakenSpotExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is False
+        assert "network blip" in (result.error or "")
+
+    def test_open_long_recovers_when_balance_found_after_exception(self):
+        client = MagicMock()
+        client.create_order.side_effect = RuntimeError("timeout")
+        client.fetch_balance.return_value = {"free": {"BTC": 0.002}}
+        ex = KrakenSpotExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is True
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.002)
+
+    def test_open_long_does_not_recover_when_balance_query_fails(self):
+        client = MagicMock()
+        client.create_order.side_effect = RuntimeError("timeout")
+        client.fetch_balance.side_effect = RuntimeError("balance query failed")
+        ex = KrakenSpotExecutor(client)
+        result = ex.open_long("BTC/USD", 50_000.0, 100.0, NOW)
+        assert result.success is False
+
+    def test_close_long_places_sell_market_order(self):
+        client = _mock_ccxt(filled=0.002)
+        ex = KrakenSpotExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        ex.close_long("BTC/USD", 51_000.0, NOW)
+        client.create_order.assert_called_once()
+        args, kwargs = client.create_order.call_args
+        assert args[0] == "BTC/USD"
+        assert kwargs["side"] == "sell"
+        assert kwargs["type"] == "market"
+
+    def test_close_long_success_result(self):
+        client = _mock_ccxt(order_id="cl-1", average=51_000.0)
+        ex = KrakenSpotExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        result = ex.close_long("BTC/USD", 51_000.0, NOW, reason="TAKE_PROFIT")
+        assert result.success is True
+        assert result.filled_price == pytest.approx(51_000.0)
+        assert result.filled_size == pytest.approx(0.002)
+
+    def test_close_long_resets_open_size_to_zero(self):
+        client = _mock_ccxt()
+        ex = KrakenSpotExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.0)
+
+    def test_close_long_no_position_returns_error(self):
+        client = _mock_ccxt()
+        ex = KrakenSpotExecutor(client)
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
+        assert "no long" in (result.error or "").lower()
+        client.create_order.assert_not_called()
+
+    def test_close_long_exchange_exception_returns_error(self):
+        client = MagicMock()
+        client.create_order.side_effect = RuntimeError("network blip")
+        ex = KrakenSpotExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
+        assert "network blip" in (result.error or "")
 
 
 # ── make_executor factory ─────────────────────────────────────────────────────

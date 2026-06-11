@@ -8,8 +8,10 @@ perpetuals path can be slotted in without touching strategy code.
 
 Three implementations:
   - PaperExecutor      : in-process simulation (delegates to PaperTrader)
-  - KrakenSpotExecutor : real Kraken spot via ccxt (stub — wire when going live)
-  - KrakenPerpsExecutor: Kraken Futures perpetuals (stub — wire when going live)
+  - KrakenSpotExecutor : real Kraken spot via ccxt (implemented, not yet wired
+                          into LiveTrader)
+  - KrakenPerpsExecutor: Kraken Futures perpetuals (implemented, not yet wired
+                          into LiveTrader)
 
 Select via TRADING_MODE env var: paper | spot | perps
 """
@@ -100,36 +102,95 @@ class PaperExecutor(Executor):
                            filled_price=price, filled_size=0, fee=0.0)
 
 
-# ── Kraken spot live (stub) ────────────────────────────────────────────────
+# ── Kraken spot live ──────────────────────────────────────────────────────
 
 class KrakenSpotExecutor(Executor):
     """
     Live Kraken spot via ccxt.
-    NOT WIRED — populate when ready to go live. Shorts on Kraken spot
-    require margin, which is a separate codepath; default to no shorts.
+    NOT WIRED into LiveTrader yet — this class is ready to slot in when going
+    live. Shorts on Kraken spot require margin, which is a separate codepath;
+    default to no shorts.
     """
     name = "kraken-spot"
 
     def __init__(self, ccxt_client):
         self.client = ccxt_client
+        # Track open position size (base-asset units) per symbol so close_long
+        # can size correctly without re-querying the exchange on every call.
+        self._open_size: Dict[str, float] = {}
 
     def supports_shorts(self) -> bool:
         return False  # Kraken spot doesn't support shorts without margin
 
+    def _amount_from_usd(self, price: float, size_usd: float) -> float:
+        """Number of base-asset units to trade for the requested USD notional."""
+        if price <= 0:
+            return 0.0
+        return size_usd / price
+
+    def _free_balance(self, symbol: str) -> Optional[float]:
+        """
+        Query the exchange for the free balance of symbol's base asset.
+        Returns None on failure. Used as a ghost-position guard after a
+        network exception during open_long: if the order actually filled
+        despite the error, the balance will reflect it.
+        """
+        try:
+            balance = self.client.fetch_balance()
+            base = symbol.split("/")[0]
+            free = (balance.get("free") or {}).get(base)
+            return float(free) if free is not None else 0.0
+        except Exception as e:
+            logger.warning(f"[SPOT-LIVE] fetch_balance failed for {symbol}: {e}")
+            return None
+
     def open_long(self, symbol, price, size_usd, timestamp, **kw):
-        raise NotImplementedError("KrakenSpotExecutor: wire up when going live")
+        amount = self._amount_from_usd(price, size_usd)
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="zero amount")
+        try:
+            order = self.client.create_order(symbol, type="market", side="buy", amount=amount)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            filled_size  = float(order.get("filled") or amount)
+            fee          = float((order.get("fee") or {}).get("cost", 0.0))
+            self._open_size[symbol] = self._open_size.get(symbol, 0.0) + filled_size
+            logger.info(f"[SPOT-LIVE] BUY {symbol} {filled_size:.6f} @ ${filled_price:.2f}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price, filled_size, fee)
+        except Exception as e:
+            logger.error(f"[SPOT-LIVE] open_long failed: {e}")
+            free = self._free_balance(symbol)
+            if free is not None and free > 0:
+                logger.warning(
+                    f"[SPOT-LIVE] open_long timed out but {symbol} balance found "
+                    f"({free:.6f}); updating local state to avoid ghost position."
+                )
+                self._open_size[symbol] = free
+                return OrderResult(True, None, price, free, 0.0)
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def open_short(self, *a, **kw):
         return OrderResult(False, None, 0, 0, 0, error="spot doesn't support shorts")
 
     def close_long(self, symbol, price, timestamp, reason=""):
-        raise NotImplementedError
+        amount = self._open_size.get(symbol, 0.0)
+        if amount <= 0:
+            return OrderResult(False, None, 0, 0, 0, error="no long position")
+        try:
+            order = self.client.create_order(symbol, type="market", side="sell", amount=amount)
+            filled_price = float(order.get("average") or order.get("price") or price)
+            fee = float((order.get("fee") or {}).get("cost", 0.0))
+            self._open_size[symbol] = 0.0
+            logger.info(f"[SPOT-LIVE] SELL {symbol} {amount:.6f} @ ${filled_price:.2f}  {reason}")
+            return OrderResult(True, str(order.get("id") or ""), filled_price, amount, fee)
+        except Exception as e:
+            logger.error(f"[SPOT-LIVE] close_long failed: {e}")
+            return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_short(self, *a, **kw):
         return OrderResult(False, None, 0, 0, 0, error="spot doesn't support shorts")
 
 
-# ── Kraken perpetuals (stub — what the user asked for) ─────────────────────
+# ── Kraken perpetuals ──────────────────────────────────────────────────────
 
 class KrakenPerpsExecutor(Executor):
     """
