@@ -314,6 +314,29 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
         prob_model_version = int(getattr(pos, 'prob_model_version', 0)) if pos else 0,
     )
     journal.add(record)
+    # Mirror into the cross-arm attribution ledger (best-effort; never break flow).
+    try:
+        from .attribution import record as _attrib_record, ARM_DIRECTIONAL
+        _attrib_record(
+            ARM_DIRECTIONAL, symbol,
+            side=direction,
+            fill_price=entry_price_actual,
+            size_usd=getattr(pos, 'size_usd_target', 0.0) if pos else 0.0,
+            fees_paid=fees_paid,
+            slippage_cost=0.0,   # paper fills at reference; real slippage lands with the maker/live executor
+            net_pnl=trade.pnl,   # paper_trader pnl is already net of fees (paper_trader.py:267)
+            reason=reason,
+            signal={
+                'confidence': float(sig.confidence) if sig else 0.0,
+                'entry_path': getattr(pos, 'entry_path', 'main') if pos else 'main',
+                'ofi': float(sig.ofi or 0.0) if sig else 0.0,
+                'regime': regime,
+            },
+            opened_at=record.opened_at,
+            closed_at=record.closed_at,
+        )
+    except Exception:
+        pass
     return record
 
 
@@ -452,6 +475,19 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         opps = _triarb_scanner.scan_once()
                         if opps:
                             logger.info(_triarb_scanner.format_log(opps))
+                            try:
+                                from .attribution import record as _attrib_record, ARM_TRIARB
+                                for _o in opps:
+                                    _attrib_record(
+                                        ARM_TRIARB, _o.cycle.label, side='cycle',
+                                        size_usd=_o.final_usd - _o.profit_usd,  # notional in
+                                        gross_pnl=_o.profit_usd,  # edge is already net of leg fees
+                                        fees_paid=0.0, slippage_cost=0.0,
+                                        net_pnl=_o.profit_usd, reason='triarb_cycle',
+                                        meta={'edge_bps': round(_o.edge_bps, 3)},
+                                    )
+                            except Exception:
+                                pass
                     except Exception as e:
                         logger.debug(f"[TRIARB] scan failed: {e}")
             _triarb_task = asyncio.create_task(supervised('triarb', _triarb_loop, notifier=notifier))
@@ -748,6 +784,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         best_trade=best,
                         worst_trade=worst,
                     )
+                # Cross-arm attribution scorecard for the day that just ended —
+                # gross edge vs fee/slippage drag vs net, per arm (all arms in one
+                # place; the per-arm Telegram rollups stay, this unifies them).
+                try:
+                    from .attribution import get_ledger, format_scorecard
+                    ended = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+                    sc = get_ledger().daily_scorecard(ended)
+                    if notifier and sc['total']['n'] > 0:
+                        notifier.send_message(format_scorecard(sc))
+                except Exception as e:
+                    logger.debug(f"[ATTRIB] daily scorecard send failed: {e}")
                 day_start_equity = s['total_equity']   # reset for next day
             except asyncio.CancelledError:
                 raise

@@ -201,6 +201,17 @@ class PaperPosition:
         return self.funding_collected - self.entry_cost - self.borrow_cost
 
 
+def _arm_id(label: str) -> str:
+    """Map a FundingArbPaperSim.label to its canonical attribution-ledger arm id
+    (src/attribution.py). Keeps the cross-arm scorecard spelling consistent."""
+    l = (label or "").lower()
+    if "kraken" in l:
+        return "funding_kraken"
+    if "major" in l:
+        return "funding_majors"
+    return "funding_aggr"
+
+
 class FundingArbPaperSim:
     """Paper-trades funding arb based on a live FundingScanner feed."""
 
@@ -415,6 +426,32 @@ class FundingArbPaperSim:
                     f"(funding ${pos.funding_collected:.4f} − cost ${pos.entry_cost:.2f})\n"
                     f"{pos.cycles_collected} funding cycles · {reason}"
                 )
+                # Cross-arm attribution ledger (best-effort; never break the arm).
+                # gross = gross funding captured; fees = transaction + borrow carry,
+                # so net == pos.net_pnl exactly. Split kept in meta for drill-down.
+                try:
+                    from src.attribution import record as _attrib_record
+                    _attrib_record(
+                        _arm_id(self.label), pos.symbol,
+                        side=pos.direction,
+                        size_usd=pos.size_usd,
+                        gross_pnl=pos.funding_collected,
+                        fees_paid=pos.entry_cost + pos.borrow_cost,
+                        slippage_cost=0.0,
+                        net_pnl=pos.net_pnl,
+                        reason=reason,
+                        signal={'entry_apy': pos.entry_apy,
+                                'entry_rate_8h': pos.entry_rate_8h},
+                        meta={'exchange': pos.exchange, 'direction': pos.direction,
+                              'entry_cost': round(pos.entry_cost, 6),
+                              'borrow_cost': round(pos.borrow_cost, 6),
+                              'funding_collected': round(pos.funding_collected, 6),
+                              'cycles': pos.cycles_collected},
+                        opened_at=pos.entry_time_iso,
+                        closed_at=pos.close_time_iso,
+                    )
+                except Exception:
+                    pass
 
         # 2. Look for new entries
         if len(self.open_positions) < self.max_positions:
