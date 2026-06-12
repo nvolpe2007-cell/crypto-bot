@@ -59,11 +59,16 @@ def _bucket_size_for(symbol: str) -> float:
 @dataclass
 class _SymbolState:
     bucket_volume: float
+    window:   int = N_BUCKETS   # rolling window size for `closed`
     buy_acc:  float = 0.0       # accumulating buy qty in the open bucket
     sell_acc: float = 0.0       # accumulating sell qty in the open bucket
-    closed:   Deque = field(default_factory=lambda: deque(maxlen=N_BUCKETS))
+    closed:   Deque = field(default_factory=deque)
     last_vpin: Optional[float] = None
     n_trades: int = 0
+
+    def __post_init__(self) -> None:
+        # default_factory above can't see `window`, so size the deque here.
+        self.closed = deque(self.closed, maxlen=self.window)
 
 
 class VPINMonitor:
@@ -97,7 +102,7 @@ class VPINMonitor:
 
         st = self._state.get(sym)
         if st is None:
-            st = _SymbolState(bucket_volume=_bucket_size_for(sym))
+            st = _SymbolState(bucket_volume=_bucket_size_for(sym), window=self.window)
             self._state[sym] = st
 
         st.n_trades += 1
