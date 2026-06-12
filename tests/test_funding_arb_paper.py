@@ -356,9 +356,13 @@ def _open_pos(entry_apy: float = 40.0,
     )
 
 
-def _sim_for_exit(tmp_path, monkeypatch) -> FundingArbPaperSim:
+def _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=0.0) -> FundingArbPaperSim:
+    # Default exit_confirm_hours=0 here so the condition-detection tests below
+    # observe the soft exit immediately; the confirmation WINDOW itself is
+    # exercised in TestExitConfirmation with an explicit non-zero value.
     monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
-    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None)
+    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                              exit_confirm_hours=exit_confirm_hours)
 
 
 class TestShouldExit:
@@ -570,6 +574,130 @@ class TestShouldExit:
         assert pos2.last_seen_iso is not None
 
 
+# ── _should_exit — exit-confirmation window (anti-churn) ─────────────────────
+
+class TestExitConfirmation:
+    """The SOFT exits (funding_flipped / apy_decayed) must hold continuously for
+    exit_confirm_hours before closing, so one noisy snapshot can't force a costly
+    round-trip. Hard exits (max_hold / off_scanner_24h) are unaffected."""
+
+    def test_single_flip_snapshot_does_not_close(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        pos = _open_pos(entry_apy=40.0)
+        now = datetime.now(timezone.utc)
+        # One flipped snapshot: pending armed, but NOT closed.
+        assert sim._should_exit(pos, _opp("BTCUSDT", -10.0), now) is None
+        assert pos.pending_exit_reason == "funding_flipped"
+        assert pos.pending_exit_since_iso is not None
+
+    def test_sustained_flip_closes_after_window(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        pos = _open_pos(entry_apy=40.0)
+        now = datetime.now(timezone.utc)
+        flip = _opp("BTCUSDT", -10.0)
+        sim._should_exit(pos, flip, now)                       # arm pending
+        # Still inside the window → hold.
+        assert sim._should_exit(pos, flip, now + timedelta(hours=1.9)) is None
+        # Past the window → close.
+        assert sim._should_exit(pos, flip, now + timedelta(hours=2.1)) == "funding_flipped"
+
+    def test_sustained_decay_closes_after_window(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        pos = _open_pos(entry_apy=40.0)
+        now = datetime.now(timezone.utc)
+        decayed = _opp("BTCUSDT", 15.0)                        # < 40*0.40=16 → decay
+        assert sim._should_exit(pos, decayed, now) is None
+        assert pos.pending_exit_reason.startswith("apy_decayed")
+        reason = sim._should_exit(pos, decayed, now + timedelta(hours=2.5))
+        assert reason is not None and reason.startswith("apy_decayed")
+
+    def test_recovery_within_window_clears_pending(self, tmp_path, monkeypatch):
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        pos = _open_pos(entry_apy=40.0)
+        now = datetime.now(timezone.utc)
+        sim._should_exit(pos, _opp("BTCUSDT", 15.0), now)      # arm decay pending
+        assert pos.pending_exit_since_iso is not None
+        # Funding recovers above the threshold → pending cleared, no close.
+        assert sim._should_exit(pos, _opp("BTCUSDT", 40.0), now + timedelta(hours=1)) is None
+        assert pos.pending_exit_reason is None
+        assert pos.pending_exit_since_iso is None
+        # A later fresh flip must restart the clock (not inherit the old one).
+        assert sim._should_exit(pos, _opp("BTCUSDT", -5.0), now + timedelta(hours=2)) is None
+
+    def test_off_scanner_preserves_pending_window(self, tmp_path, monkeypatch):
+        # Absence isn't recovery: while off-scanner the pending state is kept (not
+        # cleared) and the elapsed gap still counts toward the window — but the
+        # soft exit can only FIRE once data returns and re-confirms the condition.
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        pos = _open_pos(entry_apy=40.0, last_seen_hours_ago=0.0)
+        now = datetime.now(timezone.utc)
+        sim._should_exit(pos, _opp("BTCUSDT", -10.0), now)     # arm pending (on-scanner)
+        # Off-scanner within the off_scanner_24h window: pending preserved, no fire.
+        assert sim._should_exit(pos, None, now + timedelta(hours=1)) is None
+        assert pos.pending_exit_reason == "funding_flipped"
+        assert sim._should_exit(pos, None, now + timedelta(hours=2.5)) is None
+        assert pos.pending_exit_reason == "funding_flipped"   # still armed
+        # Data returns, still flipped, past the window (the off-scanner gap counted)
+        # → the soft exit fires.
+        assert sim._should_exit(pos, _opp("BTCUSDT", -10.0),
+                                now + timedelta(hours=2.6)) == "funding_flipped"
+
+    def test_zero_confirm_fires_immediately(self, tmp_path, monkeypatch):
+        # exit_confirm_hours=0 restores the old fire-on-first-snapshot behaviour.
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=0.0)
+        pos = _open_pos(entry_apy=40.0)
+        assert sim._should_exit(pos, _opp("BTCUSDT", -10.0),
+                                datetime.now(timezone.utc)) == "funding_flipped"
+
+    def test_hard_exits_ignore_confirmation_window(self, tmp_path, monkeypatch):
+        # max_hold and off_scanner_24h must still fire immediately regardless of
+        # the confirmation window.
+        sim = _sim_for_exit(tmp_path, monkeypatch, exit_confirm_hours=2.0)
+        now = datetime.now(timezone.utc)
+        old = _open_pos(hours_old=fap.MAX_HOLD_DAYS * 24 + 1)
+        assert "max_hold" in sim._should_exit(old, _opp("BTCUSDT", 40.0), now)
+        gone = _open_pos(last_seen_hours_ago=25.0)
+        assert sim._should_exit(gone, None, now) == "off_scanner_24h"
+
+    def test_pending_fields_survive_save_load(self, tmp_path, monkeypatch):
+        # The new pending_exit_* fields must round-trip through state persistence.
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(fap, "STATE_FILE", state_file)
+        sim = FundingArbPaperSim(scanner=_FakeScanner([_opp("BTCUSDT", 40.0)]),
+                                 notifier=None, exit_confirm_hours=2.0)
+        sim._tick()
+        pos = next(iter(sim.open_positions.values()))
+        pos.pending_exit_reason = "apy_decayed_to_5.0"
+        pos.pending_exit_since_iso = datetime.now(timezone.utc).isoformat()
+        sim._save_state()
+
+        sim2 = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                                  state_file=state_file)
+        restored = next(iter(sim2.open_positions.values()))
+        assert restored.pending_exit_reason == "apy_decayed_to_5.0"
+        assert restored.pending_exit_since_iso == pos.pending_exit_since_iso
+
+    def test_legacy_state_without_pending_fields_loads(self, tmp_path, monkeypatch):
+        # State written before the pending_exit_* fields existed must still load
+        # (dataclass defaults fill the gaps) — no crash on restart after deploy.
+        import json
+        from dataclasses import asdict
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(fap, "STATE_FILE", state_file)
+        pos = _open_pos(entry_apy=40.0)
+        raw = asdict(pos)
+        raw.pop("pending_exit_reason")
+        raw.pop("pending_exit_since_iso")
+        state_file.write_text(json.dumps({"open": {"Binance:BTCUSDT": raw},
+                                          "closed": []}))
+        sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                                 state_file=state_file)
+        assert len(sim.open_positions) == 1
+        restored = sim.open_positions["Binance:BTCUSDT"]
+        assert restored.pending_exit_reason is None
+        assert restored.pending_exit_since_iso is None
+
+
 # ── _base_symbol — symbol normalisation ──────────────────────────────────────
 
 class TestBaseSymbol:
@@ -774,10 +902,15 @@ class TestBorrowCostAccrual:
 # ── Post-loss re-entry cooldown (realized-outcome feedback loop) ───────────────
 
 def _cooldown_sim(tmp_path, opps, hours):
-    """A both-sides sim with the flip-cooldown enabled and isolated state."""
+    """A both-sides sim with the flip-cooldown enabled and isolated state.
+
+    exit_confirm_hours=0 so a flip closes on the same-wall-clock second tick —
+    these tests exercise the realized-loss cooldown, not the exit-confirmation
+    window (which is covered separately in TestExitConfirmation)."""
     return FundingArbPaperSim(
         scanner=_FakeScanner(opps), notifier=None,
         flip_cooldown_hours=hours,
+        exit_confirm_hours=0.0,
         state_file=tmp_path / "cooldown_state.json",
     )
 

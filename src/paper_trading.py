@@ -485,22 +485,23 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # gate. Records every scanner snapshot; survives restarts (data/).
             _funding_history = FundingHistory()
 
-            # Arm 1 — aggressive/experimental: all symbols, taker cost. Trades
-            # often. NOW positive-funding-only by default: a live-ledger audit
-            # showed its entire apparent +$16 came from short-spot (negative-
-            # funding) legs whose biggest winners were never charged spot-borrow
-            # carry (they closed before the borrow model deployed). Charging the
-            # borrow they owed flips that side from +$19 booked to −$11 — i.e. the
-            # negative funding ≈ the borrow cost, the legs cancel, and there is no
-            # edge there. The clean long-spot/short-perp side needs no borrow and
-            # is honestly executable, so the arm is confined to it. Set
-            # FUNDING_ARB_AGGR_POSITIVE_ONLY=0 to restore the old both-sides
-            # research baseline (its short legs are now correctly carry-charged).
-            _aggr_positive_only = os.getenv('FUNDING_ARB_AGGR_POSITIVE_ONLY', '1') == '1'
-            _funding_arb_sim = FundingArbPaperSim(
-                scanner=_funding_scanner, notifier=notifier,
-                positive_funding_only=_aggr_positive_only,
-            )
+            # Arm 1 — aggressive/experimental: all symbols (incl. Binance/Bybit),
+            # taker cost. QUARANTINED by default (FUNDING_ARB_AGGRESSIVE_ENABLED=0):
+            # for a US-geo-blocked account these rates are NOT capturable, so this
+            # arm is FANTASY — proof_scorecard marks it "FANTASY (not executable)".
+            # Left running, it only posts misleading "we're up" Telegram alerts and
+            # invites self-deception; the only real arm is Kraken. Set
+            # FUNDING_ARB_AGGRESSIVE_ENABLED=1 to restore it as a research baseline.
+            # When enabled it is positive-funding-only by default (a live-ledger
+            # audit showed its apparent +$16 was unpaid short-spot borrow carry);
+            # FUNDING_ARB_AGGR_POSITIVE_ONLY=0 restores the both-sides baseline.
+            _aggressive_enabled = os.getenv('FUNDING_ARB_AGGRESSIVE_ENABLED', '0') == '1'
+            if _aggressive_enabled:
+                _aggr_positive_only = os.getenv('FUNDING_ARB_AGGR_POSITIVE_ONLY', '1') == '1'
+                _funding_arb_sim = FundingArbPaperSim(
+                    scanner=_funding_scanner, notifier=notifier,
+                    positive_funding_only=_aggr_positive_only,
+                )
 
             # Arm 2 — conservative/"honest": liquid majors only, positive funding
             # only (long spot / short perp → no borrow needed). Separate ledger +
@@ -634,7 +635,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     try:
                         st = _read_state()
                         st['funding_opportunities'] = _funding_scanner.get_state()
-                        st['funding_arb'] = _funding_arb_sim.get_summary()
+                        if _funding_arb_sim is not None:
+                            st['funding_arb'] = _funding_arb_sim.get_summary()
                         st['funding_arb_majors'] = _funding_arb_majors.get_summary()
                         st['funding_arb_kraken'] = _funding_arb_kraken.get_summary()
                         _write_state(st)
@@ -643,13 +645,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
             _funding_tasks = [
                 asyncio.create_task(supervised('funding_scanner',     _funding_scanner.start,     notifier=notifier)),
-                asyncio.create_task(supervised('funding_arb_sim',     _funding_arb_sim.start,     notifier=notifier)),
                 asyncio.create_task(supervised('funding_arb_majors',  _funding_arb_majors.start,  notifier=notifier)),
                 asyncio.create_task(supervised('funding_arb_kraken',  _funding_arb_kraken.start,  notifier=notifier)),
                 asyncio.create_task(supervised('funding_merge_state', _merge_funding_state,        notifier=notifier)),
             ]
-            logger.info("[FUNDING] scanner + 3 delta-neutral arb arms "
-                        "(aggressive + majors-honest + kraken-executable) started")
+            if _funding_arb_sim is not None:
+                _funding_tasks.append(
+                    asyncio.create_task(supervised('funding_arb_sim', _funding_arb_sim.start, notifier=notifier))
+                )
+            logger.info(
+                "[FUNDING] scanner + delta-neutral arb arms started "
+                "(majors-honest + kraken-executable%s)",
+                " + aggressive-FANTASY" if _funding_arb_sim is not None else
+                "; aggressive arm QUARANTINED — set FUNDING_ARB_AGGRESSIVE_ENABLED=1 to restore"
+            )
         except Exception as _exc:
             logger.warning(f"[FUNDING] disabled ({_exc})")
 
@@ -1396,15 +1405,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     except Exception:
                         pass
 
-                # ── Mean-reversion: RANGING regime only (mr-extreme disabled) ──
-                # mr-extreme was 28/32 trades with 7.1% WR — disabled after live data.
+                # ── Mean-reversion: RANGING regime only ────────────────────────
+                # The mr-extreme (extreme-RSI) variant was 28/32 trades at 7.1% WR
+                # and is permanently removed — only the plain RANGING MR path
+                # remains (itself UNVALIDATED; lives behind DIRECTIONAL_ENABLED).
                 _mr_ok_regime = regime_name in ('RANGING', 'VOLATILE', 'UNKNOWN')
                 if sig.signal == Signal.HOLD and _mr_ok_regime:
                     mr_sig = mr_strategy.get_latest_signal(df)
-                    _rsi_extreme = False  # mr-extreme path disabled
                     if mr_sig and mr_sig.signal != Signal.HOLD and regime_name == 'RANGING':
-                        # Higher confidence for the extreme-RSI variant (higher edge)
-                        mr_conf = 70.0 if _rsi_extreme else 62.0
+                        mr_conf = 62.0
                         regime_score_mr = 12.0 if regime_name == 'RANGING' else 8.0
                         sig = ScientificSignal(
                             signal          = mr_sig.signal,
@@ -1413,7 +1422,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             ofi_score       = 0.0,
                             lead_lag_score  = 0.0,
                             regime_score    = regime_score_mr,
-                            rsi_score       = 15.0 if _rsi_extreme else 8.0,
+                            rsi_score       = 8.0,
                             technical_score = 8.0,
                             funding_score   = 0.0,
                             ofi             = ofi_calc.get_smoothed(symbol),
@@ -1428,9 +1437,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             volume_ratio    = 1.0,
                             funding_rate    = funding_rate,
                         )
-                        _entry_path_tag = 'mr-extreme' if _rsi_extreme else 'mr'
-                        tag = "RSI-extreme" if _rsi_extreme else regime_name
-                        logger.info(f"[MR] {symbol} {tag}: {mr_sig.signal.value} conf={mr_conf:.0f} rsi={mr_sig.rsi:.1f}")
+                        _entry_path_tag = 'mr'
+                        logger.info(f"[MR] {symbol} {regime_name}: {mr_sig.signal.value} conf={mr_conf:.0f} rsi={mr_sig.rsi:.1f}")
 
                 # ── OFI + Lead-Lag fast-track: documented short-term edge ──────
                 # When OFI is strongly directional AND BTC just led same direction,
@@ -1952,14 +1960,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
                 _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
                 _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
+                # Only show the aggressive (FANTASY) arm when it's actually running.
+                _aggr_seg = (f" aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}]"
+                             if _funding_arb_sim is not None else "")
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
-                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} "
-                    f"aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}])"
+                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f}{_aggr_seg})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
