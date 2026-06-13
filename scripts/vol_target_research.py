@@ -25,6 +25,7 @@ LOOKBACKS = [50, 100, 150, 200]
 COST_LEG = 0.0026
 VOL_WIN = 20          # trailing days for realized vol
 TARGET_VOL = 0.40     # annualized portfolio vol target
+TARGET_PERSYM = 0.50  # annualized per-symbol vol cap (implementable in the cron runner)
 ANN = 365
 
 
@@ -91,12 +92,16 @@ def run(data, n, scheme):
         day = 0.0
         port_vol_est = 0.0
         for c in coins:
-            sleeve = w[c] if sigs[c][t] == 1 else 0.0
-            r = sigs[c][t] * rets[c][t] * (w[c] if sigs[c][t] else 0)
+            scale = 1.0
+            if scheme == 'persym-vt' and vols[c][t] > 0:
+                scale = min(1.0, TARGET_PERSYM / (vols[c][t] * sqrt(ANN)))
+            eff = w[c] * scale
+            long = sigs[c][t] == 1
+            r = (rets[c][t] * eff) if long else 0.0
             if sigs[c][t] != prev_sig[c]:
-                r -= COST_LEG * w[c]
+                r -= COST_LEG * eff
             day += r
-            port_vol_est += sleeve * vols[c][t]
+            port_vol_est += (eff if long else 0.0) * vols[c][t]
             prev_sig[c] = sigs[c][t]
         if scheme == 'vol-target' and port_vol_est > 0:
             ann_vol = port_vol_est * sqrt(ANN)
@@ -124,22 +129,27 @@ def main():
     print("=" * 66)
     print(f"{'N':>5}  {'scheme':<12}{'CAGR':>8}{'Sharpe':>8}{'maxDD':>8}")
     print("-" * 66)
-    win_invvol = win_vt = 0
+    win_invvol = win_vt = win_ps = 0
     for n in LOOKBACKS:
         base = run(data, n, 'equal')
         iv = run(data, n, 'inv-vol')
         vt = run(data, n, 'vol-target')
-        for name, m in (('equal', base), ('inv-vol', iv), ('vol-target', vt)):
+        ps = run(data, n, 'persym-vt')
+        for name, m in (('equal', base), ('inv-vol', iv), ('vol-target', vt),
+                        ('persym-vt', ps)):
             print(f"{n:>5}  {name:<12}{m[0]*100:>7.0f}%{m[1]:>8.2f}{m[2]*100:>7.0f}%")
         if iv[1] > base[1] and iv[2] >= base[2]:
             win_invvol += 1
         if vt[1] > base[1] and vt[2] >= base[2]:
             win_vt += 1
+        if ps[1] > base[1] and ps[2] >= base[2]:
+            win_ps += 1
         print()
     print("-" * 66)
     print(f"inv-vol improved (Sharpe up & maxDD >=) in {win_invvol}/{len(LOOKBACKS)} lookbacks")
-    print(f"vol-target improved in {win_vt}/{len(LOOKBACKS)} lookbacks")
-    if win_vt >= 3 or win_invvol >= 3:
+    print(f"vol-target (portfolio) improved in {win_vt}/{len(LOOKBACKS)} lookbacks")
+    print(f"persym-vt (implementable) improved in {win_ps}/{len(LOOKBACKS)} lookbacks")
+    if win_ps >= 3 or win_vt >= 3 or win_invvol >= 3:
         print("=> PRINCIPLED WIN — consistent across lookbacks; worth a forward config.")
     else:
         print("=> NOT consistent — don't adopt; would be fitting noise.")
