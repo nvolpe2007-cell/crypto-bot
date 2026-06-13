@@ -57,11 +57,19 @@ expensive way:
   • SOL is the most volatile and the least reliable of the three; demand a cleaner \
     setup there. BTC leads; if BTC is clearly trending, ETH/SOL usually follow.
 
-HOW TO SIZE (size_mult scales a fixed base allocation, clamped 0.0-1.5 by the runner):
-  • 1.0 = normal conviction in a clean trend.
-  • up to 1.5 = strong, multi-signal agreement (price/MA/momentum all aligned).
-  • 0.3-0.7 = real but mixed; want exposure but cautious.
-  • action "flat" = no position (size ignored). Choosing flat is often correct.
+HOW TO SIZE — BE AGGRESSIVE WHEN YOU ARE RIGHT, FLAT WHEN YOU ARE NOT. Sizing is \
+BIMODAL, not a dial of small bets. size_mult scales a fixed base allocation and is \
+clamped 0.0-2.5 by the runner. Tie it to conviction:
+  • conviction 9-10, clean multi-signal trend (price/MA/momentum all aligned, BTC \
+    confirming): 2.0-2.5x — bet big, this is the whole point.
+  • conviction 7-8, solid trend, minor caveats: 1.2-1.8x.
+  • conviction 5-6, real but mixed: 0.5-0.9x — small, or prefer FLAT.
+  • conviction <=4 or signals disagree: action "flat" (size ignored). DO NOT take \
+    small low-conviction positions — that is "throwing money away": you pay full \
+    round-trip cost + funding for an edge that isn't there. Flat is a position.
+The aggression rule: concentrate size on your highest-conviction coin; don't spread \
+thin equal bets across all three out of habit. Being big on a clean trend and flat on \
+the rest beats being medium on everything.
 
 For EVERY coin, call submit_decisions exactly once with one entry per coin. Be \
 concrete: name the signal that decided it and what would flip your view. Prefer \
@@ -81,7 +89,7 @@ DECISION_TOOL = {
                         "coin": {"type": "string", "enum": ["BTC", "ETH", "SOL"]},
                         "action": {"type": "string", "enum": ["long", "short", "flat"]},
                         "conviction": {"type": "integer", "minimum": 1, "maximum": 10},
-                        "size_mult": {"type": "number", "minimum": 0.0, "maximum": 1.5},
+                        "size_mult": {"type": "number", "minimum": 0.0, "maximum": 2.5},
                         "key_signal": {"type": "string",
                                        "description": "The single signal that drove this call."},
                         "invalidation": {"type": "string",
@@ -150,7 +158,7 @@ def _parse(resp) -> Dict[str, CoinDecision]:
                 out[coin] = CoinDecision(
                     coin=coin, action=action,
                     conviction=max(0, min(10, int(d.get("conviction", 0) or 0))),
-                    size_mult=max(0.0, min(1.5, float(d.get("size_mult", 1.0) or 1.0))),
+                    size_mult=max(0.0, min(2.5, float(d.get("size_mult", 1.0) or 1.0))),
                     key_signal=str(d.get("key_signal", "")),
                     invalidation=str(d.get("invalidation", "")),
                     reasoning=str(d.get("reasoning", "")),

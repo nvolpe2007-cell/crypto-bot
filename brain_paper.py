@@ -30,7 +30,13 @@ COST_FRAC = float(os.getenv("BRAIN_COST_FRAC", "0.0015"))      # perp taker + sl
 FUNDING_APY = float(os.getenv("BRAIN_FUNDING_APY", "0.10"))    # conservative funding drag
 STARTING_EQUITY = float(os.getenv("BRAIN_START_EQUITY", "1000"))
 BASE_ALLOC = round(STARTING_EQUITY / len(KRAKEN_PAIRS), 2)     # per-coin base notional
-STATE_FILE = Path(os.getenv("BRAIN_STATE_FILE", "data/brain_paper_state.json"))
+# DRY RUN / self-test: exercise the FULL pipeline (live data -> snapshot -> decide ->
+# paper account -> Telegram) with a transparent local heuristic instead of the API,
+# on a SEPARATE state file so it never pollutes the real brain ledger. Lets you verify
+# the machine end-to-end before funding the Anthropic account.
+DRY_RUN = os.getenv("BRAIN_DRY_RUN", "0") == "1"
+_default_state = "data/brain_dryrun_state.json" if DRY_RUN else "data/brain_paper_state.json"
+STATE_FILE = Path(os.getenv("BRAIN_STATE_FILE", _default_state))
 INTERVAL_DAILY = 1440
 HOURS_PER_YEAR = 24.0 * 365.0
 
@@ -127,7 +133,8 @@ def _open(state: dict, coin: str, side: int, size_usd: float, price: float, ts: 
 def apply_decision(state: dict, coin: str, dec, price: float, ts: str) -> int:
     """Reconcile the coin's position to the brain's target. Returns # actions taken."""
     target = {"long": 1, "short": -1, "flat": 0}.get(dec.action, 0)
-    size_usd = BASE_ALLOC * max(0.0, min(1.5, dec.size_mult)) if target != 0 else 0.0
+    # Aggressive but bounded: conviction-scaled size up to 2.5x base per coin.
+    size_usd = BASE_ALLOC * max(0.0, min(2.5, dec.size_mult)) if target != 0 else 0.0
     cur = state["positions"].get(coin, {}).get("side", 0)
     acted = 0
     # Close if direction changes or going flat.
@@ -154,7 +161,8 @@ def _notify(state: dict, result, prices: dict, acted: int) -> None:
     eq = state.get("equity", STARTING_EQUITY)
     start = state.get("starting_equity", STARTING_EQUITY)
     icon = "🧠📈" if eq >= start else "🧠📉"
-    lines = [f"{icon} <b>AI Brain — Paper Account</b>",
+    title = "AI Brain — SELF-TEST (dry run, not the AI)" if DRY_RUN else "AI Brain — Paper Account"
+    lines = [f"{icon} <b>{title}</b>",
              f"Equity: <b>${eq:,.2f}</b>  (start ${start:,.0f}, {eq-start:+.2f})  "
              f"closed: {len(state.get('closed', []))}"]
     for coin, p in state.get("positions", {}).items():
@@ -174,6 +182,27 @@ def _notify(state: dict, result, prices: dict, acted: int) -> None:
         print(f"[brain_paper] telegram notify skipped: {e}")
 
 
+def _dry_run_result(snapshot: dict):
+    """A transparent stand-in for the brain: a plain trend heuristic, clearly labeled,
+    so a self-test exercises the whole pipeline without an API call. NOT the real brain."""
+    from src.trade_brain import BrainResult, CoinDecision
+    decs = {}
+    for coin, s in snapshot.items():
+        v50 = s.get("vs_sma50_pct"); m20 = s.get("ret_20d_pct")
+        if v50 is None or m20 is None:
+            action, key = "flat", "warming up"
+        elif v50 > 0 and m20 > 0:
+            action, key = "long", "above SMA50 + positive 20d momentum"
+        elif v50 < 0 and m20 < 0:
+            action, key = "short", "below SMA50 + negative 20d momentum"
+        else:
+            action, key = "flat", "mixed (price/MA and momentum disagree)"
+        decs[coin] = CoinDecision(coin=coin, action=action, conviction=6, size_mult=1.0,
+                                  key_signal=key, invalidation="trend reverses",
+                                  reasoning=f"[SELF-TEST heuristic, not the AI] {key}")
+    return BrainResult(decisions=decs, model="dry-run-heuristic")
+
+
 def main():
     from src.trade_brain import TradeBrain
     state = _load_state()
@@ -189,15 +218,19 @@ def main():
             prices[coin] = bars[-1]["c"]
             latest[coin] = bars[-1]
 
-    brain = TradeBrain()
-    if not brain.available():
-        print("[brain_paper] no ANTHROPIC_API_KEY — brain idle, holding current positions.")
-        _save_state(state)
-        return
+    brain = None
+    if not DRY_RUN:
+        brain = TradeBrain()
+        if not brain.available():
+            print("[brain_paper] no ANTHROPIC_API_KEY — brain idle, holding current positions.")
+            _save_state(state)
+            return
 
     # Only decide on coins with a newly-closed bar (idempotent: one decision/coin/day).
+    # A dry run ignores that and always acts, so the self-test always shows something.
     fresh = {c: latest[c] for c in latest
-             if state["last_bar_t"].get(c) != latest[c]["t"] and len(closes.get(c, [])) >= 60}
+             if (DRY_RUN or state["last_bar_t"].get(c) != latest[c]["t"])
+             and len(closes.get(c, [])) >= 60}
     if not fresh:
         print("[brain_paper] no new daily bar — nothing to decide.")
         _save_state(state)
@@ -205,11 +238,16 @@ def main():
 
     snapshot = build_snapshot({c: closes[c] for c in closes}, state)
     now = datetime.now(timezone.utc)
-    result = brain.decide(snapshot, now)
-    if not result.ok:
-        print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
-        _save_state(state)
-        return
+    if DRY_RUN:
+        result = _dry_run_result(snapshot)
+        print("[brain_paper] *** DRY RUN / SELF-TEST *** local heuristic, NO API call, "
+              f"separate ledger ({STATE_FILE.name}).")
+    else:
+        result = brain.decide(snapshot, now)
+        if not result.ok:
+            print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
+            _save_state(state)
+            return
 
     total = 0
     for coin in fresh:

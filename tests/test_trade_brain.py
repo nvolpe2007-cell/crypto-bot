@@ -58,7 +58,13 @@ def test_decide_parses_per_coin():
 def test_size_mult_clamped():
     client = _FakeClient([_dec("BTC", "long", size=99.0)])
     res = tb.TradeBrain(client=client).decide({}, datetime.now(timezone.utc))
-    assert res.decisions["BTC"].size_mult == 1.5            # hard clamp
+    assert res.decisions["BTC"].size_mult == 2.5            # hard clamp (aggressive cap)
+
+
+def test_aggressive_size_allowed():
+    client = _FakeClient([_dec("BTC", "long", size=2.3, conv=10)])
+    res = tb.TradeBrain(client=client).decide({}, datetime.now(timezone.utc))
+    assert res.decisions["BTC"].size_mult == 2.3            # high-conviction big bet preserved
 
 
 def test_bad_action_defaults_flat():
