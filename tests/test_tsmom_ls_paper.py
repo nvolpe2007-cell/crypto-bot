@@ -98,6 +98,34 @@ def test_funding_cost_charged_over_time(monkeypatch):
     assert cost == pytest.approx(100.0, rel=1e-3)     # 10% of $1000 over a year
 
 
+def test_notify_disabled_is_noop(monkeypatch):
+    monkeypatch.setenv("TSMOM_LS_NOTIFY", "0")
+    state = {"positions": {}, "closed": [], "equity": 1000.0,
+             "starting_equity": 1000.0}
+    ls._notify(state, {}, acted=5)                    # would otherwise fire
+    assert "last_notify_ts" not in state             # never touched the notifier
+
+
+def test_notify_sends_account_snapshot_on_trade(monkeypatch):
+    monkeypatch.setenv("TSMOM_LS_NOTIFY", "1")
+    sent = {}
+
+    class _Fake:
+        def send_message(self, msg, parse_mode="HTML"):
+            sent["msg"] = msg
+            return True
+
+    import src.notifications as notif
+    monkeypatch.setattr(notif, "create_notifier_from_env", lambda: _Fake())
+    state = {"positions": {"BTC": {"symbol": "BTC", "side": -1, "entry": 100.0,
+                                    "entry_ts": "1", "size_usd": 333.0}},
+             "closed": [], "equity": 1000.0, "starting_equity": 1000.0}
+    ls._notify(state, {"BTC": 80.0}, acted=1)         # a flip happened
+    assert "Paper Account" in sent["msg"]
+    assert "BTC" in sent["msg"] and "SHORT" in sent["msg"]
+    assert state.get("last_notify_ts")                # records that it sent
+
+
 def test_funding_reduces_pnl(monkeypatch):
     monkeypatch.setattr(ls, "SMA_N", 3)
     monkeypatch.setattr(ls, "TRADE_COST_FRAC", 0.0)

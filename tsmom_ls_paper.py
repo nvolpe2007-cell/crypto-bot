@@ -127,6 +127,71 @@ def _close(state: dict, base: str, price: float, ts: str, reason: str) -> dict:
     return rec
 
 
+def _notify(state: dict, prices: dict[str, float], acted: int) -> None:
+    """Post a paper-account snapshot to Telegram. Sends on any trade action, on a
+    forced run, or once per NOTIFY_INTERVAL_HOURS (daily heartbeat) — not every run,
+    so it never spams. Unrealized P&L is marked to the latest close. Best-effort:
+    a missing token / network error never breaks the arm."""
+    if os.getenv("TSMOM_LS_NOTIFY", "1") != "1":
+        return
+    force = os.getenv("TSMOM_LS_NOTIFY_FORCE", "0") == "1"
+    interval_h = float(os.getenv("TSMOM_LS_NOTIFY_INTERVAL_HOURS", "24"))
+    now = datetime.now(timezone.utc)
+    last = state.get("last_notify_ts")
+    due = True
+    if last:
+        try:
+            due = (now - datetime.fromisoformat(last)).total_seconds() >= interval_h * 3600
+        except ValueError:
+            due = True
+    if not (force or acted > 0 or due):
+        return
+
+    eq = state.get("equity", STARTING_EQUITY)
+    start = state.get("starting_equity", STARTING_EQUITY)
+    pnl = eq - start
+    icon = "📈" if pnl >= 0 else "📉"
+    unreal = 0.0
+    pos_lines = []
+    for base, p in state.get("positions", {}).items():
+        px = prices.get(base)
+        if px:
+            r = p["side"] * (px - p["entry"]) / p["entry"]
+            u = p["size_usd"] * r
+            unreal += u
+            sd = "🟢LONG" if p["side"] > 0 else "🔴SHORT"
+            pos_lines.append(f"  {base} {sd} @ ${p['entry']:,.2f} "
+                             f"(mark ${px:,.2f}, {r*100:+.1f}% = ${u:+.2f})")
+        else:
+            sd = "LONG" if p["side"] > 0 else "SHORT"
+            pos_lines.append(f"  {base} {sd} @ ${p['entry']:,.2f}")
+    closed = state.get("closed", [])
+    wins = sum(1 for c in closed if c.get("pnl", 0) > 0)
+
+    lines = [
+        f"{icon} <b>Trend L/S Perp — Paper Account</b>",
+        f"Equity: <b>${eq:,.2f}</b>  (start ${start:,.0f}, {pnl:+.2f})",
+        f"Unrealized: <b>${unreal:+.2f}</b>   Realized closed: {len(closed)}"
+        + (f" ({wins}W/{len(closed)-wins}L)" if closed else ""),
+        "<b>Open positions:</b>" if pos_lines else "No open positions.",
+        *pos_lines,
+    ]
+    if closed:
+        last_c = closed[-1]
+        sd = "SHORT" if last_c.get("side", 1) < 0 else "LONG"
+        lines.append(f"Last close: {last_c['symbol']} {sd} ${last_c['pnl']:+.2f} "
+                     f"({last_c.get('pnl_pct', 0):+.1f}%)")
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from src.notifications import create_notifier_from_env
+        notifier = create_notifier_from_env()
+        if notifier.send_message("\n".join(lines)):
+            state["last_notify_ts"] = now.isoformat()
+    except Exception as e:
+        print(f"[tsmom_ls_paper] telegram notify skipped: {e}")
+
+
 def process_symbol(base: str, bars: list[dict], state: dict) -> int:
     """Advance the L/S allocation for one symbol on newly-closed daily bars. First
     run seeds the current side at today's price (forward-only). Returns # acted."""
@@ -170,13 +235,17 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
 def main():
     state = _load_state()
     total = 0
+    prices: dict[str, float] = {}
     for base, pair in KRAKEN_PAIRS.items():
         try:
             bars = fetch_closed_daily(pair)
         except Exception as e:
             print(f"{base}: fetch failed - {e}")
             continue
+        if bars:
+            prices[base] = bars[-1]["c"]
         total += process_symbol(base, bars, state)
+    _notify(state, prices, total)
     _save_state(state)
     eq = state.get("equity", STARTING_EQUITY)
     start = state.get("starting_equity", STARTING_EQUITY)
