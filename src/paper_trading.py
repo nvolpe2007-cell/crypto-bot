@@ -536,6 +536,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             _funding_arb_sim = FundingArbPaperSim(
                 scanner=_funding_scanner, notifier=notifier,
                 positive_funding_only=_aggr_positive_only,
+                # Research/fantasy baseline (non-executable venues) — left UNcapped
+                # by default so it stays a clean reference. Set to arm it.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_MAX_DRAWDOWN', '0')),
             )
 
             # Arm 2 — conservative/"honest": liquid majors only, positive funding
@@ -589,6 +592,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 flip_cooldown_hours=_maj_flip_cooldown,
                 state_file=_Path('data/funding_arb_majors_state.json'),
                 label="Funding Arb (majors)",
+                # Per-arm loss cap (executable arm): halt new entries if cumulative
+                # net <= -$25. Currently ~-$11, so ~$14 runway. 0 disables.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_MAJORS_MAX_DRAWDOWN', '25')),
             )
 
             # Arm 3 — Kraken-only, AGGRESSIVE maker-only config (user-requested).
@@ -662,6 +668,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 flip_cooldown_hours=_kraken_flip_cooldown,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
+                # Per-arm loss cap (the real executable bleed): halt new entries if
+                # cumulative net <= -$40. Currently ~-$28, so ~$12 runway. 0 disables.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '40')),
             )
 
             async def _merge_funding_state():
@@ -674,6 +683,26 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         st['funding_arb_majors'] = _funding_arb_majors.get_summary()
                         st['funding_arb_kraken'] = _funding_arb_kraken.get_summary()
                         _write_state(st)
+                        # Global funding drawdown guard → engages the master kill
+                        # (halts ALL new entries, every arm) when the 3 arms'
+                        # combined net breaches the cap. 0 disables (default).
+                        _gcap = float(os.getenv('FUNDING_ARB_GLOBAL_MAX_DRAWDOWN', '0'))
+                        if _gcap > 0:
+                            from .kill_switch import is_killed as _kk, engage as _ke
+                            _gtot = (st['funding_arb'].get('total_pnl', 0.0)
+                                     + st['funding_arb_majors'].get('total_pnl', 0.0)
+                                     + st['funding_arb_kraken'].get('total_pnl', 0.0))
+                            if _gtot <= -_gcap and not _kk():
+                                _ke(f"global funding drawdown ${_gtot:+.2f} <= -${_gcap:.2f}")
+                                if notifier:
+                                    try:
+                                        notifier.send_message(
+                                            "🛑 <b>GLOBAL KILL ENGAGED</b>\n"
+                                            f"Funding arms net ${_gtot:+.2f} ≤ -${_gcap:.2f}\n"
+                                            "All new entries halted. Remove data/KILL_SWITCH to resume."
+                                        )
+                                    except Exception:
+                                        pass
                     except Exception as _exc:
                         logger.warning(f"[FUNDING] state merge failed: {_exc}")
 
@@ -1406,6 +1435,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     funnel.bump('signals_seen')
                     funnel.bump('skip:directional_shelved')
                     continue
+
+                # Master kill switch — halt NEW directional entries (exits above
+                # still run). Same flag the funding arms honor; file/env toggled.
+                try:
+                    from .kill_switch import is_killed as _kk
+                    if _kk():
+                        funnel.bump('signals_seen')
+                        funnel.bump('skip:killed')
+                        continue
+                except Exception:
+                    pass
 
                 # ── Strategy evaluation ────────────────────────────────────────
                 sig = strategy.evaluate(df, symbol, ofi_calc, lead_lag,

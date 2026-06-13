@@ -30,6 +30,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 STATE_FILE = Path('data/funding_arb_state.json')
 
 MIN_ENTRY_APY = 15.0           # only open positions above this APY
@@ -237,6 +244,7 @@ class FundingArbPaperSim:
         min_persistence_cycles: float = 0.0,
         max_flips: int = 10**9,
         flip_cooldown_hours: float = 0.0,
+        max_drawdown_usd: float = 0.0,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -297,6 +305,10 @@ class FundingArbPaperSim:
         self.start_time = datetime.now(timezone.utc)
         self.last_rollup_total = 0.0       # cumulative P&L at last rollup
         self.running = False
+        # Per-arm loss cap: halt NEW entries once cumulative net P&L <= -this.
+        # 0 disables. Exits continue; existing positions wind down normally.
+        self.max_drawdown_usd = max_drawdown_usd
+        self._halt_reason: Optional[str] = None   # last announced halt reason
 
         self._load_state()
 
@@ -379,6 +391,30 @@ class FundingArbPaperSim:
         self.running = False
         self._save_state()
 
+    def _entry_halt_reason(self) -> Optional[str]:
+        """Return a reason string if NEW entries should be halted, else None.
+
+        Triggers: the master kill switch, or cumulative net P&L at/below
+        -max_drawdown_usd. Announces (log + Telegram) once on engage and once on
+        resume so the alert stream isn't spammed every tick."""
+        reason = None
+        if _is_killed():
+            reason = "master kill switch engaged"
+        elif self.max_drawdown_usd > 0:
+            tot = self._total_pnl()
+            if tot <= -self.max_drawdown_usd:
+                reason = f"loss cap hit: net ${tot:+.2f} <= -${self.max_drawdown_usd:.2f}"
+        if reason and reason != self._halt_reason:
+            logger.warning(f"[{self.label}] HALT new entries — {reason}")
+            self._notify(f"⏸️ <b>{self.label} — new entries halted</b>\n{reason}\n"
+                         f"(exits continue; existing positions wind down)")
+            self._halt_reason = reason
+        elif reason is None and self._halt_reason is not None:
+            logger.info(f"[{self.label}] entries RESUMED — halt cleared")
+            self._notify(f"▶️ <b>{self.label} — entries resumed</b>")
+            self._halt_reason = None
+        return reason
+
     def _tick(self):
         """Process one cycle: accrue funding, manage exits, look for entries."""
         opps = self.scanner.get_state()  # list[dict]
@@ -453,8 +489,10 @@ class FundingArbPaperSim:
                 except Exception:
                     pass
 
-        # 2. Look for new entries
-        if len(self.open_positions) < self.max_positions:
+        # 2. Look for new entries — unless halted (master kill / per-arm loss cap).
+        #    The exit + accrual pass above always runs; halting blocks only NEW
+        #    exposure, so open positions still wind down on their own logic.
+        if self._entry_halt_reason() is None and len(self.open_positions) < self.max_positions:
             for opp in opps:
                 if len(self.open_positions) >= self.max_positions:
                     break

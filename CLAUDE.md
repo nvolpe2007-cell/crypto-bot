@@ -94,6 +94,20 @@ the proof scorecard's "by session verdict" attribution confirms FAVORABLE window
 UNFAVORABLE ones. The gate reads the realised record only (`data/trade_journal.csv` +
 `data/swing_paper_state.json`) — it never fabricates an edge.
 
+## Risk controls (kill switch + per-arm loss caps)
+**Master kill switch** (`src/kill_switch.py`): halts ALL new entries (directional +
+every funding arm) while exits keep running. Two triggers — env `BOT_KILL_SWITCH=1`
+or the flag file `data/KILL_SWITCH` (live-toggleable: `ssh … "touch
+/opt/crypto-bot/data/KILL_SWITCH"` to stop, `rm` to resume; no restart). Fails OPEN.
+**Per-arm funding loss cap** (`FundingArbPaperSim.max_drawdown_usd`): an arm halts new
+entries once its cumulative net ≤ -cap (alert once on engage + on resume). Defaults:
+`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 40, `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
+`FUNDING_ARB_MAX_DRAWDOWN` 0 (aggressive/fantasy baseline left uncapped); 0 disables.
+**Global funding cap** `FUNDING_ARB_GLOBAL_MAX_DRAWDOWN` (default 0/off): when the 3
+arms' combined net breaches it, the merge loop engages the master kill. The directional
+arm also honors the kill (funnel `skip:killed`). See memory `attribution_ledger` /
+`risk_controls`.
+
 ## Proof bar (proof_scorecard.py)
 Pre-registered bar unchanged (executable & n≥30 & expectancy>0 & correlation-adjusted t>2)
 but now **selection-bias aware**: with k arms judged at once it also requires a Šidák
