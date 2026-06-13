@@ -232,6 +232,30 @@ def _tsmom_fast_forward() -> dict | None:
     return dict(label='Trend-follow FAST SMA50 (FORWARD)', executable=True, **s)
 
 
+def _conf_forward() -> dict | None:
+    """Confluence trend allocation forward record (conf_paper.py): long-only on
+    BTC/ETH/SOL only when price is BOTH above SMA100 AND 20d momentum is positive —
+    the long-only tournament's best DRAWDOWN-adjusted spot-executable bot. A distinct
+    SIGNAL (a two-condition conjunction), not just another lookback. Same pre-registered
+    bar; entry-week clustered like the other trend arms (the 3 majors co-trend)."""
+    path = DATA / 'conf_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Trend+momo confluence (FORWARD)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -369,6 +393,7 @@ def main():
         _swing_forward(),
         _tsmom_forward(),
         _tsmom_fast_forward(),
+        _conf_forward(),
         _regime_forward(),
         _directional(),
     ] if a]

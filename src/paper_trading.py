@@ -768,6 +768,33 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('tsmom_fast', _tsmom_fast_loop, notifier=notifier))
         logger.info("[TSMOM-FAST] SMA50 long-only daily forward arm started (in-process)")
 
+    # ── Confluence trend forward arm (the long-only tournament's best DD-adjusted) ─
+    # scripts/longonly_tournament.py (BTC+ETH+SOL, honest cost) found a TREND+MOMENTUM
+    # confluence — long only when price is BOTH >SMA100 AND 20d momentum up — was the
+    # best drawdown-adjusted spot-executable bot (-31% DD vs B&H -65%). A distinct
+    # SIGNAL (two-condition conjunction), not just another lookback, so it earns its
+    # own forward arm. Runs the pre-registered conf_paper.py; proof bar judges it head
+    # to head (_conf_forward). In-process via subprocess; disable with CONF_ARM_ENABLED=0.
+    if os.getenv('CONF_ARM_ENABLED', '1') == '1':
+        async def _conf_arm_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('CONF_ARM_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'CONF_STATE_FILE': 'data/conf_paper_state.json',
+                   'CONF_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'conf_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[CONF-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('conf_arm', _conf_arm_loop, notifier=notifier))
+        logger.info("[CONF-ARM] trend+momo confluence daily forward arm started (in-process)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
