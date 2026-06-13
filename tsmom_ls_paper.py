@@ -46,7 +46,7 @@ else:
 
 SMA_N = int(os.getenv("TSMOM_LS_SMA", "50"))
 BAND = float(os.getenv("TSMOM_LS_BAND", "0.0"))            # 0 = faithful to short_leg_value
-TRADE_COST_FRAC = float(os.getenv("TSMOM_LS_COST_FRAC", "0.001"))   # perp taker round-trip ~0.10%
+TRADE_COST_FRAC = float(os.getenv("TSMOM_LS_COST_FRAC", "0.0015"))  # perp taker ~0.10% + ~0.05% slippage round-trip
 FUNDING_APY = float(os.getenv("TSMOM_LS_FUNDING_APY", "0.10"))      # conservative funding drag
 STARTING_EQUITY = float(os.getenv("TSMOM_LS_START_EQUITY", "1000"))
 ALLOC_FRAC = 1.0 / max(1, len(KRAKEN_PAIRS_ALL))          # equal weight across the universe

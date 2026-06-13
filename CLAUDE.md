@@ -101,7 +101,9 @@ or the flag file `data/KILL_SWITCH` (live-toggleable: `ssh … "touch
 /opt/crypto-bot/data/KILL_SWITCH"` to stop, `rm` to resume; no restart). Fails OPEN.
 **Per-arm funding loss cap** (`FundingArbPaperSim.max_drawdown_usd`): an arm halts new
 entries once its cumulative net ≤ -cap (alert once on engage + on resume). Defaults:
-`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 40, `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
+`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 25 (lowered from 40 on 2026-06-13 to retire the
+arm: realized net ~-$28 trips this immediately → no new entries; negative EV +
+funding-arb dead in the fear regime; re-arm by raising it), `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
 `FUNDING_ARB_MAX_DRAWDOWN` 0 (aggressive/fantasy baseline left uncapped); 0 disables.
 **Global funding cap** `FUNDING_ARB_GLOBAL_MAX_DRAWDOWN` (default 0/off): when the 3
 arms' combined net breaches it, the merge loop engages the master kill. The directional

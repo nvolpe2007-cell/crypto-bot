@@ -669,8 +669,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
                 # Per-arm loss cap (the real executable bleed): halt new entries if
-                # cumulative net <= -$40. Currently ~-$28, so ~$12 runway. 0 disables.
-                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '40')),
+                # cumulative net <= -cap. RETIRED 2026-06-13: this arm has negative
+                # realized EV (-$2.14/trade, 23% win) and funding-arb is dead in the
+                # current fear regime (memory edge_search_verdict). Cap lowered 40->25
+                # so the current ~-$28 net trips the halt IMMEDIATELY (no new entries;
+                # exits still run). Honest history kept; re-arm by raising the cap if a
+                # real persistent-funding majors opportunity appears. 0 disables the cap.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '25')),
             )
 
             async def _merge_funding_state():
