@@ -827,6 +827,34 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('tsmom_ls', _tsmom_ls_loop, notifier=notifier))
         logger.info("[TSMOM-LS] long/short perp daily forward arm started (in-process, paper)")
 
+    # ── AI brain discretionary arm (Claude decides long/short/flat on its own book) ─
+    # The mechanical arms follow a fixed rule; this one asks Claude each day to decide
+    # per coin from the full market picture, on its own $1k paper perp account, judged
+    # head-to-head by proof_scorecard (_brain_forward). Only starts if ANTHROPIC_API_KEY
+    # is set (else the brain would idle every call); fail-safe holds positions on any
+    # API error. In-process via subprocess; disable with BRAIN_ARM_ENABLED=0.
+    if os.getenv('BRAIN_ARM_ENABLED', '1') == '1' and os.getenv('ANTHROPIC_API_KEY', ''):
+        async def _brain_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('BRAIN_ARM_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'BRAIN_STATE_FILE': 'data/brain_paper_state.json',
+                   'BRAIN_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'brain_paper.py'], env=env, timeout=180,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[BRAIN-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('brain_arm', _brain_loop, notifier=notifier))
+        logger.info("[BRAIN-ARM] Claude discretionary daily forward arm started (in-process, paper)")
+    elif os.getenv('BRAIN_ARM_ENABLED', '1') == '1':
+        logger.info("[BRAIN-ARM] idle — set ANTHROPIC_API_KEY in .env to activate the AI brain arm")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "

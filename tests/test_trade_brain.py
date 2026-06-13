@@ -1,0 +1,138 @@
+"""Tests for the Claude-driven discretionary arm (src/trade_brain.py + brain_paper.py).
+
+No network: a fake Anthropic client is injected, mirroring src/altperp/ai_brain tests.
+"""
+
+import importlib
+from datetime import datetime, timezone
+
+import pytest
+
+import src.trade_brain as tb
+import brain_paper as bp
+
+
+# ── fake Anthropic plumbing ──────────────────────────────────────────────────
+
+class _Block:
+    def __init__(self, name, inp):
+        self.type = "tool_use"; self.name = name; self.input = inp
+
+
+class _Usage:
+    input_tokens = 1200; output_tokens = 200
+
+
+class _Resp:
+    def __init__(self, decisions):
+        self.content = [_Block("submit_decisions", {"decisions": decisions})]
+        self.usage = _Usage()
+
+
+class _FakeClient:
+    def __init__(self, decisions):
+        self._decisions = decisions
+        self.messages = self
+
+    def create(self, **kwargs):
+        return _Resp(self._decisions)
+
+
+def _dec(coin, action, size=1.0, conv=7):
+    return {"coin": coin, "action": action, "conviction": conv, "size_mult": size,
+            "key_signal": "sma50 reclaim", "invalidation": "loses sma50", "reasoning": "trend up"}
+
+
+# ── brain decode ─────────────────────────────────────────────────────────────
+
+def test_decide_parses_per_coin():
+    client = _FakeClient([_dec("BTC", "long"), _dec("ETH", "short", 1.5), _dec("SOL", "flat")])
+    brain = tb.TradeBrain(client=client)
+    res = brain.decide({"BTC": {}}, datetime.now(timezone.utc))
+    assert res.ok
+    assert res.decisions["BTC"].action == "long"
+    assert res.decisions["ETH"].action == "short" and res.decisions["ETH"].size_mult == 1.5
+    assert res.decisions["SOL"].action == "flat"
+
+
+def test_size_mult_clamped():
+    client = _FakeClient([_dec("BTC", "long", size=99.0)])
+    res = tb.TradeBrain(client=client).decide({}, datetime.now(timezone.utc))
+    assert res.decisions["BTC"].size_mult == 1.5            # hard clamp
+
+
+def test_bad_action_defaults_flat():
+    client = _FakeClient([{"coin": "BTC", "action": "yolo", "conviction": 9,
+                           "size_mult": 1.0, "key_signal": "", "invalidation": "", "reasoning": ""}])
+    res = tb.TradeBrain(client=client).decide({}, datetime.now(timezone.utc))
+    assert res.decisions["BTC"].action == "flat"
+
+
+def test_decide_fail_safe_on_error():
+    class _Boom:
+        messages = property(lambda self: self)
+        def create(self, **k):
+            raise RuntimeError("api down")
+    brain = tb.TradeBrain(client=_Boom())
+    res = brain.decide({}, datetime.now(timezone.utc))
+    assert not res.ok and res.error and res.decisions == {}     # holds, never raises
+
+
+def test_available_false_without_key_or_client(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert tb.TradeBrain(api_key="").available() is False
+    assert tb.TradeBrain(client=_FakeClient([])).available() is True
+
+
+# ── runner: applying decisions to the paper account ──────────────────────────
+
+def _state():
+    return {"positions": {}, "closed": [], "last_bar_t": {}, "decisions": [],
+            "starting_equity": 1000.0, "equity": 1000.0}
+
+
+def test_apply_opens_long(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 333.0)
+    st = _state()
+    d = tb.CoinDecision("BTC", action="long", size_mult=1.0)
+    acted = bp.apply_decision(st, "BTC", d, price=100.0, ts="1000")
+    assert acted == 1 and st["positions"]["BTC"]["side"] == 1
+    assert st["positions"]["BTC"]["size_usd"] == 333.0
+
+
+def test_apply_flip_long_to_short_books_pnl(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    monkeypatch.setattr(bp, "COST_FRAC", 0.0)
+    monkeypatch.setattr(bp, "FUNDING_APY", 0.0)
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "long", 1.0), 100.0, "1000")
+    acted = bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "short", 1.0), 120.0, "2000")
+    assert acted == 2                                   # closed long + opened short
+    assert st["closed"][0]["pnl"] == pytest.approx(20.0)   # long +20% on $100
+    assert st["positions"]["BTC"]["side"] == -1
+
+
+def test_apply_flat_closes_position(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    monkeypatch.setattr(bp, "COST_FRAC", 0.0)
+    monkeypatch.setattr(bp, "FUNDING_APY", 0.0)
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "short", 1.0), 100.0, "1000")
+    acted = bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "flat"), 80.0, "2000")
+    assert acted == 1 and "BTC" not in st["positions"]
+    assert st["closed"][0]["pnl"] == pytest.approx(20.0)   # short +20% as price fell 100->80
+
+
+def test_apply_hold_same_side_no_action(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "long", 1.0), 100.0, "1000")
+    acted = bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "long", 1.0), 110.0, "2000")
+    assert acted == 0 and st["positions"]["BTC"]["entry"] == 100.0   # untouched, no churn
+
+
+def test_build_snapshot_has_factual_fields():
+    closes = {"BTC": [100 + i for i in range(220)]}
+    snap = bp.build_snapshot(closes, _state())
+    assert "vs_sma50_pct" in snap["BTC"] and "ret_20d_pct" in snap["BTC"]
+    assert snap["BTC"]["current_position"] == "flat"

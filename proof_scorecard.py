@@ -281,6 +281,29 @@ def _tsmom_ls_forward() -> dict | None:
     return dict(label='Trend L/S perp (FORWARD, paper)', executable=True, **s)
 
 
+def _brain_forward() -> dict | None:
+    """Claude-driven discretionary arm forward record (brain_paper.py): the brain
+    decides long/short/flat per coin daily from the full market picture, on its own
+    paper perp account. Judged on the SAME pre-registered bar as the mechanical arms —
+    the honest test of whether a 'thinking' brain beats rules. Entry-week clustered."""
+    path = DATA / 'brain_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='AI brain discretionary (FORWARD, paper)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -420,6 +443,7 @@ def main():
         _tsmom_fast_forward(),
         _conf_forward(),
         _tsmom_ls_forward(),
+        _brain_forward(),
         _regime_forward(),
         _directional(),
     ] if a]
