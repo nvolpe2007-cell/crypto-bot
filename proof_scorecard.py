@@ -256,6 +256,31 @@ def _conf_forward() -> dict | None:
     return dict(label='Trend+momo confluence (FORWARD)', executable=True, **s)
 
 
+def _tsmom_ls_forward() -> dict | None:
+    """Trend LONG/SHORT perp allocation forward record (tsmom_ls_paper.py): tsmom_50
+    that goes SHORT in downtrends instead of cash, via paper perps, 1x, charged a
+    conservative funding drag. The paper proof for the short side Kraken US perps will
+    unlock (short_leg_value.py found it ETH-carried & funding-fragile — this earns or
+    kills it on the forward clock). Executable once US perps are enabled (matches the
+    regime arm's treatment). Entry-week clustered like the other trend arms."""
+    path = DATA / 'tsmom_ls_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Trend L/S perp (FORWARD, paper)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -394,6 +419,7 @@ def main():
         _tsmom_forward(),
         _tsmom_fast_forward(),
         _conf_forward(),
+        _tsmom_ls_forward(),
         _regime_forward(),
         _directional(),
     ] if a]

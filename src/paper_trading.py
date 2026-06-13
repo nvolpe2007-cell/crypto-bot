@@ -795,6 +795,33 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('conf_arm', _conf_arm_loop, notifier=notifier))
         logger.info("[CONF-ARM] trend+momo confluence daily forward arm started (in-process)")
 
+    # ── Trend LONG/SHORT perp forward arm (paper proof for the short side) ──────────
+    # The long-only arms can only go to CASH in a downtrend; this one goes SHORT via
+    # paper perps (tsmom_50, 1x, conservative funding drag) — the exact strategy
+    # scripts/short_leg_value.py measured before Kraken US perps unlock real shorting
+    # (found it ETH-carried & funding-fragile, so it must PROVE OUT on the forward
+    # clock first). Runs the pre-registered tsmom_ls_paper.py; judged by proof_scorecard
+    # (_tsmom_ls_forward). In-process via subprocess; disable with TSMOM_LS_ARM_ENABLED=0.
+    if os.getenv('TSMOM_LS_ARM_ENABLED', '1') == '1':
+        async def _tsmom_ls_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('TSMOM_LS_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'TSMOM_LS_STATE_FILE': 'data/tsmom_ls_state.json',
+                   'TSMOM_LS_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'tsmom_ls_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[TSMOM-LS] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('tsmom_ls', _tsmom_ls_loop, notifier=notifier))
+        logger.info("[TSMOM-LS] long/short perp daily forward arm started (in-process, paper)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
