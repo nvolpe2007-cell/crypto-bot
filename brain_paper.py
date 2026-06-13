@@ -156,8 +156,12 @@ def apply_decision(state: dict, coin: str, dec, price: float, ts: str) -> int:
 def _notify(state: dict, result, prices: dict, acted: int) -> None:
     if os.getenv("BRAIN_NOTIFY", "1") != "1":
         return
-    if not (os.getenv("BRAIN_NOTIFY_FORCE", "0") == "1" or acted > 0):
-        return  # only ping on an actual trade or a forced run
+    # Notify on a trade, a forced run, OR any day the brain made a decision (so you
+    # get its reasoning every day it thinks, even when it holds). The runner only
+    # reaches here on days with a fresh bar, so this is ~one update/day, not spam.
+    if not (os.getenv("BRAIN_NOTIFY_FORCE", "0") == "1" or acted > 0
+            or (result and getattr(result, "decisions", None))):
+        return
     eq = state.get("equity", STARTING_EQUITY)
     start = state.get("starting_equity", STARTING_EQUITY)
     icon = "🧠📈" if eq >= start else "🧠📉"
