@@ -718,6 +718,28 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         except Exception as _exc:
             logger.warning(f"[FUNDING] disabled ({_exc})")
 
+    # ── Intraday regime-following arm (regime_arm.py) ──────────────────────────
+    # LONG in uptrends / SHORT in downtrends on an intraday clock, cost-gated,
+    # shorts via paper perps. Runs IN-PROCESS every 15min (no cron needed) so it
+    # forward-tests live; judged by proof_scorecard (_regime_forward). The only
+    # arm that trades (shorts) in a downtrend instead of sitting in cash. Paper
+    # only. Disable with REGIME_ARM_ENABLED=0.
+    if os.getenv('REGIME_ARM_ENABLED', '1') == '1':
+        async def _regime_arm_loop():
+            import regime_arm as _ra
+            interval = float(os.getenv('REGIME_ARM_INTERVAL_SEC', '900'))
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, _ra.run_forward)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[REGIME-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('regime_arm', _regime_arm_loop, notifier=notifier))
+        logger.info("[REGIME-ARM] intraday L/S regime follower started (in-process, 15min)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "

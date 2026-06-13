@@ -227,6 +227,28 @@ def _directional() -> dict | None:
     return dict(label='Directional (long-only majors)', executable=True, **s)
 
 
+def _regime_forward() -> dict | None:
+    """Intraday regime-following arm (regime_arm.py): LONG in uptrends / SHORT in
+    downtrends on an intraday clock, cost-gated, shorts via paper perps. The only
+    arm that TRADES (shorts) in a downtrend rather than sitting in cash. Clustered
+    by entry DAY — intraday same-session trades co-move, so they aren't independent."""
+    path = DATA / 'regime_arm_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _day(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            return dt.strftime('%Y-%m-%d')
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_day(p) for p in closed])
+    return dict(label='Regime intraday L/S (FORWARD)', executable=True, **s)
+
+
 def _verdict(a: dict, t_family: float = T_MIN, k: int = 1) -> str:
     if not a['executable']:
         return 'FANTASY (not executable on a US Kraken-spot account)'
@@ -323,6 +345,7 @@ def main():
         _arm('Kraken funding',     'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
         _swing_forward(),
         _tsmom_forward(),
+        _regime_forward(),
         _directional(),
     ] if a]
 
