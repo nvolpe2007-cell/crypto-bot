@@ -340,6 +340,32 @@ class TestOpenLong:
         self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
         assert trader.account.total_fees == pytest.approx(2.60)
 
+    def test_entry_fee_recorded_on_position(self):
+        """The actual fee charged by the exchange must be stored on the
+        position so close_long() can use it instead of re-estimating."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 0.10},  # maker fee, well below FEE_RATE estimate
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
+        assert pos.entry_fee == pytest.approx(0.10)
+
+    def test_entry_fee_falls_back_to_fee_rate_when_missing(self):
+        """If the exchange doesn't return fee info, fall back to the FEE_RATE
+        estimate (existing behavior) and record it on the position."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
+        assert pos.entry_fee == pytest.approx(100.0 * FEE_RATE)
+
 
 # ── close_long ───────────────────────────────────────────────────────────────────
 
@@ -431,6 +457,39 @@ class TestCloseLong:
         })
         self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
         assert trader.account.total_pnl != 0.0
+
+    def test_pnl_uses_actual_entry_fee_not_fee_rate_estimate(self):
+        """PnL must subtract the entry fee actually charged at open (stored
+        on the position as entry_fee), not a fresh FEE_RATE re-estimate of
+        size_usd. A maker entry (0.10) is far below the FEE_RATE estimate
+        (100 * 0.0026 = 0.26) — using the wrong figure would silently bias
+        every recorded trade's PnL/win-loss outcome."""
+        trader = _make_trader()
+        entry_price, size, size_usd = 50_000.0, 0.002, 100.0
+        sig = _make_signal(close=entry_price)
+        trader.positions["BTC/USD"] = LivePosition(
+            symbol="BTC/USD",
+            entry_time=datetime.now(timezone.utc),
+            entry_price=entry_price,
+            size=size,
+            size_usd=size_usd,
+            order_id="entry-order",
+            stop_loss_price=entry_price * 0.98,
+            take_profit_price=entry_price * 1.03,
+            entry_signal=sig,
+            entry_fee=0.10,
+        )
+        exit_fee = 0.10
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-order", "status": "closed",
+            "average": entry_price, "fee": {"cost": exit_fee},
+        })
+        trade = self._run(trader.close_long("BTC/USD", entry_price, "SIGNAL"))
+
+        # Flat exit: pnl == -(entry_fee + exit_fee), not -(size_usd * FEE_RATE + exit_fee)
+        assert trade.pnl == pytest.approx(-0.20)
+        assert trade.pnl != pytest.approx(-(size_usd * FEE_RATE + exit_fee))
+        assert trade.fees == pytest.approx(0.20)
 
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
