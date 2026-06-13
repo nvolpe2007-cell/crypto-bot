@@ -46,7 +46,7 @@ COST_FRAC = float(os.getenv("TSMOM_COST_FRAC", "0.0054"))
 STARTING_EQUITY = float(os.getenv("TSMOM_START_EQUITY", "500"))
 ALLOC_FRAC = 1.0 / max(1, len(KRAKEN_PAIRS_ALL))        # equal weight across the universe
 TRADE_SIZE = round(STARTING_EQUITY * ALLOC_FRAC, 2)
-STATE_FILE = Path("data/tsmom_paper_state.json")
+STATE_FILE = Path(os.getenv("TSMOM_STATE_FILE", "data/tsmom_paper_state.json"))
 INTERVAL_DAILY = 1440
 
 

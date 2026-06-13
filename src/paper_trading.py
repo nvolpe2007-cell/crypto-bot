@@ -740,6 +740,34 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('regime_arm', _regime_arm_loop, notifier=notifier))
         logger.info("[REGIME-ARM] intraday L/S regime follower started (in-process, 15min)")
 
+    # ── Fast-trend forward arm (the tournament's robust executable winner) ─────
+    # scripts/strategy_tournament.py (37 strategies, BTC+ETH, both halves) found
+    # SHORT-lookback trend robustly beats slow: tsmom_long_50 ($1470) >> the live
+    # SMA200 tsmom ($922). This runs the EXACT pre-registered tsmom code at SMA50
+    # (long-only, spot-executable) as a parallel forward arm — the SMA200 original
+    # stays the untouched control, and the proof bar judges both. In-process via
+    # subprocess (no cron needed); disable with TSMOM_FAST_ENABLED=0.
+    if os.getenv('TSMOM_FAST_ENABLED', '1') == '1':
+        async def _tsmom_fast_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('TSMOM_FAST_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'TSMOM_SMA': os.getenv('TSMOM_FAST_SMA', '50'),
+                   'TSMOM_STATE_FILE': 'data/tsmom_fast_state.json',
+                   'TSMOM_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'tsmom_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[TSMOM-FAST] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('tsmom_fast', _tsmom_fast_loop, notifier=notifier))
+        logger.info("[TSMOM-FAST] SMA50 long-only daily forward arm started (in-process)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "

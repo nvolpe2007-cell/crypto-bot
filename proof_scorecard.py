@@ -209,6 +209,29 @@ def _tsmom_forward() -> dict | None:
     return dict(label='Trend-follow BTC/ETH/SOL (FORWARD)', executable=True, **s)
 
 
+def _tsmom_fast_forward() -> dict | None:
+    """Fast-lookback (SMA50) long-only trend — the 37-strategy tournament's robust
+    executable winner (tsmom_long_50 backtested ~$1470 vs the SMA200 control's
+    ~$922). Same pre-registered code, faster lookback; run as a parallel forward
+    arm so the proof bar judges fast-vs-slow head to head. Week-clustered."""
+    path = DATA / 'tsmom_fast_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Trend-follow FAST SMA50 (FORWARD)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -345,6 +368,7 @@ def main():
         _arm('Kraken funding',     'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
         _swing_forward(),
         _tsmom_forward(),
+        _tsmom_fast_forward(),
         _regime_forward(),
         _directional(),
     ] if a]
