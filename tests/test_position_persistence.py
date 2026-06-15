@@ -375,6 +375,69 @@ class TestEntryContextRoundTrip:
         assert restored.sentiment_btc_dom is None
 
 
+class TestAnnotatePositionContext:
+    """_annotate_position_context() snapshots live sentiment onto a fresh
+    position — this is the only place sentiment_fng/sentiment_btc_dom are
+    ever populated from real data (the persistence round-trip tests above
+    just move whatever value was already set)."""
+
+    @staticmethod
+    def _snapshot(fear_greed_score=42, btc_dominance=58.7):
+        from src.market_sentiment import SentimentSnapshot
+        return SentimentSnapshot(
+            fear_greed_score=fear_greed_score,
+            fear_greed_label='Fear',
+            btc_dominance=btc_dominance,
+            market_cap_change_24h=-1.2,
+            mempool_tx_count=10_000,
+            tx_count_24h=300_000,
+        )
+
+    def test_sentiment_populated_from_snapshot(self):
+        from src.paper_trading import _annotate_position_context
+
+        class _StubMonitor:
+            def get_snapshot(_self):
+                return self._snapshot()
+
+        pos = _spot_position()
+        pos.sentiment_fng = None
+        pos.sentiment_btc_dom = None
+
+        _annotate_position_context(pos, 'BTC/USD', _StubMonitor(), strategy=None)
+
+        assert pos.sentiment_fng == 42
+        assert pos.sentiment_btc_dom == pytest.approx(58.7)
+
+    def test_no_sentiment_monitor_leaves_fields_unset(self):
+        from src.paper_trading import _annotate_position_context
+
+        pos = _spot_position()
+        pos.sentiment_fng = None
+        pos.sentiment_btc_dom = None
+
+        _annotate_position_context(pos, 'BTC/USD', None, strategy=None)
+
+        assert pos.sentiment_fng is None
+        assert pos.sentiment_btc_dom is None
+
+    def test_no_snapshot_yet_leaves_fields_unset(self):
+        from src.paper_trading import _annotate_position_context
+
+        class _StubMonitor:
+            def get_snapshot(self):
+                return None
+
+        pos = _spot_position()
+        pos.sentiment_fng = None
+        pos.sentiment_btc_dom = None
+
+        _annotate_position_context(pos, 'BTC/USD', _StubMonitor(), strategy=None)
+
+        assert pos.sentiment_fng is None
+        assert pos.sentiment_btc_dom is None
+
+
 class TestMultiPositionRoundTrip:
     def test_multiple_symbols_all_restored(self, clean_positions_file):
         trader = _fresh_trader()
