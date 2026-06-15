@@ -235,6 +235,14 @@ def test_positions_brief_handles_dict_and_list():
     assert as_list[0]["dir"] == "long" and as_list[0]["size_usd"] == 60
 
 
+def test_positions_brief_handles_string_sides():
+    # arms disagree on the representation: some store 'long'/'sell' not ±1.
+    out = bo._positions_brief([{"symbol": "BTC", "side": "long"},
+                               {"symbol": "ETH", "side": "sell"},
+                               {"symbol": "SOL", "side": "weird"}])
+    assert [p["dir"] for p in out] == ["long", "short", "?"]
+
+
 def test_own_book_summary_uses_mtm_and_pnl(tmp_path):
     p = tmp_path / "x_state.json"
     p.write_text(json.dumps({"starting_equity": 1000, "equity": 1000, "equity_mtm": 944.71,

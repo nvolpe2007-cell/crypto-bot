@@ -44,6 +44,23 @@ OWN_BOOK_ARMS = {
 }
 
 
+def _side_dir(side) -> str:
+    """Map an arm's `side` (int ±1, or a string like 'long'/'short'/'buy'/'sell')
+    to a direction label. Arms don't agree on the representation."""
+    if isinstance(side, str):
+        s = side.strip().lower()
+        if s in ("long", "buy", "bid", "+1", "1"):
+            return "long"
+        if s in ("short", "sell", "ask", "-1"):
+            return "short"
+        return "?"
+    try:
+        v = float(side)
+    except (TypeError, ValueError):
+        return "?"
+    return "long" if v > 0 else "short" if v < 0 else "?"
+
+
 def _positions_brief(pos) -> list[dict]:
     """Normalise positions (dict-keyed-by-symbol or list) to a short list."""
     items = pos.items() if isinstance(pos, dict) else enumerate(pos or [])
@@ -51,10 +68,9 @@ def _positions_brief(pos) -> list[dict]:
     for _, p in items:
         if not isinstance(p, dict):
             continue
-        side = p.get("side")
         out.append({
             "symbol": p.get("symbol"),
-            "dir": ("long" if (side or 0) > 0 else "short" if (side or 0) < 0 else "?"),
+            "dir": _side_dir(p.get("side")),
             "entry": p.get("entry") or p.get("entry_price"),
             "size_usd": p.get("size_usd"),
         })
