@@ -66,8 +66,12 @@ def _pct(a: float, b: float):
     return (a / b - 1.0) * 100 if b else 0.0
 
 
-def build_snapshot(closes_by_coin: dict[str, list[float]], state: dict) -> dict:
-    """Factual per-coin market picture for the brain to reason over (no opinion baked in)."""
+def build_snapshot(closes_by_coin: dict[str, list[float]], state: dict,
+                   market_ctx: dict | None = None) -> dict:
+    """Factual per-coin market picture for the brain to reason over (no opinion baked in).
+    When market_ctx is given, fold in the desk signals (regime/IV/funding) the main bot
+    already computes so the brain reasons over the same picture as the rest of the system."""
+    per_coin = (market_ctx or {}).get("per_coin", {})
     snap = {}
     for coin, c in closes_by_coin.items():
         if len(c) < 60:
@@ -90,6 +94,8 @@ def build_snapshot(closes_by_coin: dict[str, list[float]], state: dict) -> dict:
             "ret_60d_pct": round(_pct(price, c[-61]), 2) if len(c) > 61 else None,
             "current_position": cur or "flat",
         }
+        if coin in per_coin:
+            snap[coin]["market"] = per_coin[coin]
     return snap
 
 
@@ -335,13 +341,25 @@ def main():
         _save_state(state)
         return
 
-    snapshot = build_snapshot({c: closes[c] for c in closes}, state)
+    # Desk context (regime/IV/funding/sentiment) the main loop already computes — read
+    # from the shared state.json so the brain sees the same picture. Best-effort.
+    try:
+        from src.market_context import load_market_context
+        market_ctx = load_market_context(list(closes.keys()))
+    except Exception as e:
+        print(f"[brain_paper] market context unavailable: {e}")
+        market_ctx = {"stale": True, "macro": {}, "per_coin": {}}
+    macro = {**market_ctx.get("macro", {}),
+             "stale": market_ctx.get("stale", True),
+             "as_of": market_ctx.get("as_of"), "age_sec": market_ctx.get("age_sec")}
+
+    snapshot = build_snapshot({c: closes[c] for c in closes}, state, market_ctx)
     if DRY_RUN:
         result = _dry_run_result(snapshot)
         print("[brain_paper] *** DRY RUN / SELF-TEST *** local heuristic, NO API call, "
               f"separate ledger ({STATE_FILE.name}).")
     else:
-        result = brain.decide(snapshot, now)
+        result = brain.decide(snapshot, now, macro=macro)
         if not result.ok:
             print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
             _save_state(state)

@@ -57,6 +57,28 @@ expensive way:
   • SOL is the most volatile and the least reliable of the three; demand a cleaner \
     setup there. BTC leads; if BTC is clearly trending, ETH/SOL usually follow.
 
+READING THE EXTRA CONTEXT. Each coin now also carries the desk signals the rest of \
+the system computes, and a portfolio-wide `market` block. Use them to REFINE the \
+trend read and sizing — they do NOT override the cost/overtrading discipline above. \
+If `market.stale` is true, IGNORE this context and decide on price/trend alone.
+  • regime + adx (the bot's own classifier): ADX>25 = a real trend, align with it; \
+    ADX<20 = chop, directional bets get whipsawed → prefer FLAT. In RANGING regime, \
+    do NOT chase breakouts; in TRENDING_DOWN, long is fighting the tape (short or flat).
+  • rsi: in a RANGE, stretched RSI (>70/<30) mean-reverts; in a STRONG trend RSI can \
+    stay pinned — do not fade a strong trend on RSI alone.
+  • iv_percentile / iv_term: high IV percentile = options pricing in big moves → size \
+    DOWN and demand a cleaner setup; BACKWARDATION (near>far) signals stress/fear → caution.
+  • funding (perp APY): a POSITIONING tell, not a price forecast. Large positive funding \
+    = crowded longs paying to hold (headwind for fresh longs, carry tailwind for shorts); \
+    large negative = crowded shorts. Weigh lightly, never as a sole trigger.
+  • market.fear_greed: Extreme Fear (<25) marks capitulation zones — contrarian LONG \
+    bias for survivors, BUT in a confirmed downtrend fear persists; do not catch a falling \
+    knife. Extreme Greed (>75) = froth, caution on new longs. A tiebreaker, not a trigger.
+  • market.btc_dominance rising = capital rotating OUT of alts into BTC (risk-off for \
+    alts) → demand cleaner ETH/SOL setups or prefer BTC. altcoin_pressure flags this too.
+The context should mostly REINFORCE or VETO a trend call, and tune size — it is not a \
+new set of triggers to trade more. When signals conflict, that is itself a reason for FLAT.
+
 HOW TO SIZE — BE AGGRESSIVE WHEN YOU ARE RIGHT, FLAT WHEN YOU ARE NOT. Sizing is \
 BIMODAL, not a dial of small bets. size_mult scales a fixed base allocation and is \
 clamped 0.0-2.5 by the runner. Tie it to conviction:
@@ -213,11 +235,12 @@ class BrainResult:
         return self.error is None and bool(self.decisions)
 
 
-def _build_user_message(snapshot: Dict, now) -> str:
+def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None) -> str:
     payload = {
         "utc_time": now.isoformat() if hasattr(now, "isoformat") else str(now),
         "note": "Decide long/short/flat per coin. Holding yesterday's position is "
                 "free of cost; changing it is not. Do nothing unless there's a reason.",
+        "market": macro or {},
         "coins": snapshot,
     }
     return ("Here is today's market picture. Call submit_decisions with one entry "
@@ -268,9 +291,10 @@ class TradeBrain:
             self._client = anthropic.Anthropic(api_key=self._api_key, timeout=TIMEOUT_SECS)
         return self._client
 
-    def decide(self, snapshot: Dict, now) -> BrainResult:
+    def decide(self, snapshot: Dict, now, macro: Optional[Dict] = None) -> BrainResult:
         """Consult the brain for all coins. Never raises — fail-safe to empty
-        decisions (the runner then holds current positions)."""
+        decisions (the runner then holds current positions). `macro` carries
+        portfolio-wide context (sentiment, dominance, staleness)."""
         t0 = time.time()
         try:
             client = self._get_client()
@@ -281,7 +305,8 @@ class TradeBrain:
                          "cache_control": {"type": "ephemeral"}}],
                 tools=[DECISION_TOOL],
                 tool_choice={"type": "tool", "name": "submit_decisions"},
-                messages=[{"role": "user", "content": _build_user_message(snapshot, now)}],
+                messages=[{"role": "user",
+                           "content": _build_user_message(snapshot, now, macro)}],
             )
             decisions = _parse(resp)
             res = BrainResult(decisions=decisions, model=self.model,
