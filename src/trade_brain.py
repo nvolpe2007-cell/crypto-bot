@@ -107,6 +107,87 @@ DECISION_TOOL = {
 }
 
 
+# ── Portfolio overseer ───────────────────────────────────────────────────────
+# A SECOND, separate role for the same brain: read EVERY arm's live book and
+# produce a portfolio-level RISK REVIEW. This is OBSERVABILITY ONLY — its output
+# is never executed and changes no positions. Its job is judgment about the whole
+# book: concentration (many arms betting the same direction on the same coin),
+# arms fighting the tape, drawdown, and cost/overtrading discipline.
+OVERSEER_SYSTEM_PROMPT = """\
+You are the RISK OVERSEER for a multi-arm crypto PAPER trading system. Several \
+independent arms each run their own book: some are mechanical trend rules, some are \
+delta-neutral funding-carry arms, one is a discretionary "brain". You are shown every \
+arm's current equity, open positions, and recent P&L.
+
+YOUR OUTPUT IS ADVISORY ONLY. Nothing you say is executed; you change no positions. \
+You are a second pair of eyes that flags risk a single-arm view misses. Be concise, \
+specific, and honest — do NOT invent an edge or cheerlead.
+
+What to look for:
+  • CONCENTRATION / hidden correlation: if several arms are all LONG (or all SHORT) \
+    the same coin, the "diversified" book is really one big directional bet. Say so.
+  • FIGHTING THE TAPE: an arm short into a sustained bounce (or long into a drop), \
+    especially with a widening drawdown, is bleeding. Name it.
+  • DRAWDOWN: arms near or past their loss caps; books down materially on MTM.
+  • COST / OVERTRADING: arms churning for tiny edges (cost ~0.15-0.5% round-trip \
+    dominates at this size). Idle is usually fine; churn is the enemy.
+  • The honest baseline: this system has NO proven directional edge; trend's only \
+    proven value is downside protection. Flat is a legitimate position. If the whole \
+    book is quiet and that's appropriate, say that plainly rather than manufacturing \
+    concern.
+
+Call submit_review exactly once. Keep flags to what genuinely matters (0 is fine)."""
+
+REVIEW_TOOL = {
+    "name": "submit_review",
+    "description": "Submit one portfolio-level risk review.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "overall_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+            "portfolio_note": {"type": "string",
+                               "description": "1-3 sentence read of the whole book."},
+            "flags": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "arm": {"type": "string"},
+                        "severity": {"type": "string",
+                                     "enum": ["info", "warn", "critical"]},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["arm", "severity", "note"],
+                },
+            },
+            "suggestions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Non-binding observations. NOT executed.",
+            },
+        },
+        "required": ["overall_risk", "portfolio_note", "flags"],
+    },
+}
+
+
+@dataclass
+class ReviewResult:
+    overall_risk: str = "low"
+    portfolio_note: str = ""
+    flags: List[Dict[str, str]] = field(default_factory=list)
+    suggestions: List[str] = field(default_factory=list)
+    model: str = ""
+    latency_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and bool(self.portfolio_note)
+
+
 @dataclass
 class CoinDecision:
     coin: str
@@ -214,3 +295,52 @@ class TradeBrain:
             logger.warning("[TRADE_BRAIN] decide failed → hold current: %s", e)
             return BrainResult(decisions={}, model=self.model, error=str(e),
                                latency_ms=int((time.time() - t0) * 1000))
+
+    def review(self, portfolio: Dict, now) -> "ReviewResult":
+        """Portfolio-level RISK REVIEW across all arms. Advisory only — never
+        executed. Fail-safe: any error → empty review (the runner just skips)."""
+        t0 = time.time()
+        try:
+            client = self._get_client()
+            payload = {
+                "utc_time": now.isoformat() if hasattr(now, "isoformat") else str(now),
+                "note": "Review the whole book. Advisory only — you change no positions.",
+                "arms": portfolio,
+            }
+            user = ("Here is every arm's current book. Call submit_review once.\n\n"
+                    "```json\n" + json.dumps(payload, indent=2, default=str) + "\n```")
+            resp = client.messages.create(
+                model=self.model,
+                max_tokens=MAX_TOKENS,
+                system=[{"type": "text", "text": OVERSEER_SYSTEM_PROMPT,
+                         "cache_control": {"type": "ephemeral"}}],
+                tools=[REVIEW_TOOL],
+                tool_choice={"type": "tool", "name": "submit_review"},
+                messages=[{"role": "user", "content": user}],
+            )
+            data = {}
+            for block in getattr(resp, "content", []) or []:
+                if (getattr(block, "type", None) == "tool_use"
+                        and getattr(block, "name", None) == "submit_review"):
+                    data = block.input or {}
+                    break
+            if not data:
+                raise ValueError("no submit_review tool_use block in response")
+            res = ReviewResult(
+                overall_risk=str(data.get("overall_risk", "low")).lower(),
+                portfolio_note=str(data.get("portfolio_note", "")),
+                flags=[{"arm": str(f.get("arm", "")),
+                        "severity": str(f.get("severity", "info")).lower(),
+                        "note": str(f.get("note", ""))}
+                       for f in (data.get("flags") or []) if isinstance(f, dict)],
+                suggestions=[str(s) for s in (data.get("suggestions") or [])],
+                model=self.model, latency_ms=int((time.time() - t0) * 1000))
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                res.input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                res.output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            return res
+        except Exception as e:
+            logger.warning("[TRADE_BRAIN] review failed → skip: %s", e)
+            return ReviewResult(model=self.model, error=str(e),
+                                latency_ms=int((time.time() - t0) * 1000))

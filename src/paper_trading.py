@@ -878,6 +878,28 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     elif os.getenv('BRAIN_ARM_ENABLED', '1') == '1':
         logger.info("[BRAIN-ARM] idle — set ANTHROPIC_API_KEY in .env to activate the AI brain arm")
 
+    # Brain OVERSEER — the brain reads EVERY arm's book and posts a portfolio risk
+    # review (concentration, fighting-the-tape, drawdown, cost). OBSERVABILITY ONLY:
+    # it executes nothing. Runs less often than the trader arm (default 12h). Same
+    # API-key gate; disable with BRAIN_OVERSEER_ENABLED=0.
+    if os.getenv('BRAIN_OVERSEER_ENABLED', '1') == '1' and os.getenv('ANTHROPIC_API_KEY', ''):
+        async def _overseer_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('BRAIN_OVERSEER_INTERVAL_SEC', '43200'))  # 12h
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'brain_overseer.py'], env={**os.environ},
+                        timeout=180, capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[BRAIN-OVERSEER] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('brain_overseer', _overseer_loop, notifier=notifier))
+        logger.info("[BRAIN-OVERSEER] portfolio risk-review started (in-process, advisory only)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "

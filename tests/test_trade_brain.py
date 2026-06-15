@@ -4,12 +4,14 @@ No network: a fake Anthropic client is injected, mirroring src/altperp/ai_brain 
 """
 
 import importlib
+import json
 from datetime import datetime, timezone
 
 import pytest
 
 import src.trade_brain as tb
 import brain_paper as bp
+import brain_overseer as bo
 
 
 # ── fake Anthropic plumbing ──────────────────────────────────────────────────
@@ -189,3 +191,56 @@ def test_drawdown_stop_noop_within_cap(monkeypatch):
     # -$10 unrealized, well inside the -$200 cap → no stop.
     assert bp.maybe_drawdown_stop(st, {"BTC": 110.0}, {"BTC": {"t": 2000}}, now) is False
     assert st.get("halted", False) is False and "BTC" in st["positions"]
+
+
+# ── portfolio overseer (advisory risk review across all arms) ─────────────────
+
+class _ReviewResp:
+    def __init__(self, payload):
+        self.content = [_Block("submit_review", payload)]
+        self.usage = _Usage()
+
+
+class _ReviewClient:
+    def __init__(self, payload):
+        self._payload = payload
+        self.messages = self
+
+    def create(self, **kwargs):
+        return _ReviewResp(self._payload)
+
+
+def test_review_parses_flags_and_risk():
+    payload = {"overall_risk": "Medium", "portfolio_note": "Book is one big short bet.",
+               "flags": [{"arm": "AI Brain", "severity": "Warn", "note": "short into a bounce"}],
+               "suggestions": ["consider trimming SOL short"]}
+    res = tb.TradeBrain(client=_ReviewClient(payload)).review({}, datetime.now(timezone.utc))
+    assert res.ok and res.overall_risk == "medium"          # normalised lower
+    assert res.flags[0]["arm"] == "AI Brain" and res.flags[0]["severity"] == "warn"
+    assert res.suggestions == ["consider trimming SOL short"]
+
+
+def test_review_failsafe_on_no_tool_block():
+    class _Empty:
+        messages = property(lambda self: self)
+    client = _FakeClient([])            # returns submit_decisions, not submit_review
+    res = tb.TradeBrain(client=client).review({}, datetime.now(timezone.utc))
+    assert res.ok is False and res.error is not None        # fail-safe → skip, no crash
+
+
+def test_positions_brief_handles_dict_and_list():
+    as_dict = bo._positions_brief({"BTC": {"symbol": "BTC", "side": -1, "entry": 100, "size_usd": 50}})
+    as_list = bo._positions_brief([{"symbol": "ETH", "side": 1, "entry": 200, "size_usd": 60}])
+    assert as_dict[0]["dir"] == "short" and as_dict[0]["symbol"] == "BTC"
+    assert as_list[0]["dir"] == "long" and as_list[0]["size_usd"] == 60
+
+
+def test_own_book_summary_uses_mtm_and_pnl(tmp_path):
+    p = tmp_path / "x_state.json"
+    p.write_text(json.dumps({"starting_equity": 1000, "equity": 1000, "equity_mtm": 944.71,
+                             "positions": {"BTC": {"symbol": "BTC", "side": -1, "entry": 63000,
+                                                   "size_usd": 466}},
+                             "closed": [], "halted": False}))
+    s = bo._own_book_summary(p, "AI Brain")
+    assert s["equity_mtm"] == 944.71 and s["pnl"] == -55.29   # MTM preferred over realized
+    assert s["open_positions"][0]["dir"] == "short"
