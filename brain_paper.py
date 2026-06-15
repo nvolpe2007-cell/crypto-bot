@@ -30,6 +30,12 @@ COST_FRAC = float(os.getenv("BRAIN_COST_FRAC", "0.0015"))      # perp taker + sl
 FUNDING_APY = float(os.getenv("BRAIN_FUNDING_APY", "0.10"))    # conservative funding drag
 STARTING_EQUITY = float(os.getenv("BRAIN_START_EQUITY", "1000"))
 BASE_ALLOC = round(STARTING_EQUITY / len(KRAKEN_PAIRS), 2)     # per-coin base notional
+# Mark-to-market drawdown stop (USD). When the book's MTM equity (realized + open
+# unrealized at current price) falls to start - this, flatten every position at the
+# current price and HALT new entries until re-armed. The brain can still flip/close
+# while halted; it just can't open fresh risk. 0 disables. Default 200 = -20% on a
+# $1k book: a generous leash that respects the brain's conviction but caps a blowup.
+MAX_DRAWDOWN = float(os.getenv("BRAIN_MAX_DRAWDOWN", "200"))
 # DRY RUN / self-test: exercise the FULL pipeline (live data -> snapshot -> decide ->
 # paper account -> Telegram) with a transparent local heuristic instead of the API,
 # on a SEPARATE state file so it never pollutes the real brain ledger. Lets you verify
@@ -92,6 +98,7 @@ def _load_state() -> dict:
         return json.loads(STATE_FILE.read_text())
     return {"positions": {}, "closed": [], "last_bar_t": {}, "decisions": [],
             "starting_equity": STARTING_EQUITY, "equity": STARTING_EQUITY,
+            "equity_mtm": STARTING_EQUITY, "equity_curve": [], "halted": False,
             "started_at": datetime.now(timezone.utc).isoformat()}
 
 
@@ -130,8 +137,56 @@ def _open(state: dict, coin: str, side: int, size_usd: float, price: float, ts: 
                                 "entry_ts": ts, "size_usd": round(size_usd, 2)}
 
 
-def apply_decision(state: dict, coin: str, dec, price: float, ts: str) -> int:
-    """Reconcile the coin's position to the brain's target. Returns # actions taken."""
+def _unrealized(state: dict, prices: dict) -> float:
+    """Open positions' P&L marked at current prices (0 for any coin we can't price)."""
+    upnl = 0.0
+    for coin, p in state.get("positions", {}).items():
+        px = prices.get(coin)
+        if px and p.get("entry"):
+            upnl += p["size_usd"] * p["side"] * (px - p["entry"]) / p["entry"]
+    return upnl
+
+
+def mtm_equity(state: dict, prices: dict) -> float:
+    """Realized equity + open unrealized P&L. This is the honest book value; the
+    plain `equity` field only moves on a close and hides open drawdown."""
+    return state.get("equity", STARTING_EQUITY) + _unrealized(state, prices)
+
+
+def maybe_drawdown_stop(state: dict, prices: dict, latest: dict, now) -> bool:
+    """If MTM equity has breached the cap, flatten every priceable position at the
+    current price, mark the book halted, and alert. Returns True if it engaged.
+    Idempotent: a book already halted with no open positions just stays halted."""
+    if MAX_DRAWDOWN <= 0:
+        return False
+    start = state.get("starting_equity", STARTING_EQUITY)
+    if mtm_equity(state, prices) > start - MAX_DRAWDOWN:
+        return False
+    already = state.get("halted", False)
+    realized_before = state.get("equity", STARTING_EQUITY)
+    for coin in list(state["positions"].keys()):
+        px = prices.get(coin)
+        if not px:
+            continue
+        ts = str(latest.get(coin, {}).get("t", ""))
+        rec = _close(state, coin, px, ts, "risk:drawdown_stop")
+        print(f"{coin}: DRAWDOWN STOP close @ {px:.4f} net=${rec['pnl']:+.2f}")
+    state["halted"] = True
+    state["halted_at"] = now.isoformat()
+    if not already:
+        _alert(state, f"\U0001f6d1 <b>AI Brain — DRAWDOWN STOP</b>\n"
+                      f"MTM equity breached the -${MAX_DRAWDOWN:.0f} cap. Flattened all "
+                      f"positions (realized ${state.get('equity', STARTING_EQUITY)-realized_before:+.2f}); "
+                      f"new entries halted until re-armed (set BRAIN_REARM=1 or raise "
+                      f"BRAIN_MAX_DRAWDOWN). Equity now ${state.get('equity', STARTING_EQUITY):,.2f}.")
+    return True
+
+
+def apply_decision(state: dict, coin: str, dec, price: float, ts: str,
+                   allow_open: bool = True) -> int:
+    """Reconcile the coin's position to the brain's target. Returns # actions taken.
+    When allow_open is False (book halted) the brain may still close/flatten but cannot
+    open fresh risk."""
     target = {"long": 1, "short": -1, "flat": 0}.get(dec.action, 0)
     # Aggressive but bounded: conviction-scaled size up to 2.5x base per coin.
     size_usd = BASE_ALLOC * max(0.0, min(2.5, dec.size_mult)) if target != 0 else 0.0
@@ -146,11 +201,25 @@ def apply_decision(state: dict, coin: str, dec, price: float, ts: str) -> int:
         cur = 0
     # Open the new side.
     if target != 0 and cur == 0:
+        if not allow_open:
+            print(f"{coin}: OPEN {dec.action.upper()} SKIPPED — book halted (drawdown stop)")
+            return acted
         _open(state, coin, target, size_usd, price, ts)
         print(f"{coin}: OPEN {dec.action.upper()} @ {price:.4f} size=${size_usd:.0f} "
               f"conv={dec.conviction} ({dec.key_signal[:40]})")
         acted += 1
     return acted
+
+
+def _alert(state: dict, html: str) -> None:
+    """Fire a one-off Telegram message (risk alerts). Never raises."""
+    if os.getenv("BRAIN_NOTIFY", "1") != "1":
+        return
+    try:
+        from src.notifications import create_notifier_from_env
+        create_notifier_from_env().send_message(html)
+    except Exception as e:
+        print(f"[brain_paper] telegram alert skipped: {e}")
 
 
 def _notify(state: dict, result, prices: dict, acted: int) -> None:
@@ -164,11 +233,14 @@ def _notify(state: dict, result, prices: dict, acted: int) -> None:
         return
     eq = state.get("equity", STARTING_EQUITY)
     start = state.get("starting_equity", STARTING_EQUITY)
-    icon = "🧠📈" if eq >= start else "🧠📉"
+    upnl = _unrealized(state, prices)
+    eq_mtm = eq + upnl
+    icon = "🧠📈" if eq_mtm >= start else "🧠📉"
     title = "AI Brain — SELF-TEST (dry run, not the AI)" if DRY_RUN else "AI Brain — Paper Account"
-    lines = [f"{icon} <b>{title}</b>",
-             f"Equity: <b>${eq:,.2f}</b>  (start ${start:,.0f}, {eq-start:+.2f})  "
-             f"closed: {len(state.get('closed', []))}"]
+    halt = "  ⛔HALTED" if state.get("halted") else ""
+    lines = [f"{icon} <b>{title}</b>{halt}",
+             f"Equity (MTM): <b>${eq_mtm:,.2f}</b>  ({eq_mtm-start:+.2f}, {(eq_mtm/start-1)*100:+.1f}%)  "
+             f"[realized ${eq:,.2f}, open ${upnl:+.2f}]  closed: {len(state.get('closed', []))}"]
     for coin, p in state.get("positions", {}).items():
         px = prices.get(coin)
         sd = "🟢LONG" if p["side"] > 0 else "🔴SHORT"
@@ -222,6 +294,29 @@ def main():
             prices[coin] = bars[-1]["c"]
             latest[coin] = bars[-1]
 
+    now = datetime.now(timezone.utc)
+    # Re-arm a previously halted book only on explicit request.
+    if state.get("halted") and os.getenv("BRAIN_REARM", "0") == "1":
+        state["halted"] = False
+        state.pop("halted_at", None)
+        print("[brain_paper] re-armed (BRAIN_REARM=1) — new entries allowed again.")
+
+    # Risk + observability run on EVERY invocation (even with no fresh bar or no API
+    # key): mark the book to market and enforce the drawdown stop on open positions,
+    # so a losing book can't bleed unbounded between daily decisions or hide behind a
+    # frozen realized-equity number.
+    if prices:
+        stopped = maybe_drawdown_stop(state, prices, latest, now)
+        eq_mtm = mtm_equity(state, prices)
+        state["equity_mtm"] = round(eq_mtm, 2)
+        state.setdefault("equity_curve", []).append(
+            {"ts": now.isoformat(), "equity_mtm": round(eq_mtm, 2),
+             "realized": round(state.get("equity", STARTING_EQUITY), 2)})
+        state["equity_curve"] = state["equity_curve"][-400:]
+        if stopped:
+            print(f"[brain_paper] DRAWDOWN STOP engaged — MTM ${eq_mtm:,.2f} "
+                  f"<= start-${MAX_DRAWDOWN:.0f}; positions flattened, new entries halted.")
+
     brain = None
     if not DRY_RUN:
         brain = TradeBrain()
@@ -241,7 +336,6 @@ def main():
         return
 
     snapshot = build_snapshot({c: closes[c] for c in closes}, state)
-    now = datetime.now(timezone.utc)
     if DRY_RUN:
         result = _dry_run_result(snapshot)
         print("[brain_paper] *** DRY RUN / SELF-TEST *** local heuristic, NO API call, "
@@ -254,12 +348,16 @@ def main():
             return
 
     total = 0
+    allow_open = not state.get("halted", False)
     for coin in fresh:
         dec = result.decisions.get(coin)
         if dec is None:
             continue
-        total += apply_decision(state, coin, dec, prices[coin], str(latest[coin]["t"]))
+        total += apply_decision(state, coin, dec, prices[coin], str(latest[coin]["t"]),
+                                allow_open=allow_open)
         state["last_bar_t"][coin] = latest[coin]["t"]
+    # Positions may have changed (flips/closes) — refresh the MTM mark before saving.
+    state["equity_mtm"] = round(mtm_equity(state, prices), 2)
     # Keep a rolling log of the brain's reasoning (last 50 decisions).
     state["decisions"].append({"ts": now.isoformat(),
                                "decisions": {c: vars(d) for c, d in result.decisions.items()},
@@ -269,10 +367,12 @@ def main():
     _notify(state, result, prices, total)
     _save_state(state)
     eq = state.get("equity", STARTING_EQUITY)
+    eq_mtm = state.get("equity_mtm", eq)
     held = {c: ("L" if p["side"] > 0 else "S") for c, p in state["positions"].items()}
-    print(f"[brain_paper] {now:%Y-%m-%d %H:%M} UTC  equity=${eq:.2f} "
-          f"({eq-state.get('starting_equity', STARTING_EQUITY):+.2f}) acted={total} "
-          f"held={held} closed={len(state['closed'])} "
+    print(f"[brain_paper] {now:%Y-%m-%d %H:%M} UTC  equity_mtm=${eq_mtm:.2f} "
+          f"({eq_mtm-state.get('starting_equity', STARTING_EQUITY):+.2f}) "
+          f"[realized ${eq:.2f}] acted={total} held={held} "
+          f"{'HALTED ' if state.get('halted') else ''}closed={len(state['closed'])} "
           f"model={result.model} tok={result.input_tokens}/{result.output_tokens}")
 
 

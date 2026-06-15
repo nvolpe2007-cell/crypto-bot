@@ -142,3 +142,50 @@ def test_build_snapshot_has_factual_fields():
     snap = bp.build_snapshot(closes, _state())
     assert "vs_sma50_pct" in snap["BTC"] and "ret_20d_pct" in snap["BTC"]
     assert snap["BTC"]["current_position"] == "flat"
+
+
+# ── mark-to-market + drawdown stop ───────────────────────────────────────────
+
+def test_mtm_equity_includes_open_unrealized(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "short", 1.0), 100.0, "1000")
+    # price rose 10% against a short on $100 → -$10 unrealized, realized still flat.
+    assert bp.mtm_equity(st, {"BTC": 110.0}) == pytest.approx(990.0)
+    assert st["equity"] == 1000.0   # realized untouched until close
+
+
+def test_drawdown_stop_flattens_and_halts(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    monkeypatch.setattr(bp, "COST_FRAC", 0.0)
+    monkeypatch.setattr(bp, "FUNDING_APY", 0.0)
+    monkeypatch.setattr(bp, "MAX_DRAWDOWN", 50.0)
+    monkeypatch.setenv("BRAIN_NOTIFY", "0")
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "short", 1.0), 100.0, "1000")
+    now = datetime.now(timezone.utc)
+    # price +60% → -$60 unrealized, breaches the -$50 cap.
+    engaged = bp.maybe_drawdown_stop(st, {"BTC": 160.0}, {"BTC": {"t": 2000}}, now)
+    assert engaged is True
+    assert st["halted"] is True and "BTC" not in st["positions"]
+    assert st["equity"] == pytest.approx(940.0)   # -$60 realized at the stop
+
+
+def test_drawdown_stop_blocks_new_opens(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    st = _state()
+    st["halted"] = True
+    acted = bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "long", 1.0),
+                              100.0, "1000", allow_open=False)
+    assert acted == 0 and "BTC" not in st["positions"]
+
+
+def test_drawdown_stop_noop_within_cap(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    monkeypatch.setattr(bp, "MAX_DRAWDOWN", 200.0)
+    st = _state()
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "short", 1.0), 100.0, "1000")
+    now = datetime.now(timezone.utc)
+    # -$10 unrealized, well inside the -$200 cap → no stop.
+    assert bp.maybe_drawdown_stop(st, {"BTC": 110.0}, {"BTC": {"t": 2000}}, now) is False
+    assert st.get("halted", False) is False and "BTC" in st["positions"]
