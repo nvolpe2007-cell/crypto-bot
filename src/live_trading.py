@@ -58,6 +58,7 @@ class LivePosition:
     take_profit_price: float
     entry_signal:     Optional[ScientificSignal] = None
     unrealized_pnl:   float = 0.0
+    entry_fee:        float = 0.0  # actual fee charged on the opening order
 
 
 @dataclass
@@ -211,6 +212,7 @@ class LiveTrader:
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
             entry_signal=signal,
+            entry_fee=actual_fee,
         )
         self.positions[symbol] = pos
         logger.info(
@@ -243,7 +245,9 @@ class LiveTrader:
         exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
         self.account.total_fees += exit_fee
 
-        pnl     = (exec_price - pos.entry_price) * pos.size - pos.size_usd * FEE_RATE - exit_fee
+        # Use the actual entry fee charged at open (not a re-estimate) so realized
+        # PnL matches the real account balance change.
+        pnl     = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
         pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
 
         trade = Trade(
@@ -255,7 +259,7 @@ class LiveTrader:
             side='sell',
             pnl=pnl,
             pnl_pct=pnl_pct,
-            fees=exit_fee,
+            fees=pos.entry_fee + exit_fee,
         )
         self.account.closed_trades.append(trade)
         self.account.total_pnl += pnl
