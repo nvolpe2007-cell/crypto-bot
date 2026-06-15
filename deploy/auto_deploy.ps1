@@ -16,6 +16,10 @@
     - Passwordless SSH set up to crypto-bot-vps (one-time install via gist)
     - gh CLI authenticated for git push (already configured)
 
+  NOTE: This file is intentionally PURE ASCII. Windows PowerShell 5.1 reads .ps1
+  files without a BOM as the ANSI codepage (cp1252), which mangles UTF-8 dashes/
+  box-drawing chars into stray curly-quote bytes and breaks parsing. Keep it ASCII.
+
 .PARAMETER Commit
   Stage and commit all tracked changes before pushing.
 
@@ -48,14 +52,14 @@ function Fail($msg) { Write-Host "[FAIL] $msg" -ForegroundColor Red; exit 1 }
 
 Set-Location $RepoRoot
 
-# ── 1. Sanity ─────────────────────────────────────────────────────────────────
+# -- 1. Sanity ------------------------------------------------------------------
 Step "Verifying local repo state"
 $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
 if ($branch -ne 'master') { Fail "Not on master (current: $branch)" }
 Write-Host "  branch: $branch"
 Write-Host "  HEAD:   $((& git log -1 --oneline).Trim())"
 
-# ── 2. Optional commit ────────────────────────────────────────────────────────
+# -- 2. Optional commit ---------------------------------------------------------
 # SAFETY: never `git add -A`. Caller must stage with `git add <files>` before
 # invoking with -Commit. We only commit what's already in the index.
 # This prevents accidentally shipping .env, .env.vps, embedded worktrees,
@@ -71,13 +75,13 @@ if ($Commit) {
     $body = @"
 $Message
 
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 "@
     & git commit -m $body | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail "git commit failed" }
 }
 
-# ── 3. Push ───────────────────────────────────────────────────────────────────
+# -- 3. Push --------------------------------------------------------------------
 # Note: `git push` writes its progress to stderr by default. Under
 # `$ErrorActionPreference='Stop'` PowerShell treats stderr from native cmds
 # as a terminating exception even on exit 0, so we capture both streams as
@@ -91,7 +95,7 @@ $ErrorActionPreference = $prevPref
 $pushOutput.TrimEnd().Split("`n") | ForEach-Object { Write-Host "  $_" }
 if ($pushExit -ne 0) { Fail "git push failed (exit $pushExit)" }
 
-# ── 4. Trigger VPS update ─────────────────────────────────────────────────────
+# -- 4. Trigger VPS update ------------------------------------------------------
 # Capture the currently-deployed commit BEFORE updating, so a failed deploy can
 # be rolled back to a known-good SHA (more reliable than reflog HEAD@{1}).
 $prevSha = (& ssh $VPSHost "cd /opt/crypto-bot && git rev-parse HEAD").Trim()
@@ -102,20 +106,20 @@ Step "Running vps_update.sh on $VPSHost"
 & ssh $VPSHost "bash /opt/crypto-bot/deploy/vps_update.sh 2>&1 | tail -25"
 if ($LASTEXITCODE -ne 0) { Fail "vps_update.sh failed (exit $LASTEXITCODE)" }
 
-# ── 5. Verify the bot is alive — AUTO-ROLLBACK if the new commit won't run ─────
+# -- 5. Verify the bot is alive - AUTO-ROLLBACK if the new commit won't run -----
 Step "Waiting ${Wait}s then checking service health"
 Start-Sleep -Seconds $Wait
 $alive = (& ssh $VPSHost "systemctl is-active crypto-bot").Trim()
 if ($alive -ne "active") {
-    Step "Service is '$alive' after deploy — ROLLING BACK to $prevSha"
+    Step "Service is '$alive' after deploy - ROLLING BACK to $prevSha"
     & ssh $VPSHost "cd /opt/crypto-bot && git reset --hard $prevSha && sudo systemctl restart crypto-bot && sleep $Wait"
     $recovered = (& ssh $VPSHost "systemctl is-active crypto-bot").Trim()
     & ssh $VPSHost "journalctl -u crypto-bot --no-pager -n 25"
     if ($recovered -eq "active") {
-        Fail "Deploy failed health check; ROLLED BACK to $prevSha and the service recovered. The pushed commit is bad — investigate before redeploying."
+        Fail "Deploy failed health check; ROLLED BACK to $prevSha and the service recovered. The pushed commit is bad - investigate before redeploying."
     } else {
         Fail "Deploy FAILED health check and rollback did NOT recover (service=$recovered). Manual intervention required on $VPSHost."
     }
 }
 & ssh $VPSHost "journalctl -u crypto-bot --no-pager -n 15"
-Step "Deploy complete — service healthy"
+Step "Deploy complete - service healthy"
