@@ -827,6 +827,34 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('tsmom_ls', _tsmom_ls_loop, notifier=notifier))
         logger.info("[TSMOM-LS] long/short perp daily forward arm started (in-process, paper)")
 
+    # ── Leveraged perp arm (3x + fixed take-profit, "sell in profit") ───────────────
+    # Opens a LEVERAGED (default 3x) perp in the trend direction and exits on a fixed
+    # take-profit, with a realistic liquidation as the downside — the owner's explicit
+    # "place a trade with leverage and sell in profit" request, run honestly on its own
+    # $1k PAPER book (US Kraken-spot can't trade perps for real yet). Judged head-to-head
+    # by proof_scorecard (_lev_perp_forward); leverage is settled-dangerous (memory
+    # doubling_in_a_month_verdict) so this PROVES OR KILLS it on the forward clock.
+    # In-process via subprocess; disable with LEV_PERP_ARM_ENABLED=0.
+    if os.getenv('LEV_PERP_ARM_ENABLED', '1') == '1':
+        async def _lev_perp_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('LEV_PERP_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'LEV_PERP_STATE_FILE': 'data/lev_perp_state.json',
+                   'LEV_PERP_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'lev_perp_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[LEV-PERP] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('lev_perp', _lev_perp_loop, notifier=notifier))
+        logger.info("[LEV-PERP] leveraged perp (3x + take-profit) daily forward arm started (in-process, paper)")
+
     # ── AI brain discretionary arm (Claude decides long/short/flat on its own book) ─
     # The mechanical arms follow a fixed rule; this one asks Claude each day to decide
     # per coin from the full market picture, on its own $1k paper perp account, judged

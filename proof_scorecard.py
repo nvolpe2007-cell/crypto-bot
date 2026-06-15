@@ -304,6 +304,31 @@ def _brain_forward() -> dict | None:
     return dict(label='AI brain discretionary (FORWARD, paper)', executable=True, **s)
 
 
+def _lev_perp_forward() -> dict | None:
+    """Leveraged perp arm forward record (lev_perp_paper.py): opens a 3x perp in the
+    trend direction and exits on a FIXED TAKE-PROFIT ('sell in profit'), with a
+    realistic liquidation as the downside. Its own paper book, judged on the SAME
+    pre-registered bar — the honest test of whether leverage+take-profit beats the
+    1x rules, or just liquidates faster (memory doubling_in_a_month_verdict). PAPER
+    only (US Kraken-spot can't trade perps yet). Entry-week clustered."""
+    path = DATA / 'lev_perp_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Leveraged perp 3x + take-profit (FORWARD, paper)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -445,6 +470,7 @@ def main():
         _tsmom_ls_forward(),
         _brain_forward(),
         _regime_forward(),
+        _lev_perp_forward(),
         _directional(),
     ] if a]
 
