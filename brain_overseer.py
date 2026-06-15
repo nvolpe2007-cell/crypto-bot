@@ -151,24 +151,33 @@ _SEV_ICON = {"info": "ℹ️", "warn": "⚠️", "critical": "🚨"}
 _RISK_ICON = {"low": "🟢", "medium": "🟡", "high": "🔴"}
 
 
+def _clip(s: str, n: int) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
 def _format_telegram(result, now) -> str:
+    # Telegram hard-caps a message at 4096 chars; the brain can be verbose, so bound
+    # every field and the whole message rather than getting a 400 and dropping it.
     lines = [f"🧠🛡️ <b>AI Brain — Portfolio Risk Review</b>",
              f"{_RISK_ICON.get(result.overall_risk, '⚪')} Overall risk: "
              f"<b>{result.overall_risk.upper()}</b>  "
              f"<i>{now:%Y-%m-%d %H:%M} UTC</i>",
              "",
-             result.portfolio_note]
+             _clip(result.portfolio_note, 800)]
     if result.flags:
         lines.append("")
-        for f in result.flags:
+        for f in result.flags[:8]:
             icon = _SEV_ICON.get(f.get("severity", "info"), "•")
-            lines.append(f"{icon} <b>{f.get('arm', '?')}</b>: {f.get('note', '')}")
+            lines.append(f"{icon} <b>{_clip(f.get('arm', '?'), 40)}</b>: "
+                         f"{_clip(f.get('note', ''), 280)}")
     if result.suggestions:
         lines.append("")
         lines.append("<i>Non-binding observations (not executed):</i>")
-        for s in result.suggestions:
-            lines.append(f"  • {s}")
-    return "\n".join(lines)
+        for s in result.suggestions[:6]:
+            lines.append(f"  • {_clip(s, 200)}")
+    msg = "\n".join(lines)
+    return msg if len(msg) <= 3900 else msg[:3899].rstrip() + "…"
 
 
 def main() -> int:

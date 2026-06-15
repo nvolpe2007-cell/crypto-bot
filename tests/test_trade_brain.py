@@ -235,6 +235,15 @@ def test_positions_brief_handles_dict_and_list():
     assert as_list[0]["dir"] == "long" and as_list[0]["size_usd"] == 60
 
 
+def test_format_telegram_bounded_for_telegram_limit():
+    res = tb.ReviewResult(overall_risk="high", portfolio_note="X" * 5000,
+                          flags=[{"arm": "A" * 100, "severity": "critical",
+                                  "note": "N" * 1000} for _ in range(20)],
+                          suggestions=["S" * 1000 for _ in range(20)])
+    msg = bo._format_telegram(res, datetime.now(timezone.utc))
+    assert len(msg) <= 3900            # never exceed Telegram's cap
+
+
 def test_positions_brief_handles_string_sides():
     # arms disagree on the representation: some store 'long'/'sell' not ±1.
     out = bo._positions_brief([{"symbol": "BTC", "side": "long"},
