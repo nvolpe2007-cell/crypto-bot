@@ -70,16 +70,29 @@ fi
 ./venv/bin/pip install --upgrade pip --quiet
 
 echo "[5/7] Installing requirements..."
-# pandas-ta has known PyPI install issues on some Pythons; try pinned first, fallback to GitHub
-./venv/bin/pip install --quiet -r requirements.txt 2>/tmp/pip-err.log || {
-    echo "  requirements.txt install partially failed; trying pandas-ta from GitHub..."
-    ./venv/bin/pip install --quiet 'pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git' || true
-    ./venv/bin/pip install --quiet -r requirements.txt || {
-        echo "  ERROR: dependency install failed. See /tmp/pip-err.log"
-        cat /tmp/pip-err.log
-        exit 1
-    }
-}
+# RESILIENT BY DESIGN: pandas-ta is NOT in requirements.txt (not on PyPI; its git
+# source refuses an unauthenticated clone from the VPS). A pip hiccup must NOT abort
+# the deploy before the unit-refresh/restart steps — that was the root cause of the
+# 2026-06-15 systemd unit drift. So: best-effort install, bootstrap pandas-ta ONLY if
+# missing (multi-source, non-fatal), then VERIFY the critical deps actually import and
+# fail ONLY on a genuinely broken env.
+./venv/bin/pip install --quiet -r requirements.txt 2>/tmp/pip-err.log || \
+    echo "  note: 'pip install -r' returned non-zero (tolerated; verifying imports below)"
+
+if ! ./venv/bin/python -c 'import pandas_ta' 2>/dev/null; then
+    echo "  pandas_ta missing; bootstrapping (only-if-missing, non-fatal)..."
+    ./venv/bin/pip install --quiet pandas-ta 2>/dev/null \
+        || ./venv/bin/pip install --quiet 'pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git' 2>/dev/null \
+        || echo "  WARNING: could not install pandas_ta from any source"
+fi
+
+echo "  verifying critical imports..."
+if ! ./venv/bin/python -c 'import ccxt, pandas, numpy, yaml, pandas_ta, sklearn, anthropic' 2>>/tmp/pip-err.log; then
+    echo "  ERROR: a critical dependency is not importable. See /tmp/pip-err.log"
+    tail -20 /tmp/pip-err.log
+    exit 1
+fi
+echo "  critical deps OK"
 
 # ── 5. Ensure data/ and logs/ dirs exist ──────────────────────────────────────
 mkdir -p "$BOT_DIR/logs" "$BOT_DIR/data"
@@ -90,10 +103,22 @@ cp "$BOT_DIR/deploy/crypto-bot.service" "$SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable crypto-bot >/dev/null 2>&1
 
-# ── 7. (Re)start the bot ──────────────────────────────────────────────────────
+# ── 7. (Re)start the bot + ASSERT it actually came up ─────────────────────────
 echo "[7/7] Restarting service..."
 systemctl restart crypto-bot
-sleep 3
+sleep 8
+
+# Fail loudly if the service did not reach 'active' — a broken unit/env crash-loops
+# (status stays 'activating'/'failed'), and a silent "status printed, exit 0" let the
+# 2026-06-15 drift hide. The caller (auto_deploy.ps1) also health-checks, but make the
+# VPS script itself the first line of defense.
+ACTIVE="$(systemctl is-active crypto-bot || true)"
+if [ "$ACTIVE" != "active" ]; then
+    echo "  ERROR: service is '$ACTIVE' after restart (expected 'active')."
+    journalctl -u crypto-bot --no-pager -n 25
+    exit 1
+fi
+echo "  service is active."
 
 echo
 echo "=== Status ==="

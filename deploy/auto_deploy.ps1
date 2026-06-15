@@ -102,8 +102,10 @@ $prevSha = (& ssh $VPSHost "cd /opt/crypto-bot && git rev-parse HEAD").Trim()
 
 Step "Running vps_update.sh on $VPSHost"
 # vps_update.sh handles git fetch, .env preservation, requirements, systemd restart.
-# We tee its output but only show key lines locally to keep noise low.
-& ssh $VPSHost "bash /opt/crypto-bot/deploy/vps_update.sh 2>&1 | tail -25"
+# We tail its output to keep noise low, but `set -o pipefail` makes the pipeline's
+# exit code reflect vps_update.sh's failure (not tail's 0) - otherwise a failed update
+# would be silently masked (the gap that hid the 2026-06-15 unit drift).
+& ssh $VPSHost "set -o pipefail; bash /opt/crypto-bot/deploy/vps_update.sh 2>&1 | tail -30"
 if ($LASTEXITCODE -ne 0) { Fail "vps_update.sh failed (exit $LASTEXITCODE)" }
 
 # -- 5. Verify the bot is alive - AUTO-ROLLBACK if the new commit won't run -----

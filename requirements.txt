@@ -5,10 +5,15 @@
 # the live VPS env (2026-06-05).
 ccxt>=4.0.0,<5
 pandas>=2.0.0,<4
-# pandas-ta classic (0.3.14b0) was pulled from PyPI; install from the git source
-# instead so a clean `pip install -r requirements.txt` works (this is the same
-# source deploy/vps_update.sh already falls back to, so prod is unchanged).
-pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git
+# pandas-ta is NOT pip-managed here. It was pulled from PyPI under this name, and the
+# git source (github.com/twopirllc/pandas-ta) now refuses an unauthenticated clone
+# from the VPS ("could not read Username") — so listing it here ABORTED every
+# `pip install -r requirements.txt`, which in turn aborted the whole deploy before the
+# systemd-unit refresh/restart steps (the root cause of the 2026-06-15 unit drift).
+# The working build (pandas-ta 0.4.71b0, from pandas-ta.dev) is already in the venv and
+# is bootstrapped only-if-missing, multi-source + non-fatal, by deploy/vps_update.sh.
+# Do NOT re-add a hard `pandas-ta @ git+...` line — it is the dead source that broke deploys.
+# pandas-ta  (installed out-of-band; see deploy/vps_update.sh step 5)
 numpy>=1.24.0,<3
 python-dotenv>=1.0.0,<2
 PyYAML>=6.0,<7
