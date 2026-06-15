@@ -474,20 +474,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     try:
                         opps = _triarb_scanner.scan_once()
                         if opps:
+                            # MEASUREMENT ONLY. This is a DETECTOR, not an executor: it
+                            # logs whether triangular edges *appear* on REST/WS snapshots.
+                            # It must NOT write to the P&L ledger — recording un-executed
+                            # detections as realised, zero-slippage fills manufactured a
+                            # fake +$400 (3 legs crossed in series are pure slippage, and
+                            # the edges are mostly snapshot-staleness phantoms the module's
+                            # own docstring says don't persist). Keep the log as the record
+                            # of "do edges exist"; book nothing until a real executor exists.
                             logger.info(_triarb_scanner.format_log(opps))
-                            try:
-                                from .attribution import record as _attrib_record, ARM_TRIARB
-                                for _o in opps:
-                                    _attrib_record(
-                                        ARM_TRIARB, _o.cycle.label, side='cycle',
-                                        size_usd=_o.final_usd - _o.profit_usd,  # notional in
-                                        gross_pnl=_o.profit_usd,  # edge is already net of leg fees
-                                        fees_paid=0.0, slippage_cost=0.0,
-                                        net_pnl=_o.profit_usd, reason='triarb_cycle',
-                                        meta={'edge_bps': round(_o.edge_bps, 3)},
-                                    )
-                            except Exception:
-                                pass
                     except Exception as e:
                         logger.debug(f"[TRIARB] scan failed: {e}")
             _triarb_task = asyncio.create_task(supervised('triarb', _triarb_loop, notifier=notifier))
@@ -2204,6 +2199,26 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
                 _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
                 _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
+                # The AI brain runs out-of-process on its own $1k book; read its
+                # mark-to-market equity from state on disk so the heartbeat reflects
+                # its open drawdown (the `equity` field alone hides it). Kept as a
+                # separate segment — its bankroll is distinct from the arms above, so
+                # folding it into netPnL would mix books.
+                def _brain_mtm_hb():
+                    try:
+                        _bp = os.getenv("BRAIN_STATE_FILE", "data/brain_paper_state.json")
+                        with open(_bp) as _bf:
+                            _bd = json.load(_bf)
+                        _bs = float(_bd.get("starting_equity", 0.0) or 0.0)
+                        _bm = float(_bd.get("equity_mtm", _bd.get("equity", _bs)) or _bs)
+                        return _bm, _bm - _bs, bool(_bd.get("halted", False))
+                    except Exception:
+                        return None, 0.0, False
+                _brain_eq, _brain_pnl, _brain_halt = _brain_mtm_hb()
+                _brain_seg = ""
+                if _brain_eq is not None:
+                    _brain_seg = (f" brain={_brain_eq:.2f}[{_brain_pnl:+.2f}"
+                                  f"{' HALTED' if _brain_halt else ''}]")
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
@@ -2211,7 +2226,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
                     f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} "
-                    f"aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}])"
+                    f"aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}]{_brain_seg})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
