@@ -36,7 +36,10 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5
         if col_val and col_dir:
             df['supertrend']      = st[col_val[0]]
             df['supertrend_bull'] = st[col_dir[0]] == 1
-            df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+            # shift(1) produces object dtype in pandas 3; cast to bool before ~ to avoid
+            # bitwise-not on Python ints (~True == -2, truthy) instead of bool NOT.
+            _prev = df['supertrend_bull'].shift(1).fillna(True).astype(bool)
+            df['supertrend_flip'] = df['supertrend_bull'] & ~_prev
             return df
     except Exception:
         pass
@@ -85,7 +88,8 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5
 
     df['supertrend']      = st_line
     df['supertrend_bull'] = direction == 1
-    df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+    _prev = df['supertrend_bull'].shift(1).fillna(True).astype(bool)
+    df['supertrend_flip'] = df['supertrend_bull'] & ~_prev
     return df
 
 
