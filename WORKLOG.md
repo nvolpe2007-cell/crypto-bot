@@ -39,3 +39,4 @@ append an entry when you begin meaningful work and when you finish.
 | 2026-06-15 22:00–22:55 | Claude (computer) | merged to master | Brain MTM + drawdown stop; triarb phantom killed + ledger purged; brain in heartbeat; portfolio overseer; desk-context enrichment (commits 31b6e96→f1a3cc6). |
 | 2026-06-15 ~23:00–05:15 | dispatch | merged to master | Strategy rewrite (ATR trailing stops / 3-signal consensus / session filter / tiered sizing), statarb pairs trading, supertrend fix, ATR-gate loosening (commits 54675f4→cef65a2). Overwrote `paper_trading.py`, dropping the multi-arm wiring above. |
 | 2026-06-16 | Claude (computer) | `coordination-scaffolding` → PR | Added this WORKLOG + CLAUDE.md coordination section. No code/strategy changes. |
+| 2026-06-16 | dispatch | `dispatch/supertrend-fix-and-tests` → PR | Fixed `supertrend_flip` pandas-3.x boolean bug (shift→object dtype, ~True==-2 truthy); added 17 supertrend unit tests (zero coverage before). |
