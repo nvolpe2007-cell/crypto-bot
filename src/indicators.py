@@ -1,13 +1,116 @@
 """
 Technical Indicators for Scalping Strategy
-EMA Crossover + RSI
+EMA Crossover + RSI + Supertrend + ATR helpers
 """
 
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from typing import Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+
+
+# ── Supertrend ─────────────────────────────────────────────────────────────────
+
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5
+               ) -> pd.DataFrame:
+    """
+    Supertrend indicator.
+
+    Returns a copy of df with three new columns:
+      'supertrend'       — the supertrend line value
+      'supertrend_bull'  — True when price is above the band (bullish)
+      'supertrend_flip'  — True on the candle where direction just flipped bullish
+
+    Uses pandas_ta.supertrend if available, otherwise falls back to a
+    pure-pandas implementation so there are no hard extra dependencies.
+    """
+    df = df.copy()
+    try:
+        st = ta.supertrend(df['high'], df['low'], df['close'],
+                           length=period, multiplier=multiplier)
+        # pandas_ta column names: SUPERT_10_2.5, SUPERTd_10_2.5, ...
+        col_val = [c for c in st.columns if c.startswith('SUPERT_') and 'd' not in c and 'l' not in c and 's' not in c]
+        col_dir = [c for c in st.columns if c.startswith('SUPERTd_')]
+        if col_val and col_dir:
+            df['supertrend']      = st[col_val[0]]
+            df['supertrend_bull'] = st[col_dir[0]] == 1
+            df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+            return df
+    except Exception:
+        pass
+
+    # ── Fallback: manual implementation ───────────────────────────────────────
+    hl2 = (df['high'] + df['low']) / 2.0
+    atr_s = ta.atr(df['high'], df['low'], df['close'], length=period)
+    if atr_s is None:
+        df['supertrend'] = hl2
+        df['supertrend_bull'] = True
+        df['supertrend_flip'] = False
+        return df
+
+    upper_basic = hl2 + multiplier * atr_s
+    lower_basic = hl2 - multiplier * atr_s
+
+    upper = upper_basic.copy()
+    lower = lower_basic.copy()
+    direction = pd.Series(1, index=df.index)  # 1=bull, -1=bear
+
+    for i in range(1, len(df)):
+        prev_upper = upper.iloc[i - 1]
+        prev_lower = lower.iloc[i - 1]
+        prev_close = df['close'].iloc[i - 1]
+
+        upper.iloc[i] = (upper_basic.iloc[i]
+                         if upper_basic.iloc[i] < prev_upper or prev_close > prev_upper
+                         else prev_upper)
+        lower.iloc[i] = (lower_basic.iloc[i]
+                         if lower_basic.iloc[i] > prev_lower or prev_close < prev_lower
+                         else prev_lower)
+
+        prev_dir = direction.iloc[i - 1]
+        close_i  = df['close'].iloc[i]
+        if prev_dir == -1 and close_i > upper.iloc[i]:
+            direction.iloc[i] = 1
+        elif prev_dir == 1 and close_i < lower.iloc[i]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = prev_dir
+
+    # Supertrend line = lower band when bullish, upper band when bearish
+    st_line = pd.Series(index=df.index, dtype=float)
+    st_line[direction == 1]  = lower[direction == 1]
+    st_line[direction == -1] = upper[direction == -1]
+
+    df['supertrend']      = st_line
+    df['supertrend_bull'] = direction == 1
+    df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+    return df
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> Optional[pd.Series]:
+    """Convenience wrapper — returns ATR series or None."""
+    try:
+        return ta.atr(df['high'], df['low'], df['close'], length=period)
+    except Exception:
+        return None
+
+
+def ema_htf(closes: pd.Series, fast: int = 21, slow: int = 55
+            ) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Return the latest (fast_ema_value, slow_ema_value) from a higher-timeframe
+    close series.  Used for the 5m trend filter.
+    Returns (None, None) when there are too few candles.
+    """
+    if len(closes) < slow + 1:
+        return None, None
+    fast_s = ta.ema(closes, length=fast)
+    slow_s = ta.ema(closes, length=slow)
+    if fast_s is None or slow_s is None:
+        return None, None
+    return float(fast_s.iloc[-1]), float(slow_s.iloc[-1])
 
 
 class Signal(Enum):
