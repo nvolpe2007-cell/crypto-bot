@@ -19,10 +19,38 @@ losing trade had).
 """
 
 from __future__ import annotations
+import os
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, List, Literal, Optional
+from statistics import median
+from typing import Any, Callable, Deque, Dict, List, Literal, Optional
+
+from .session_filter import SessionEdge
 
 CheckKind = Literal["hard", "soft"]
+
+# ── Cost-aware volatility floor ──────────────────────────────────────────────
+# Round-trip cost (taker fee + spread + slippage) as a fraction of price.
+# Mirrors microstructure_strategy._ROUND_TRIP_COST_FRAC. A trade whose expected
+# per-bar move (ATR) is below the cost it must overcome cannot reach a
+# profitable target before fees — it is structurally negative-EV.
+_ROUND_TRIP_COST_FRAC = float(os.getenv("ROUND_TRIP_COST_FRAC", "0.003"))  # 0.30%
+
+# atr_alive floor = max(absolute floor, ATR_ALIVE_COST_MULT × round-trip cost).
+# Default 0.5 → ATR must be ≥ 0.15% (half the round-trip cost).
+# Journal audit (228 trades, May 2026) showed median ATR 0.07% and *max* 0.24%
+# — every trade's per-bar range was below the 0.30% cost, MFE median was 0.00%,
+# and the win rate was 0.9%. The old 0.05% floor let all of that churn through.
+# Set ATR_ALIVE_COST_MULT=1.0 to require ATR ≥ full round-trip cost (would have
+# blocked every loser in that sample); 0.0 restores the legacy 0.05% floor.
+_ATR_ALIVE_COST_MULT = float(os.getenv("ATR_ALIVE_COST_MULT", "0.5"))
+_ATR_ALIVE_FLOOR = max(0.0005, _ATR_ALIVE_COST_MULT * _ROUND_TRIP_COST_FRAC)
+
+# Session/time-of-day gate. Default SOFT (down-scores an UNFAVORABLE window but
+# never single-handedly vetoes) — measure-first. Set SESSION_FILTER_HARD=1 to
+# promote it to a hard veto once the per-session sample is large enough to trust.
+_SESSION_FILTER_HARD = os.getenv("SESSION_FILTER_HARD", "").strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 @dataclass
@@ -47,6 +75,25 @@ class CheckContext:
     sentiment_allows: bool                  # already evaluated by caller
     kill_filter_reason: Optional[str]       # output of _kill_filter_skip
     circuit_breaker_reason: Optional[str]   # None if can_enter
+    # Spread anomaly guard: caller passes current spread (as a fraction of price,
+    # e.g. 0.0008 = 8bp) and the rolling median over the last ~N samples. The
+    # _spread_normal check rejects when current is more than SPREAD_MAX_MULT ×
+    # median, which catches news spikes, whale events, and stop hunts. Both
+    # fields are optional so older call sites (and tests) still work.
+    current_spread_pct: Optional[float] = None
+    median_spread_pct:  Optional[float] = None
+    # VPIN guard: caller passes the current VPIN reading (or None on warm-up).
+    # The _vpin_safe check rejects when VPIN exceeds VPIN_TOXIC_THRESHOLD —
+    # the tape is being adversely selected and entries get knife-caught.
+    vpin: Optional[float] = None
+    vpin_threshold: float = 0.55
+    # Session/time-of-day guard: caller passes the UTC hour of the would-be
+    # entry and the SessionEdge verdict for that hour ("FAVORABLE"/"NEUTRAL"/
+    # "UNFAVORABLE"). The _session_favorable check soft-rejects UNFAVORABLE
+    # windows — ones where the bot has measured ITSELF losing money. Both
+    # optional so older call sites (and tests) still work; None ⇒ fail-open.
+    entry_hour: Optional[int] = None
+    session_verdict: Optional[str] = None
 
 
 @dataclass
@@ -207,6 +254,81 @@ def _regime_short_block(ctx: CheckContext):
     return True, ctx.regime_name
 
 
+# Multiplier above the rolling-median spread at which entries get vetoed.
+# 1.5× is the textbook setting from the algo-spread-monitor literature;
+# tightening to 1.3× or 1.2× refuses more trades during turbulent tape.
+SPREAD_MAX_MULT = 1.5
+
+
+def _vpin_safe(ctx: CheckContext):
+    """Hard veto: refuse to enter when order-flow toxicity (VPIN) is high.
+    VPIN > threshold means the recent volume bucket is heavily one-sided —
+    an informed trader is sweeping. Market-takers entering here get adversely
+    selected. Passes when no VPIN data is available yet (warm-up)."""
+    v = ctx.vpin
+    if v is None:
+        return True, "no vpin"
+    if v > ctx.vpin_threshold:
+        return False, f"vpin {v:.2f}>{ctx.vpin_threshold:.2f} toxic flow"
+    return True, f"vpin {v:.2f}"
+
+
+def _spread_normal(ctx: CheckContext):
+    """Hard veto: refuse to enter when the current spread is anomalously wide
+    relative to its rolling median. Wide spreads typically mean (a) a news
+    spike just hit, (b) a whale is sweeping levels, or (c) a stop run is in
+    progress — all of which adversely select market-takers. Passes silently
+    when no baseline data is available (warm-up window)."""
+    cur = ctx.current_spread_pct
+    med = ctx.median_spread_pct
+    if cur is None or med is None or med <= 0:
+        return True, "no baseline"
+    mult = cur / med
+    if mult > SPREAD_MAX_MULT:
+        return False, f"spread {cur*100:.3f}% = {mult:.1f}× median {med*100:.3f}%"
+    return True, f"spread {cur*100:.3f}% ({mult:.2f}× median)"
+
+
+# ── SpreadTracker — caller side, populated each tick from live order books ──
+
+class SpreadTracker:
+    """Tiny per-symbol rolling buffer of spread-as-fraction-of-price.
+
+    Used by the paper_trading main loop: on every tick that observes a fresh
+    bid/ask, call tracker.push(symbol, spread/price). At checklist time,
+    tracker.median(symbol) feeds CheckContext.median_spread_pct.
+
+    Asyncio-single-threaded — no locks. maxlen of 60 ≈ last ~2 minutes when the
+    loop ticks every ~2s; long enough to be robust, short enough to react when
+    the tape regime changes.
+    """
+
+    def __init__(self, maxlen: int = 60):
+        self.maxlen = maxlen
+        self._buf: Dict[str, Deque[float]] = {}
+
+    def push(self, symbol: str, spread_pct: float) -> None:
+        if spread_pct is None or spread_pct <= 0:
+            return
+        buf = self._buf.get(symbol)
+        if buf is None:
+            buf = deque(maxlen=self.maxlen)
+            self._buf[symbol] = buf
+        buf.append(float(spread_pct))
+
+    def current(self, symbol: str) -> Optional[float]:
+        buf = self._buf.get(symbol)
+        if not buf:
+            return None
+        return buf[-1]
+
+    def median(self, symbol: str, min_samples: int = 10) -> Optional[float]:
+        buf = self._buf.get(symbol)
+        if not buf or len(buf) < min_samples:
+            return None
+        return median(buf)
+
+
 # ── Soft predicates ─────────────────────────────────────────────────────────
 
 def _rsi_healthy(ctx: CheckContext):
@@ -236,16 +358,19 @@ def _volume_strong(ctx: CheckContext):
 
 
 def _atr_alive(ctx: CheckContext):
-    """Reject dead-volatility setups. ATR / price must be ≥ 0.08% to trade.
-    Covers normal market conditions where ATR/px is typically 0.10%–0.30%."""
+    """Reject dead-volatility setups whose expected per-bar move (ATR) is below
+    the round-trip cost. Such trades are structurally negative-EV: the price
+    cannot reach a profitable target before fees, so they bleed out via cost.
+    Floor = max(0.05%, ATR_ALIVE_COST_MULT × round-trip cost) — default 0.15%.
+    See journal audit note on _ATR_ALIVE_FLOOR above."""
     atr = getattr(ctx.sig, "atr", None)
     px  = getattr(ctx.sig, "close", None)
     if not atr or not px:
         return True, "no atr/price"
     ratio = atr / px
-    if ratio >= 0.0008:
+    if ratio >= _ATR_ALIVE_FLOOR:
         return True, f"atr/px={ratio*100:.3f}%"
-    return False, f"atr/px={ratio*100:.3f}%<0.08%"
+    return False, f"atr/px={ratio*100:.3f}%<{_ATR_ALIVE_FLOOR*100:.2f}%"
 
 
 def _lead_lag_aligned(ctx: CheckContext):
@@ -255,6 +380,19 @@ def _lead_lag_aligned(ctx: CheckContext):
     if ctx.sig.lead_lag_dir == want:
         return True, f"lead={ctx.sig.lead_lag_dir}"
     return False, f"lead={ctx.sig.lead_lag_dir} opposes"
+
+
+def _session_favorable(ctx: CheckContext):
+    """Reject entries in a time-of-day window where the bot has measured ITSELF
+    losing money (SessionEdge UNFAVORABLE). Passes on FAVORABLE/NEUTRAL and on
+    no verdict (warm-up / fail-open). Soft by default; hard when
+    SESSION_FILTER_HARD=1. See src/session_filter.py."""
+    v = ctx.session_verdict
+    if v is None or v in ("NEUTRAL", "FAVORABLE"):
+        sess = SessionEdge.session_of(ctx.entry_hour) if ctx.entry_hour is not None else None
+        return True, (v.lower() if v else "no session data") + (f" ({sess})" if sess else "")
+    sess = SessionEdge.session_of(ctx.entry_hour)
+    return False, f"session {v.lower()}" + (f" ({sess} hour {ctx.entry_hour})" if sess else "")
 
 
 def _funding_favorable(ctx: CheckContext):
@@ -282,6 +420,10 @@ def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("sentiment",         "hard", _sentiment),
         Check("kill_filter",       "hard", _kill_filter),
         Check("atr_alive",         "hard", _atr_alive),
+        Check("spread_normal",     "hard", _spread_normal),
+        Check("vpin_safe",         "hard", _vpin_safe),
+        Check("session_favorable", "hard" if _SESSION_FILTER_HARD else "soft",
+              _session_favorable, weight=1.0),
         Check("rsi_healthy",       "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",        "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",     "soft", _volume_strong,     weight=1.0),
@@ -302,6 +444,10 @@ def build_short_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("regime_short_block", "hard", _regime_short_block),
         Check("kill_filter",        "hard", _kill_filter),
         Check("atr_alive",          "hard", _atr_alive),
+        Check("spread_normal",      "hard", _spread_normal),
+        Check("vpin_safe",          "hard", _vpin_safe),
+        Check("session_favorable",  "hard" if _SESSION_FILTER_HARD else "soft",
+              _session_favorable, weight=1.0),
         Check("rsi_healthy",        "soft", _rsi_healthy,       weight=2.0),
         Check("adx_strong",         "soft", _adx_strong,        weight=2.0),
         Check("volume_strong",      "soft", _volume_strong,     weight=1.0),

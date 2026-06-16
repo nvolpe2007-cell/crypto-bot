@@ -23,8 +23,11 @@ import pandas_ta as _pta
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
-from .microstructure_strategy import MicrostructureStrategy, MicrostructureSignal
-from .exchange import ExchangeConnection
+from .microstructure_strategy import (
+    MicrostructureStrategy, MicrostructureSignal,
+    _ENTRY_GRACE_SECS as _MICRO_ENTRY_GRACE_SECS,
+)
+from .exchange import ExchangeConnection, CircuitBreakerOpen
 from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
@@ -33,7 +36,6 @@ from .regime_detector import RegimeDetector
 from .portfolio_optimizer import PortfolioOptimizer
 from .crypto_vol import CryptoVolMonitor
 from .order_flow import OrderFlowImbalance
-from .orderflow_ws import OrderFlowWS
 from .wick_analyzer import detect_rejection, detect_stop_hunt
 from .lead_lag_detector import LeadLagDetector
 from .trade_journal import TradeJournal, TradeRecord
@@ -42,17 +44,23 @@ from .state import write_state, read_state
 from .ml_scorer import MLScorer
 from .multi_timeframe import MultiTimeframeFilter
 from .mean_reversion_strategy import MeanReversionStrategy, MRSignal
-from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED
+from .probability_gate import ProbabilityGate, ENABLED as PROB_GATE_ENABLED, PROB_MODEL_VERSION
+from .expectancy_gate import ExpectancyGate
 from .macro_data import MacroDataProvider, alt_beta
 from .daily_circuit import DailyCircuitBreaker
 from .trailing_stop import update_trailing_stop
 from .entry_checklist import (
     CheckContext,
+    SpreadTracker,
     build_long_checklist,
     build_short_checklist,
 )
+from .session_filter import SessionEdge
+from .task_supervisor import supervised, get_health as _get_subsystem_health
 
 logger = logging.getLogger(__name__)
+
+# (PaperTrader + paper fill/PnL model extracted to paper_trader.py)
 
 # ── Funding rate helper ────────────────────────────────────────────────────────
 _SYMBOL_TO_FUNDING = {
@@ -96,10 +104,13 @@ def _load_adaptations():
 
 def _save_adaptations():
     try:
-        os.makedirs('logs', exist_ok=True)
+        dir_path = os.path.dirname(_ADAPT_FILE) or '.'
+        os.makedirs(dir_path, exist_ok=True)
         _adapt['updated_at'] = datetime.now(timezone.utc).isoformat()
-        with open(_ADAPT_FILE, 'w') as f:
+        tmp_path = _ADAPT_FILE + '.tmp'
+        with open(tmp_path, 'w') as f:
             json.dump(_adapt, f, indent=2)
+        os.replace(tmp_path, _ADAPT_FILE)  # atomic on POSIX — no partial-write corruption
     except Exception as e:
         logger.error(f"[ADAPT] Save failed: {e}")
 
@@ -300,318 +311,69 @@ def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
         # Probability gate
         prob_win           = round(float(getattr(pos, 'prob_win', 0.0)), 4) if pos else 0.0,
         edges_used         = ",".join(getattr(pos, 'edges_used', []) or []) if pos else '',
+        prob_model_version = int(getattr(pos, 'prob_model_version', 0)) if pos else 0,
     )
     journal.add(record)
+    # Mirror into the cross-arm attribution ledger (best-effort; never break flow).
+    try:
+        from .attribution import record as _attrib_record, ARM_DIRECTIONAL
+        _attrib_record(
+            ARM_DIRECTIONAL, symbol,
+            side=direction,
+            fill_price=entry_price_actual,
+            size_usd=getattr(pos, 'size_usd_target', 0.0) if pos else 0.0,
+            fees_paid=fees_paid,
+            slippage_cost=0.0,   # paper fills at reference; real slippage lands with the maker/live executor
+            net_pnl=trade.pnl,   # paper_trader pnl is already net of fees (paper_trader.py:267)
+            reason=reason,
+            signal={
+                'confidence': float(sig.confidence) if sig else 0.0,
+                'entry_path': getattr(pos, 'entry_path', 'main') if pos else 'main',
+                'ofi': float(sig.ofi or 0.0) if sig else 0.0,
+                'regime': regime,
+            },
+            opened_at=record.opened_at,
+            closed_at=record.closed_at,
+        )
+    except Exception:
+        pass
     return record
 
 
 # ── PaperPosition / PaperAccount / PaperTrader ────────────────────────────────
 
-@dataclass
-class PaperPosition:
-    entry_time:      datetime
-    entry_price:     float
-    size:            float
-    side:            str
-    entry_fee:       float = 0.0
-    unrealized_pnl:  float = 0.0
-    entry_signal:    Optional[ScientificSignal] = None   # full signal context
-    # Excursion tracking (updated each tick)
-    peak_favorable_price: float = 0.0    # best price for the position
-    peak_adverse_price:   float = 0.0    # worst price for the position
-    # Entry pathway: 'main' / 'mr' / 'mr-extreme' / 'fast-track'
-    entry_path:      str = 'main'
-    # Pre-trade context snapshot
-    size_usd_target: float = 0.0
-    spread_at_entry: float = 0.0
-    sentiment_fng:   Optional[int]   = None
-    sentiment_btc_dom: Optional[float] = None
-    # Probability gate output
-    prob_win:        float = 0.0
-    edges_used:      List[str] = field(default_factory=list)
-    # Conviction tier + trailing stop state (set on entry, updated each tick)
-    tier:                str   = 'scalp'
-    intended_hold_min:   int   = 0
-    trail_style:         str   = 'atr_stop'
-    trail_stop_price:    float = 0.0
-    target_usd_at_entry: float = 0.0
-    # Perp-only state (zero in spot mode)
-    is_perp:             bool  = False
-    leverage:            float = 1.0
-    margin_locked:       float = 0.0    # USD locked as margin (= notional / leverage)
-    funding_accrued:     float = 0.0    # cumulative funding paid (long) or collected (short)
-    last_funding_ts:     Optional[datetime] = None
+from .paper_trader import (  # extracted execution engine
+    _PERP_MAINT_MARGIN, PaperPosition, PaperAccount, PaperTrader,
+)
+class _FunnelStats:
+    """Exception-safe counter for the entry funnel.
 
+    Tracks where actionable signals die between strategy.evaluate() and order
+    execution, so we can see whether the bot is starved at the source (signals
+    are all HOLD) or killed by a specific downstream gate. Counts are per
+    heartbeat interval (reset each heartbeat). Adds no trading behavior — it only
+    counts — so it is safe to leave on permanently.
+    """
 
-@dataclass
-class PaperAccount:
-    initial_capital: float
-    cash:            float
-    positions:       Dict[str, PaperPosition] = field(default_factory=dict)
-    closed_trades:   List[Trade]              = field(default_factory=list)
-    total_pnl:       float = 0.0
+    def __init__(self):
+        self._c: Dict[str, int] = {}
 
+    def bump(self, key: str, n: int = 1):
+        self._c[key] = self._c.get(key, 0) + n
 
-class PaperTrader:
-    def __init__(self, initial_capital: float = 100.0,
-                 position_size: float = 50.0,     # kept for compat; scientific uses equity %
-                 fee_pct: float = 0.26,
-                 slippage_pct: float = 0.1,
-                 stop_loss_pct: float = 2.0,
-                 take_profit_pct: float = 3.0,
-                 perp_mode: bool = False,
-                 leverage: float = 1.0,
-                 allow_spot_shorts: bool = False):
-        self.initial_capital  = initial_capital
-        self.account          = PaperAccount(initial_capital=initial_capital, cash=initial_capital)
-        self.position_size    = position_size
-        self.fee_pct          = fee_pct / 100
-        self.slippage_pct     = slippage_pct / 100   # floor / fallback
-        self.stop_loss_pct    = stop_loss_pct / 100
-        self.take_profit_pct  = take_profit_pct / 100
-        self.running          = False
-        self._started_at: Optional[str] = None
-        # Live spread cache populated by paper_trading main loop; used for realistic slippage
-        self.live_spreads: Dict[str, float] = {}   # symbol → current spread in price units
-        # ── Perp mode state ───────────────────────────────────────────────────
-        self.perp_mode        = perp_mode
-        self.leverage         = max(1.0, float(leverage)) if perp_mode else 1.0
-        # Symbol → current 8h funding rate (fraction, e.g. 0.0001). Caller updates.
-        self._funding_rates: Dict[str, float] = {}
-        if perp_mode:
-            logger.info(f"[PaperTrader] PERP mode ON  leverage={self.leverage:.1f}x")
+    def render(self) -> str:
+        seen  = self._c.get('signals_seen', 0)
+        hold  = self._c.get('hold', 0)
+        act   = self._c.get('actionable', 0)
+        execd = self._c.get('exec:long', 0) + self._c.get('exec:short', 0)
+        skips = {k.split(':', 1)[1]: v for k, v in sorted(self._c.items())
+                 if k.startswith('skip:')}
+        skip_str = ' '.join(f"{k}={v}" for k, v in skips.items()) or 'none'
+        return (f"seen={seen} hold={hold} actionable={act} "
+                f"executed={execd} | skips: {skip_str}")
 
-    # ── Perp funding helpers ──────────────────────────────────────────────────
-
-    def set_funding_rate(self, symbol: str, rate_8h_fraction: float) -> None:
-        """Update the current 8h funding rate (as a fraction, e.g. 0.0001 = 0.01%)."""
-        self._funding_rates[symbol] = float(rate_8h_fraction)
-
-    def accrue_funding(self, now: datetime) -> None:
-        """
-        Accrue funding for all open perp positions across any 8h cycles
-        elapsed since the last accrual. Long pays positive funding, short collects.
-        Called each tick from the main loop; no-op outside perp mode.
-        """
-        if not self.perp_mode:
-            return
-        for symbol, pos in self.account.positions.items():
-            if not pos.is_perp:
-                continue
-            rate = self._funding_rates.get(symbol)
-            if rate is None:
-                continue
-            last_ts = pos.last_funding_ts or pos.entry_time
-            hours = (now - last_ts).total_seconds() / 3600.0
-            cycles = int(hours // 8)
-            if cycles <= 0:
-                continue
-            notional = pos.entry_price * pos.size
-            # Long pays positive funding → -rate*notional per cycle
-            # Short collects positive funding → +rate*notional per cycle
-            sign = -1.0 if pos.side == 'buy' else 1.0
-            delta = sign * rate * notional * cycles
-            pos.funding_accrued += delta
-            pos.last_funding_ts = last_ts + timedelta(hours=cycles * 8)
-
-    def _slippage_pct_for(self, symbol: str, price: float) -> float:
-        """
-        Realistic slippage = max(floor, 0.5 × spread_pct).
-        On a market order you cross half the spread on entry, half on exit; thin pairs / wide spreads
-        give more slippage. Falls back to flat self.slippage_pct when no spread data.
-        """
-        spread = self.live_spreads.get(symbol, 0.0)
-        if spread > 0 and price > 0:
-            spread_pct = spread / price
-            # Cap slippage to avoid pathological book reads (max 0.5%)
-            return max(self.slippage_pct, min(0.005, spread_pct * 0.5))
-        return self.slippage_pct
-
-    def execute_buy(self, symbol: str, price: float, timestamp: datetime,
-                    size_usd: float, signal: Optional[ScientificSignal] = None) -> Optional[PaperPosition]:
-        size       = size_usd / price
-        slip       = self._slippage_pct_for(symbol, price)
-        exec_price = price * (1 + slip)
-        fee        = exec_price * size * self.fee_pct
-        notional   = exec_price * size
-        margin_req = notional / self.leverage if self.perp_mode else notional
-        total_cost = margin_req + fee
-
-        if total_cost > self.account.cash:
-            # Scale down to fit available cash
-            available  = self.account.cash * 0.98
-            # cash >= notional/lev + notional*fee_pct  →  notional <= cash / (1/lev + fee_pct)
-            denom      = (1.0 / self.leverage) + self.fee_pct if self.perp_mode else (1.0 + self.fee_pct)
-            notional   = available / denom
-            size       = notional / exec_price
-            fee        = notional * self.fee_pct
-            margin_req = notional / self.leverage if self.perp_mode else notional
-            total_cost = margin_req + fee
-
-        if size <= 0 or total_cost > self.account.cash:
-            return None
-
-        self.account.cash -= total_cost
-        pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
-                            size=size, side='buy', entry_fee=fee, entry_signal=signal,
-                            peak_favorable_price=exec_price,
-                            peak_adverse_price=exec_price,
-                            size_usd_target=size_usd,
-                            is_perp=self.perp_mode,
-                            leverage=self.leverage,
-                            margin_locked=margin_req,
-                            last_funding_ts=timestamp)
-        self.account.positions[symbol] = pos
-        tag = "[LONG-PERP]" if self.perp_mode else "[BUY]"
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
-        return pos
-
-    def execute_sell(self, symbol: str, price: float, timestamp: datetime,
-                     reason: str = "signal") -> Optional[Trade]:
-        if symbol not in self.account.positions:
-            return None
-        pos        = self.account.positions[symbol]
-        # Final funding accrual on the position before closing it
-        if pos.is_perp:
-            self.accrue_funding(timestamp)
-        slip       = self._slippage_pct_for(symbol, price)
-        exec_price = price * (1 - slip)
-        exit_fee   = exec_price * pos.size * self.fee_pct
-        total_fees = exit_fee + pos.entry_fee
-        pnl        = (exec_price - pos.entry_price) * pos.size - total_fees + pos.funding_accrued
-        if pos.is_perp:
-            cost_basis = pos.margin_locked + pos.entry_fee
-            # Return margin + entry_fee (already deducted at open) plus net pnl.
-            # pnl already deducts entry_fee via total_fees, so we add it back here
-            # to avoid double-counting it against cash.
-            self.account.cash += pos.margin_locked + pos.entry_fee + pnl
-        else:
-            cost_basis = pos.entry_price * pos.size + pos.entry_fee
-            self.account.cash += exec_price * pos.size - exit_fee
-        pnl_pct    = pnl / cost_basis * 100 if cost_basis else 0.0
-        self.account.total_pnl += pnl
-        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
-                      entry_price=pos.entry_price, exit_price=exec_price,
-                      size=pos.size, side='sell', pnl=pnl, pnl_pct=pnl_pct, fees=total_fees)
-        self.account.closed_trades.append(trade)
-        del self.account.positions[symbol]
-        tag = "[CLOSE-LONG]" if pos.is_perp else "[SELL]"
-        funding_note = f" funding=${pos.funding_accrued:+.4f}" if pos.is_perp else ""
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%){funding_note}  {reason}")
-        return trade
-
-    def execute_short(self, symbol: str, price: float, timestamp: datetime,
-                      size_usd: float, signal: Optional[ScientificSignal] = None) -> Optional[PaperPosition]:
-        size       = size_usd / price
-        slip       = self._slippage_pct_for(symbol, price)
-        exec_price = price * (1 - slip)
-        fee        = exec_price * size * self.fee_pct
-        notional   = exec_price * size
-        margin_req = notional / self.leverage if self.perp_mode else notional
-        total_cost = margin_req + fee
-
-        if total_cost > self.account.cash:
-            available  = self.account.cash * 0.98
-            denom      = (1.0 / self.leverage) + self.fee_pct if self.perp_mode else (1.0 + self.fee_pct)
-            notional   = available / denom
-            size       = notional / exec_price
-            fee        = notional * self.fee_pct
-            margin_req = notional / self.leverage if self.perp_mode else notional
-            total_cost = margin_req + fee
-
-        if size <= 0 or total_cost > self.account.cash:
-            return None
-        self.account.cash -= total_cost
-        pos = PaperPosition(entry_time=timestamp, entry_price=exec_price,
-                            size=size, side='short', entry_fee=fee, entry_signal=signal,
-                            peak_favorable_price=exec_price,
-                            peak_adverse_price=exec_price,
-                            size_usd_target=size_usd,
-                            is_perp=self.perp_mode,
-                            leverage=self.leverage,
-                            margin_locked=margin_req,
-                            last_funding_ts=timestamp)
-        self.account.positions[symbol] = pos
-        tag = "[SHORT-PERP]" if self.perp_mode else "[SHORT]"
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  notional=${notional:.2f} margin=${margin_req:.2f}  conf={signal.confidence:.0f}%" if signal else f"{tag} {symbol} @ ${exec_price:,.2f}")
-        return pos
-
-    def execute_cover(self, symbol: str, price: float, timestamp: datetime,
-                      reason: str = "signal") -> Optional[Trade]:
-        if symbol not in self.account.positions:
-            return None
-        pos = self.account.positions[symbol]
-        if pos.side != 'short':
-            return self.execute_sell(symbol, price, timestamp, reason)
-        if pos.is_perp:
-            self.accrue_funding(timestamp)
-        slip        = self._slippage_pct_for(symbol, price)
-        exec_price  = price * (1 + slip)
-        exit_fee    = exec_price * pos.size * self.fee_pct
-        total_fees  = exit_fee + pos.entry_fee
-        pnl         = (pos.entry_price - exec_price) * pos.size - total_fees + pos.funding_accrued
-        if pos.is_perp:
-            cost_basis = pos.margin_locked + pos.entry_fee
-            self.account.cash += pos.margin_locked + pos.entry_fee + pnl
-        else:
-            cost_basis = pos.entry_price * pos.size + pos.entry_fee
-            returned   = pos.entry_price * pos.size + pos.entry_fee
-            self.account.cash += returned + pnl
-        pnl_pct = pnl / cost_basis * 100 if cost_basis else 0.0
-        self.account.total_pnl += pnl
-        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
-                      entry_price=pos.entry_price, exit_price=exec_price,
-                      size=pos.size, side='cover', pnl=pnl, pnl_pct=pnl_pct, fees=total_fees)
-        self.account.closed_trades.append(trade)
-        del self.account.positions[symbol]
-        tag = "[CLOSE-SHORT]" if pos.is_perp else "[COVER]"
-        funding_note = f" funding=${pos.funding_accrued:+.4f}" if pos.is_perp else ""
-        logger.info(f"{tag} {symbol} @ ${exec_price:,.2f}  PnL ${pnl:+.2f} ({pnl_pct:+.2f}%){funding_note}  {reason}")
-        return trade
-
-    def update_unrealized_pnl(self, prices: Dict[str, float]):
-        for sym, pos in self.account.positions.items():
-            if sym in prices:
-                p = prices[sym]
-                pos.unrealized_pnl = (p - pos.entry_price) * pos.size if pos.side == 'buy' else (pos.entry_price - p) * pos.size
-                # Track excursions (favorable = direction we want, adverse = against us)
-                if pos.side == 'buy':
-                    if p > pos.peak_favorable_price: pos.peak_favorable_price = p
-                    if p < pos.peak_adverse_price:   pos.peak_adverse_price   = p
-                else:   # short
-                    if p < pos.peak_favorable_price: pos.peak_favorable_price = p
-                    if p > pos.peak_adverse_price:   pos.peak_adverse_price   = p
-
-    def get_account_summary(self) -> Dict:
-        # Perp positions: only margin_locked is the actual capital at risk, not full notional.
-        # Spot positions: full notional (entry_price * size) is the capital deployed.
-        pos_val  = sum(
-            (p.margin_locked if p.is_perp else p.entry_price * p.size) + p.unrealized_pnl
-            for p in self.account.positions.values()
-        )
-        equity   = self.account.cash + pos_val
-        closed   = self.account.closed_trades
-        return {
-            'cash':           self.account.cash,
-            'total_equity':   equity,
-            'total_pnl':      self.account.total_pnl,
-            'pnl_pct':        (self.account.total_pnl / self.initial_capital) * 100,
-            'open_positions': len(self.account.positions),
-            'closed_trades':  len(closed),
-            'winning_trades': len([t for t in closed if t.pnl > 0]),
-            'losing_trades':  len([t for t in closed if t.pnl <= 0]),
-        }
-
-    def print_summary(self):
-        s = self.get_account_summary()
-        print("\n" + "=" * 50)
-        print("PAPER TRADING ACCOUNT")
-        print("=" * 50)
-        print(f"Cash:           ${s['cash']:.2f}")
-        print(f"Total Equity:   ${s['total_equity']:.2f}")
-        print(f"Total PnL:      ${s['total_pnl']:.2f} ({s['pnl_pct']:.2f}%)")
-        print(f"Trades:         {s['closed_trades']}  ({s['winning_trades']}W / {s['losing_trades']}L)")
-        print("=" * 50)
+    def reset(self):
+        self._c.clear()
 
 
 # ── Main paper trading session ─────────────────────────────────────────────────
@@ -626,10 +388,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                      sentiment_monitor: Optional[SentimentMonitor] = None,
                                      public_ws: Optional[KrakenPublicWS] = None,
                                      vol_monitor: Optional[CryptoVolMonitor] = None,
-                                     book_feed=None,    # accepted for compat with newer bot.py
-                                     trade_feed=None,   # accepted for compat with newer bot.py
-                                     risk_cfg=None):    # accepted for compat with newer bot.py
+                                     book_feed=None,
+                                     trade_feed=None,
+                                     risk_cfg: Optional[dict] = None):
 
+    risk_cfg = risk_cfg or {}
     trader.running    = True
     trader._started_at = datetime.now(timezone.utc).isoformat()
     logger.info(f"Starting paper trading session for {symbols}")
@@ -642,8 +405,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # ── Subsystems ─────────────────────────────────────────────────────────────
     strategy        = MicrostructureStrategy()
     regime_detector = RegimeDetector()
-    ofi_calc        = OrderFlowImbalance(exchange, symbols)  # REST fallback
-    ofw             = OrderFlowWS(symbols)                   # WS order flow (preferred)
+    ofi_calc        = OrderFlowImbalance(exchange, symbols)
     lead_lag        = LeadLagDetector(lead_symbol='BTC/USD')
     journal         = TradeJournal()
     learner         = Learner(journal)
@@ -655,26 +417,513 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     ml_scorer   = MLScorer(journal)
     htf_filter  = MultiTimeframeFilter(exchange)
     mr_strategy = MeanReversionStrategy()
-    prob_gate   = ProbabilityGate() if PROB_GATE_ENABLED else None
+    # Probability calibrator: maps the gate's raw stacked P(win) to the empirical
+    # win rate from the journal. Stays identity until ~40 resolved trades exist.
+    calibrator = None
+    if PROB_GATE_ENABLED:
+        try:
+            from .calibration import ProbabilityCalibrator
+            calibrator = ProbabilityCalibrator()
+            _calib_report = calibrator.fit_from_journal(journal)
+            logger.info("[CALIB] %s", _calib_report.render().splitlines()[0])
+        except Exception as e:
+            logger.warning(f"[CALIB] disabled ({e}); gate will use raw stacked P")
+            calibrator = None
+    prob_gate   = ProbabilityGate(calibrator=calibrator) if PROB_GATE_ENABLED else None
+    # Expectancy gate: caps each entry path to a small probe size until it proves
+    # positive GROSS expectancy over a meaningful sample. See [[directional_cost_bleed_fix]].
+    expectancy_gate = ExpectancyGate()
+    expectancy_gate.update(journal, force=True)
+    logger.info(f"[EXPECTANCY] {expectancy_gate.status()}")
     long_checklist  = build_long_checklist()
     short_checklist = build_short_checklist()
+    # Time-of-day edge ratings from the bot's own realised record (journal +
+    # swing ledger). Loaded once at session start; UNFAVORABLE windows soft-
+    # reject in the checklist (hard with SESSION_FILTER_HARD=1). See
+    # src/session_filter.py.
+    session_edge    = SessionEdge.from_files()
+    spread_tracker  = SpreadTracker()
+    # VPIN toxic-flow monitor — fed by the WS v2 trade tape (taker side per
+    # Kraken docs). Hooked below if trade_feed is provided.
+    from .vpin_monitor import VPINMonitor, TOXIC_THRESHOLD as _VPIN_THRESH
+    vpin_monitor = VPINMonitor()
+    if trade_feed is not None and getattr(trade_feed, "_on_trade", None) is None:
+        trade_feed._on_trade = vpin_monitor.on_trade
+
+    # Triangular arbitrage scanner — observe-only paper sim of single-venue
+    # cycle opportunities (USD→A→B→USD). Logs every qualifying opportunity
+    # so we build a record of whether real edges exist before committing to
+    # execution code. Disabled when book_feed isn't wired.
+    _triarb_scanner = None
+    _triarb_task = None
+    if book_feed is not None and os.getenv("TRIARB_ENABLED", "1") == "1":
+        try:
+            from .triangular_arb import TriangularArbScanner, DEFAULT_CYCLES
+            _triarb_scanner = TriangularArbScanner(
+                cycles=DEFAULT_CYCLES,
+                get_book=lambda s: book_feed.get_top(s, depth=10),
+                # Void cycles whose quotes are stale — the thin cross pairs
+                # (ETH/BTC, SOL/BTC) lag the USD legs and manufacture phantom
+                # edges. book_feed.staleness() returns seconds since last tick.
+                get_staleness=book_feed.staleness,
+            )
+            async def _triarb_loop():
+                interval = float(os.getenv("TRIARB_SCAN_INTERVAL_SEC", "30"))
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        opps = _triarb_scanner.scan_once()
+                        if opps:
+                            # MEASUREMENT ONLY. This is a DETECTOR, not an executor: it
+                            # logs whether triangular edges *appear* on REST/WS snapshots.
+                            # It must NOT write to the P&L ledger — recording un-executed
+                            # detections as realised, zero-slippage fills manufactured a
+                            # fake +$400 (3 legs crossed in series are pure slippage, and
+                            # the edges are mostly snapshot-staleness phantoms the module's
+                            # own docstring says don't persist). Keep the log as the record
+                            # of "do edges exist"; book nothing until a real executor exists.
+                            logger.info(_triarb_scanner.format_log(opps))
+                    except Exception as e:
+                        logger.debug(f"[TRIARB] scan failed: {e}")
+            _triarb_task = asyncio.create_task(supervised('triarb', _triarb_loop, notifier=notifier))
+            logger.info(f"[TRIARB] scanner started, cycles={len(DEFAULT_CYCLES)}")
+        except Exception as e:
+            logger.warning(f"[TRIARB] disabled: {e}")
     macro_provider = MacroDataProvider()
     macro_provider.start()
+
+    # ── Funding-rate arbitrage (market-neutral, runs alongside the scalper) ──────
+    # Scans Binance/Bybit funding every minute → state.json (this also feeds the
+    # microstructure funding edge + kill filters, which are otherwise starved in
+    # this entry point) and paper-trades a cost-aware delta-neutral cash-and-carry
+    # sim. Best-effort: any failure here is isolated and never touches the main
+    # trading loop. Disable with FUNDING_ARB_ENABLED=0.
+    _funding_tasks: List[asyncio.Task] = []
+    # Bound up front so the heartbeat can read arm P&L directly from these
+    # in-memory objects (race-free) regardless of whether the block below runs.
+    _funding_arb_sim = _funding_arb_majors = _funding_arb_kraken = None
+    if os.getenv('FUNDING_ARB_ENABLED', '1') == '1':
+        try:
+            from pathlib import Path as _Path
+            from arbitrage.funding_scanner import FundingScanner
+            from arbitrage.funding_arb_paper import FundingArbPaperSim, MAJOR_SYMBOLS
+            from arbitrage.funding_history import FundingHistory
+            from .state import read_state as _read_state, write_state as _write_state
+
+            _funding_scanner = FundingScanner(notifier=None)
+
+            # Shared funding-history tracker → feeds the Kraken arm's persistence
+            # gate. Records every scanner snapshot; survives restarts (data/).
+            _funding_history = FundingHistory()
+
+            # Arm 1 — aggressive/experimental: all symbols, taker cost. Trades
+            # often. NOW positive-funding-only by default: a live-ledger audit
+            # showed its entire apparent +$16 came from short-spot (negative-
+            # funding) legs whose biggest winners were never charged spot-borrow
+            # carry (they closed before the borrow model deployed). Charging the
+            # borrow they owed flips that side from +$19 booked to −$11 — i.e. the
+            # negative funding ≈ the borrow cost, the legs cancel, and there is no
+            # edge there. The clean long-spot/short-perp side needs no borrow and
+            # is honestly executable, so the arm is confined to it. Set
+            # FUNDING_ARB_AGGR_POSITIVE_ONLY=0 to restore the old both-sides
+            # research baseline (its short legs are now correctly carry-charged).
+            _aggr_positive_only = os.getenv('FUNDING_ARB_AGGR_POSITIVE_ONLY', '1') == '1'
+            _funding_arb_sim = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=_aggr_positive_only,
+                # Research/fantasy baseline (non-executable venues) — left UNcapped
+                # by default so it stays a clean reference. Set to arm it.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_MAX_DRAWDOWN', '0')),
+            )
+
+            # Arm 2 — conservative/"honest": liquid majors only, positive funding
+            # only (long spot / short perp → no borrow needed). Separate ledger +
+            # alert label so the two arms can be compared side by side.
+            # REALISM FIX: the arm previously sourced ALL venues and booked a
+            # 0.08% cost. But for a US-restricted account only Kraken Futures is
+            # executable (funding_scanner docstring: Binance/Bybit are research
+            # baselines), and the long-spot/short-perp round-trip on Kraken really
+            # costs ~0.54% (Kraken Pro spot maker 0.25% + perp maker 0.02%, ×2
+            # sides) — the same figure the Kraken arm uses for the identical trade.
+            # Booking 0.08% on non-executable venues flattered the arm two ways.
+            # Now confined to Kraken Futures at realistic cost so its P&L means
+            # something; the aggressive arm (all venues) remains the research
+            # baseline. This raises the breakeven APY floor (~9% → ~59%), so the
+            # arm trades only when funding genuinely clears the real cost.
+            _maj_cost = float(os.getenv('FUNDING_ARB_MAJORS_COST_FRAC', '0.0054'))
+            # Persistence gate (was OFF) — the live ledger showed the majors arm
+            # repeating the cycle-0 flip bleed the Kraken arm was fixed for: it
+            # opened OP/NEAR/ETC at 28-43% APY and every loss closed
+            # reason=funding_flipped cycles=0, eating the entry cost having
+            # collected nothing. Verifying funding actually held positive for N
+            # cycles (FundingHistory) before entry structurally removes those
+            # traps. Shares the same history tracker as the Kraken arm.
+            _maj_min_persist = float(
+                os.getenv('FUNDING_ARB_MAJORS_MIN_PERSISTENCE_CYCLES', '2')
+            )
+            _maj_max_flips = int(os.getenv('FUNDING_ARB_MAJORS_MAX_FLIPS', '6'))
+            _maj_flip_cooldown = float(
+                os.getenv('FUNDING_ARB_MAJORS_FLIP_COOLDOWN_HOURS', '48')
+            )
+            # Size bump (user-requested): with the persistence gate now filtering
+            # entries down to verified-stable funding, more notional lands on the
+            # surviving (higher-quality) trades rather than the flip traps.
+            # Dedicated knobs so this arm scales independently and is reversible.
+            _maj_min_size = float(os.getenv('FUNDING_ARB_MAJORS_MIN_SIZE', '375'))
+            _maj_max_size = float(os.getenv('FUNDING_ARB_MAJORS_MAX_SIZE', '1500'))
+            _maj_max_total = float(os.getenv('FUNDING_ARB_MAJORS_MAX_TOTAL', '4500'))
+            _funding_arb_majors = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=True,
+                symbol_allowlist=MAJOR_SYMBOLS,
+                source_allowlist={'Kraken Futures'},
+                cost_frac=_maj_cost,
+                min_position_usd=_maj_min_size,
+                max_position_usd=_maj_max_size,
+                max_total_notional=_maj_max_total,
+                history=_funding_history,
+                min_persistence_cycles=_maj_min_persist,
+                max_flips=_maj_max_flips,
+                flip_cooldown_hours=_maj_flip_cooldown,
+                state_file=_Path('data/funding_arb_majors_state.json'),
+                label="Funding Arb (majors)",
+                # Per-arm loss cap (executable arm): halt new entries if cumulative
+                # net <= -$25. Currently ~-$11, so ~$14 runway. 0 disables.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_MAJORS_MAX_DRAWDOWN', '25')),
+            )
+
+            # Arm 3 — Kraken-only, AGGRESSIVE maker-only config (user-requested).
+            # Opportunities sourced from Kraken Futures ONLY (the only venue an
+            # account this side of the geo-block can actually trade), positive-
+            # funding-only (no spot-borrow risk). Aggressive posture:
+            #   • maker-only cost (~0.54% round-trip: maker spot 0.25% + maker
+            #     perp 0.02% per side × 2 sides, ~0 slippage as a passive maker —
+            #     the spot maker fee is the floor; perps are near-free).
+            #   • ALL-IN: one position at a time (max_positions=1), full
+            #     allocation per trade (min==max==total), no conviction scaling.
+            #   • gate relaxed to ~6-cycle breakeven (≈2 days persistence) and
+            #     APY cap raised to 300% — still only enters when funding is
+            #     expected to clear the (lower) maker cost, so it passes on the
+            #     cycle-0 flip traps that bled ~$29 (memory funding_arb_kraken_bleed)
+            #     while trading the genuinely rich opportunities.
+            # CAVEAT (paper): maker fills + all-in on illiquid microcaps are not
+            # realistically executable live; the sim assumes fills.
+            _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0054'))
+            _kraken_max_be = float(
+                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '6')
+            )
+            _kraken_cap = float(os.getenv('FUNDING_ARB_KRAKEN_MAX_APY', '300'))
+            _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '100'))
+            # Persistence gate: only enter symbols whose funding has actually
+            # held positive for N cycles and isn't a serial flipper. This is the
+            # evidence-based fix for the cycle-0 flip bleed (the breakeven gate
+            # only assumes persistence; this verifies it). Needs ~min_cycles×8h
+            # of accumulated history per symbol before it'll pass anything —
+            # a deliberate warm-up, not a bug. Set MIN_PERSISTENCE_CYCLES=0 to disable.
+            # Default raised 2 → 3: the live ledger showed losers collected 0-1
+            # cycles while every winner persisted 7-12, so requiring 3 cycles
+            # (~24h) of verified prior stability cleanly separates carry from spikes.
+            _kraken_min_persist = float(
+                os.getenv('FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES', '3')
+            )
+            _kraken_max_flips = int(os.getenv('FUNDING_ARB_KRAKEN_MAX_FLIPS', '6'))
+            # Post-loss re-entry cooldown (hours). After a net-loss close the arm
+            # refuses to re-buy that symbol for this long — the realized-outcome
+            # feedback guard that stops the re-flip bleed (e.g. DEXE flipped, was
+            # re-entered, flipped again). Default 48h; 0 disables.
+            _kraken_flip_cooldown = float(
+                os.getenv('FUNDING_ARB_KRAKEN_FLIP_COOLDOWN_HOURS', '48')
+            )
+            # Restrict the Kraken arm to liquid majors. The Kraken funding universe
+            # is almost entirely extreme microcap perps (PF_* alts with 300-600%+
+            # APY that flip funding at cycle 0) — that was the source of the -$27
+            # bleed: with no symbol filter the arm was forced to pick the "least
+            # insane" microcap. Confine it to the same MAJOR_SYMBOLS the majors arm
+            # uses; combined with the scanner's major-preserving truncation this
+            # gives it real, capturable Kraken-majors to trade. Override with
+            # FUNDING_ARB_KRAKEN_SYMBOLS="BTC,ETH,..." (comma-separated bases).
+            _env_kraken_syms = os.getenv('FUNDING_ARB_KRAKEN_SYMBOLS', '').strip()
+            _kraken_allowlist = ({s.strip().upper() for s in _env_kraken_syms.split(',') if s.strip()}
+                                 if _env_kraken_syms else MAJOR_SYMBOLS)
+            _funding_arb_kraken = FundingArbPaperSim(
+                scanner=_funding_scanner, notifier=notifier,
+                positive_funding_only=True,
+                source_allowlist={'Kraken Futures'},
+                symbol_allowlist=_kraken_allowlist,
+                cost_frac=_kraken_cost,
+                max_breakeven_cycles=_kraken_max_be,
+                max_entry_apy=_kraken_cap,
+                max_positions=1,
+                min_position_usd=_kraken_alloc,
+                max_position_usd=_kraken_alloc,
+                max_total_notional=_kraken_alloc,
+                history=_funding_history,
+                min_persistence_cycles=_kraken_min_persist,
+                max_flips=_kraken_max_flips,
+                flip_cooldown_hours=_kraken_flip_cooldown,
+                state_file=_Path('data/funding_arb_kraken_state.json'),
+                label="Funding Arb (Kraken)",
+                # Per-arm loss cap (the real executable bleed): halt new entries if
+                # cumulative net <= -cap. RETIRED 2026-06-13: this arm has negative
+                # realized EV (-$2.14/trade, 23% win) and funding-arb is dead in the
+                # current fear regime (memory edge_search_verdict). Cap lowered 40->25
+                # so the current ~-$28 net trips the halt IMMEDIATELY (no new entries;
+                # exits still run). Honest history kept; re-arm by raising the cap if a
+                # real persistent-funding majors opportunity appears. 0 disables the cap.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '25')),
+            )
+
+            async def _merge_funding_state():
+                while True:
+                    await asyncio.sleep(65)
+                    try:
+                        st = _read_state()
+                        st['funding_opportunities'] = _funding_scanner.get_state()
+                        st['funding_arb'] = _funding_arb_sim.get_summary()
+                        st['funding_arb_majors'] = _funding_arb_majors.get_summary()
+                        st['funding_arb_kraken'] = _funding_arb_kraken.get_summary()
+                        _write_state(st)
+                        # Global funding drawdown guard → engages the master kill
+                        # (halts ALL new entries, every arm) when the 3 arms'
+                        # combined net breaches the cap. 0 disables (default).
+                        _gcap = float(os.getenv('FUNDING_ARB_GLOBAL_MAX_DRAWDOWN', '0'))
+                        if _gcap > 0:
+                            from .kill_switch import is_killed as _kk, engage as _ke
+                            _gtot = (st['funding_arb'].get('total_pnl', 0.0)
+                                     + st['funding_arb_majors'].get('total_pnl', 0.0)
+                                     + st['funding_arb_kraken'].get('total_pnl', 0.0))
+                            if _gtot <= -_gcap and not _kk():
+                                _ke(f"global funding drawdown ${_gtot:+.2f} <= -${_gcap:.2f}")
+                                if notifier:
+                                    try:
+                                        notifier.send_message(
+                                            "🛑 <b>GLOBAL KILL ENGAGED</b>\n"
+                                            f"Funding arms net ${_gtot:+.2f} ≤ -${_gcap:.2f}\n"
+                                            "All new entries halted. Remove data/KILL_SWITCH to resume."
+                                        )
+                                    except Exception:
+                                        pass
+                    except Exception as _exc:
+                        logger.warning(f"[FUNDING] state merge failed: {_exc}")
+
+            _funding_tasks = [
+                asyncio.create_task(supervised('funding_scanner',     _funding_scanner.start,     notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_sim',     _funding_arb_sim.start,     notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_majors',  _funding_arb_majors.start,  notifier=notifier)),
+                asyncio.create_task(supervised('funding_arb_kraken',  _funding_arb_kraken.start,  notifier=notifier)),
+                asyncio.create_task(supervised('funding_merge_state', _merge_funding_state,        notifier=notifier)),
+            ]
+            logger.info("[FUNDING] scanner + 3 delta-neutral arb arms "
+                        "(aggressive + majors-honest + kraken-executable) started")
+        except Exception as _exc:
+            logger.warning(f"[FUNDING] disabled ({_exc})")
+
+    # ── Intraday regime-following arm (regime_arm.py) ──────────────────────────
+    # LONG in uptrends / SHORT in downtrends on an intraday clock, cost-gated,
+    # shorts via paper perps. Runs IN-PROCESS every 15min (no cron needed) so it
+    # forward-tests live; judged by proof_scorecard (_regime_forward). The only
+    # arm that trades (shorts) in a downtrend instead of sitting in cash. Paper
+    # only. Disable with REGIME_ARM_ENABLED=0.
+    if os.getenv('REGIME_ARM_ENABLED', '1') == '1':
+        async def _regime_arm_loop():
+            import regime_arm as _ra
+            interval = float(os.getenv('REGIME_ARM_INTERVAL_SEC', '900'))
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, _ra.run_forward)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[REGIME-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('regime_arm', _regime_arm_loop, notifier=notifier))
+        logger.info("[REGIME-ARM] intraday L/S regime follower started (in-process, 15min)")
+
+    # ── Fast-trend forward arm (the tournament's robust executable winner) ─────
+    # scripts/strategy_tournament.py (37 strategies, BTC+ETH, both halves) found
+    # SHORT-lookback trend robustly beats slow: tsmom_long_50 ($1470) >> the live
+    # SMA200 tsmom ($922). This runs the EXACT pre-registered tsmom code at SMA50
+    # (long-only, spot-executable) as a parallel forward arm — the SMA200 original
+    # stays the untouched control, and the proof bar judges both. In-process via
+    # subprocess (no cron needed); disable with TSMOM_FAST_ENABLED=0.
+    if os.getenv('TSMOM_FAST_ENABLED', '1') == '1':
+        async def _tsmom_fast_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('TSMOM_FAST_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'TSMOM_SMA': os.getenv('TSMOM_FAST_SMA', '50'),
+                   'TSMOM_STATE_FILE': 'data/tsmom_fast_state.json',
+                   'TSMOM_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'tsmom_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[TSMOM-FAST] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('tsmom_fast', _tsmom_fast_loop, notifier=notifier))
+        logger.info("[TSMOM-FAST] SMA50 long-only daily forward arm started (in-process)")
+
+    # ── Confluence trend forward arm (the long-only tournament's best DD-adjusted) ─
+    # scripts/longonly_tournament.py (BTC+ETH+SOL, honest cost) found a TREND+MOMENTUM
+    # confluence — long only when price is BOTH >SMA100 AND 20d momentum up — was the
+    # best drawdown-adjusted spot-executable bot (-31% DD vs B&H -65%). A distinct
+    # SIGNAL (two-condition conjunction), not just another lookback, so it earns its
+    # own forward arm. Runs the pre-registered conf_paper.py; proof bar judges it head
+    # to head (_conf_forward). In-process via subprocess; disable with CONF_ARM_ENABLED=0.
+    if os.getenv('CONF_ARM_ENABLED', '1') == '1':
+        async def _conf_arm_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('CONF_ARM_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'CONF_STATE_FILE': 'data/conf_paper_state.json',
+                   'CONF_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'conf_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[CONF-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('conf_arm', _conf_arm_loop, notifier=notifier))
+        logger.info("[CONF-ARM] trend+momo confluence daily forward arm started (in-process)")
+
+    # ── Trend LONG/SHORT perp forward arm (paper proof for the short side) ──────────
+    # The long-only arms can only go to CASH in a downtrend; this one goes SHORT via
+    # paper perps (tsmom_50, 1x, conservative funding drag) — the exact strategy
+    # scripts/short_leg_value.py measured before Kraken US perps unlock real shorting
+    # (found it ETH-carried & funding-fragile, so it must PROVE OUT on the forward
+    # clock first). Runs the pre-registered tsmom_ls_paper.py; judged by proof_scorecard
+    # (_tsmom_ls_forward). In-process via subprocess; disable with TSMOM_LS_ARM_ENABLED=0.
+    if os.getenv('TSMOM_LS_ARM_ENABLED', '1') == '1':
+        async def _tsmom_ls_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('TSMOM_LS_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'TSMOM_LS_STATE_FILE': 'data/tsmom_ls_state.json',
+                   'TSMOM_LS_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'tsmom_ls_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[TSMOM-LS] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('tsmom_ls', _tsmom_ls_loop, notifier=notifier))
+        logger.info("[TSMOM-LS] long/short perp daily forward arm started (in-process, paper)")
+
+    # ── Leveraged perp arm (3x + fixed take-profit, "sell in profit") ───────────────
+    # Opens a LEVERAGED (default 3x) perp in the trend direction and exits on a fixed
+    # take-profit, with a realistic liquidation as the downside — the owner's explicit
+    # "place a trade with leverage and sell in profit" request, run honestly on its own
+    # $1k PAPER book (US Kraken-spot can't trade perps for real yet). Judged head-to-head
+    # by proof_scorecard (_lev_perp_forward); leverage is settled-dangerous (memory
+    # doubling_in_a_month_verdict) so this PROVES OR KILLS it on the forward clock.
+    # In-process via subprocess; disable with LEV_PERP_ARM_ENABLED=0.
+    if os.getenv('LEV_PERP_ARM_ENABLED', '1') == '1':
+        async def _lev_perp_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('LEV_PERP_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'LEV_PERP_STATE_FILE': 'data/lev_perp_state.json',
+                   'LEV_PERP_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'lev_perp_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[LEV-PERP] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('lev_perp', _lev_perp_loop, notifier=notifier))
+        logger.info("[LEV-PERP] leveraged perp (3x + take-profit) daily forward arm started (in-process, paper)")
+
+    # ── AI brain discretionary arm (Claude decides long/short/flat on its own book) ─
+    # The mechanical arms follow a fixed rule; this one asks Claude each day to decide
+    # per coin from the full market picture, on its own $1k paper perp account, judged
+    # head-to-head by proof_scorecard (_brain_forward). Only starts if ANTHROPIC_API_KEY
+    # is set (else the brain would idle every call); fail-safe holds positions on any
+    # API error. In-process via subprocess; disable with BRAIN_ARM_ENABLED=0.
+    if os.getenv('BRAIN_ARM_ENABLED', '1') == '1' and os.getenv('ANTHROPIC_API_KEY', ''):
+        async def _brain_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('BRAIN_ARM_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'BRAIN_STATE_FILE': 'data/brain_paper_state.json',
+                   'BRAIN_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'brain_paper.py'], env=env, timeout=180,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[BRAIN-ARM] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('brain_arm', _brain_loop, notifier=notifier))
+        logger.info("[BRAIN-ARM] Claude discretionary daily forward arm started (in-process, paper)")
+    elif os.getenv('BRAIN_ARM_ENABLED', '1') == '1':
+        logger.info("[BRAIN-ARM] idle — set ANTHROPIC_API_KEY in .env to activate the AI brain arm")
+
+    # Brain OVERSEER — the brain reads EVERY arm's book and posts a portfolio risk
+    # review (concentration, fighting-the-tape, drawdown, cost). OBSERVABILITY ONLY:
+    # it executes nothing. Runs less often than the trader arm (default 12h). Same
+    # API-key gate; disable with BRAIN_OVERSEER_ENABLED=0.
+    if os.getenv('BRAIN_OVERSEER_ENABLED', '1') == '1' and os.getenv('ANTHROPIC_API_KEY', ''):
+        async def _overseer_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('BRAIN_OVERSEER_INTERVAL_SEC', '43200'))  # 12h
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'brain_overseer.py'], env={**os.environ},
+                        timeout=180, capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[BRAIN-OVERSEER] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('brain_overseer', _overseer_loop, notifier=notifier))
+        logger.info("[BRAIN-OVERSEER] portfolio risk-review started (in-process, advisory only)")
+
     circuit_breaker = DailyCircuitBreaker()
     cb_status = circuit_breaker.status()
     logger.info(f"[CIRCUIT] daily: {cb_status['wins']}W/{cb_status['losses']}L "
                 f"(max {cb_status['max_losses']} losses, halted={cb_status['halted']})")
     if prob_gate:
-        logger.info(f"[PROB-GATE] Enabled (min_p={prob_gate.min_p:.2f}, kelly_ref={prob_gate.kelly_ref:.3f})")
+        _cal_on = bool(getattr(calibrator, "is_active", False))
+        logger.info(f"[PROB-GATE] Enabled (min_p={prob_gate.min_p:.2f}, kelly_ref={prob_gate.kelly_ref:.3f}, "
+                    f"calibration={'active' if _cal_on else 'identity (collecting trades)'})")
     strategy.ml_scorer = ml_scorer
     # Attempt initial load/train if journal already has data
     if ml_scorer.should_retrain():
         ml_scorer.train()
 
-    max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS', 10))
+    # Risk limits: config.yaml is authoritative, env var overrides for ops.
+    max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS',
+                                          risk_cfg.get('max_daily_loss', 10)))
     session_start_equity = trader.initial_capital
+    # UTC-day-rolling baseline for the daily-loss circuit (reset at midnight).
+    risk_day             = datetime.now(timezone.utc).date()
+    risk_day_baseline    = trader.initial_capital
+    daily_entries_halted = False
 
     iteration = 0
+    funnel = _FunnelStats()   # entry-funnel diagnostics, logged each heartbeat
     prices:   Dict[str, float] = {}
     indicators:       Dict[str, dict]   = {}
     recent_trades:    Deque[dict]        = deque(maxlen=50)
@@ -691,17 +940,22 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _hourly_digest():
         await asyncio.sleep(3600)
         while trader.running:
-            s = trader.get_account_summary()
-            stats = journal.stats()
-            if notifier:
-                notifier.send_status(
-                    capital=s['total_equity'], pnl=s['total_pnl'],
-                    pnl_pct=s['pnl_pct'], open_positions=s['open_positions'],
-                    trades_today=stats.get('total', 0),
-                )
+            try:
+                s = trader.get_account_summary()
+                stats = journal.stats()
+                if notifier:
+                    notifier.send_status(
+                        capital=s['total_equity'], pnl=s['total_pnl'],
+                        pnl_pct=s['pnl_pct'], open_positions=s['open_positions'],
+                        trades_today=stats.get('total', 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[DIGEST] hourly digest failed: {e}")
             await asyncio.sleep(3600)
 
-    asyncio.create_task(_hourly_digest())
+    asyncio.create_task(supervised('hourly_digest', _hourly_digest, notifier=notifier))
 
     # ── Daily P&L summary (fires at midnight UTC) ──────────────────────────────
     day_start_equity = trader.initial_capital
@@ -709,105 +963,146 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     async def _daily_summary():
         nonlocal day_start_equity
         while trader.running:
-            # Sleep until next midnight UTC
-            now = datetime.now(timezone.utc)
-            midnight = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0)
-            await asyncio.sleep((midnight - now).total_seconds())
+            try:
+                # Sleep until next midnight UTC
+                now = datetime.now(timezone.utc)
+                midnight = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                await asyncio.sleep((midnight - now).total_seconds())
 
-            if not trader.running:
-                break
+                if not trader.running:
+                    break
 
-            s      = trader.get_account_summary()
-            closed = trader.account.closed_trades
-            # Only count today's trades (since last midnight)
-            today  = [t for t in closed if hasattr(t, 'exit_time') and
-                      t.exit_time and
-                      (datetime.now(timezone.utc) - (t.exit_time if t.exit_time.tzinfo
-                       else t.exit_time.replace(tzinfo=timezone.utc))).days == 0]
-            wins   = [t for t in today if t.pnl > 0]
-            losses = [t for t in today if t.pnl <= 0]
-            best   = max((t.pnl for t in today), default=0.0)
-            worst  = min((t.pnl for t in today), default=0.0)
+                s      = trader.get_account_summary()
+                closed = trader.account.closed_trades
+                # Only count today's trades (since last midnight)
+                today  = [t for t in closed if hasattr(t, 'exit_time') and
+                          t.exit_time and
+                          (datetime.now(timezone.utc) - (t.exit_time if t.exit_time.tzinfo
+                           else t.exit_time.replace(tzinfo=timezone.utc))).days == 0]
+                wins   = [t for t in today if t.pnl > 0]
+                losses = [t for t in today if t.pnl <= 0]
+                best   = max((t.pnl for t in today), default=0.0)
+                worst  = min((t.pnl for t in today), default=0.0)
 
-            if notifier:
-                notifier.send_daily_summary(
-                    total_equity=s['total_equity'],
-                    start_equity=day_start_equity,
-                    trades=len(today),
-                    wins=len(wins),
-                    losses=len(losses),
-                    best_trade=best,
-                    worst_trade=worst,
-                )
-            day_start_equity = s['total_equity']   # reset for next day
+                if notifier:
+                    notifier.send_daily_summary(
+                        total_equity=s['total_equity'],
+                        start_equity=day_start_equity,
+                        trades=len(today),
+                        wins=len(wins),
+                        losses=len(losses),
+                        best_trade=best,
+                        worst_trade=worst,
+                    )
+                # Cross-arm attribution scorecard for the day that just ended —
+                # gross edge vs fee/slippage drag vs net, per arm (all arms in one
+                # place; the per-arm Telegram rollups stay, this unifies them).
+                try:
+                    from .attribution import get_ledger, format_scorecard
+                    ended = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+                    sc = get_ledger().daily_scorecard(ended)
+                    if notifier and sc['total']['n'] > 0:
+                        notifier.send_message(format_scorecard(sc))
+                except Exception as e:
+                    logger.debug(f"[ATTRIB] daily scorecard send failed: {e}")
+                day_start_equity = s['total_equity']   # reset for next day
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[DIGEST] daily summary failed: {e}")
 
-    asyncio.create_task(_daily_summary())
+    asyncio.create_task(supervised('daily_summary', _daily_summary, notifier=notifier))
 
     # ── SL/TP watcher ──────────────────────────────────────────────────────────
     async def _sltp_watcher():
         while trader.running:
-            await asyncio.sleep(1)
-            if not trader.account.positions:
-                continue
-            ws_prices = public_ws.get_prices() if public_ws else {}
-            for sym in list(trader.account.positions.keys()):
-                price = ws_prices.get(sym) or prices.get(sym)
-                if not price:
+            try:
+                await asyncio.sleep(1)
+                if not trader.account.positions:
                     continue
-                pos = trader.account.positions.get(sym)
-                if not pos:
-                    continue
-                now = datetime.now(timezone.utc)
-                sig = pos.entry_signal
+                ws_prices = public_ws.get_prices() if public_ws else {}
+                for sym in list(trader.account.positions.keys()):
+                    try:
+                        price = ws_prices.get(sym) or prices.get(sym)
+                        if not price:
+                            continue
+                        pos = trader.account.positions.get(sym)
+                        if not pos:
+                            continue
+                        now = datetime.now(timezone.utc)
+                        sig = pos.entry_signal
 
-                # Use signal-derived SL/TP if available, else fallback
-                sl_pct = sig.stop_loss_pct()    / 100 if sig else trader.stop_loss_pct
-                tp_pct = sig.take_profit_pct()  / 100 if sig else trader.take_profit_pct
+                        # Use signal-derived SL/TP if available, else fallback
+                        sl_pct = sig.stop_loss_pct()    / 100 if sig else trader.stop_loss_pct
+                        tp_pct = sig.take_profit_pct()  / 100 if sig else trader.take_profit_pct
 
-                if pos.side == 'short':
-                    pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
-                    close_fn = trader.execute_cover
-                else:
-                    pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
-                    close_fn = trader.execute_sell
+                        if pos.side == 'short':
+                            pnl_pct = (pos.entry_price - price) / pos.entry_price * 100
+                            close_fn = trader.execute_cover
+                        else:
+                            pnl_pct = (price - pos.entry_price) / pos.entry_price * 100
+                            close_fn = trader.execute_sell
 
-                exit_reason = None
-                # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
-                trail_reason = update_trailing_stop(pos, price)
-                if trail_reason:
-                    exit_reason = trail_reason
-                elif pnl_pct / 100 <= -sl_pct:
-                    exit_reason = 'STOP_LOSS'
-                elif pnl_pct / 100 >= tp_pct:
-                    # All tiers honor fixed TP — was previously gated to atr_stop only;
-                    # losers had MFE 0.23% so they never hit TP and bled out instead.
-                    exit_reason = 'TAKE_PROFIT'
+                        # Post-entry grace: a fresh taker entry sits ~spread underwater,
+                        # so suppress the fixed stop for the first few seconds to avoid
+                        # the ~2s noise flush seen in the journal audit. Trailing stop and
+                        # take-profit are unaffected.
+                        entry_dt = pos.entry_time if isinstance(pos.entry_time, datetime) else now
+                        secs_open = (now - entry_dt).total_seconds()
 
-                if exit_reason:
-                    trade = close_fn(sym, price, now, reason=exit_reason)
-                    if trade:
-                        recent_trades.append(_trade_to_dict(trade, sym, exit_reason))
-                        summary = trader.get_account_summary()
-                        equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
-                        _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
-                                         notifier, journal, ml_scorer)
-                        _record_exit(sym, exit_reason)
-                        just_halted, halt_msg = circuit_breaker.record_outcome(
-                            won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
-                        if just_halted and notifier:
-                            notifier.send_message(halt_msg)
+                        exit_reason = None
+                        # Tier-based trailing stop / max-hold (skipped for legacy atr_stop)
+                        trail_reason = update_trailing_stop(pos, price)
+                        if trail_reason:
+                            exit_reason = trail_reason
+                        elif pnl_pct / 100 <= -sl_pct and secs_open >= _MICRO_ENTRY_GRACE_SECS:
+                            exit_reason = 'STOP_LOSS'
+                        elif pnl_pct / 100 >= tp_pct:
+                            # All tiers honor fixed TP — was previously gated to atr_stop only;
+                            # losers had MFE 0.23% so they never hit TP and bled out instead.
+                            exit_reason = 'TAKE_PROFIT'
 
-    asyncio.create_task(_sltp_watcher())
+                        if exit_reason:
+                            trade = close_fn(sym, price, now, reason=exit_reason)
+                            if trade:
+                                recent_trades.append(_trade_to_dict(trade, sym, exit_reason))
+                                summary = trader.get_account_summary()
+                                equity_curve.append({'t': now.strftime('%Y-%m-%d %H:%M'), 'v': round(summary['total_equity'], 2)})
+                                _on_trade_closed(sym, pos, trade, exit_reason, summary['total_equity'],
+                                                 notifier, journal, ml_scorer, calibrator)
+                                _record_exit(sym, exit_reason)
+                                just_halted, halt_msg = circuit_breaker.record_outcome(
+                                    won=(trade.pnl > 0), pnl=trade.pnl, symbol=sym)
+                                if just_halted and notifier:
+                                    notifier.send_message(halt_msg)
+                    except Exception as e:
+                        logger.error(f"[SLTP] error processing {sym}: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[SLTP] watcher iteration error: {e}")
+
+    asyncio.create_task(supervised('sltp_watcher', _sltp_watcher, notifier=notifier, max_restarts=10))
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
         consecutive_failures = 0
         while trader.running:
+            circuit_paused = False
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
                     consecutive_failures = 0
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[OFI] Exchange circuit breaker open — pausing prefetcher "
+                        f"{wait:.0f}s (symbol={sym})"
+                    )
+                    await asyncio.sleep(wait)
+                    circuit_paused = True
+                    break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
                     consecutive_failures += 1
                     logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
@@ -818,22 +1113,29 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"trading without live order flow data"
                         )
                 await asyncio.sleep(2)
-            await asyncio.sleep(20)   # full cycle every ~26s
+            if not circuit_paused:
+                await asyncio.sleep(20)   # full cycle every ~26s
 
-    asyncio.create_task(_ofi_prefetcher())
-
-    # ── WebSocket order flow (live CVD + OBI, preferred over REST OFI) ────────
-    asyncio.create_task(ofw.start())
-    logger.info("[PAPER] WebSocket order flow started")
+    asyncio.create_task(supervised('ofi_prefetcher', _ofi_prefetcher, notifier=notifier))
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
         consecutive_failures = 0
         while trader.running:
+            circuit_paused = False
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
                     consecutive_failures = 0
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[HTF] Exchange circuit breaker open — pausing prefetcher "
+                        f"{wait:.0f}s (symbol={sym})"
+                    )
+                    await asyncio.sleep(wait)
+                    circuit_paused = True
+                    break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
                     consecutive_failures += 1
                     logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
@@ -844,14 +1146,33 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             f"multi-timeframe alignment unavailable"
                         )
                 await asyncio.sleep(3)
-            await asyncio.sleep(45)   # full cycle every ~54s
+            if not circuit_paused:
+                await asyncio.sleep(45)   # full cycle every ~54s
 
-    asyncio.create_task(_htf_fetcher())
+    asyncio.create_task(supervised('htf_fetcher', _htf_fetcher, notifier=notifier))
 
     # ── OHLCV cache — one DataFrame per symbol, refreshed on candle close ──────
     ohlcv_cache:       Dict[str, pd.DataFrame] = {}
     last_eval_time:    Dict[str, float]        = {}   # throttle per symbol
     EVAL_INTERVAL = 2.0   # seconds between strategy evaluations per symbol
+
+    # ── Directional engine kill-switch ────────────────────────────────────────
+    # The intraday directional stack (microstructure scalper + MR/OFI fast-track
+    # → ProbabilityGate → execution) is a PROVEN loser at this size: the proof
+    # scorecard read 229 trades, expectancy -$0.088/trade, t-stat -8.82 (FAILED)
+    # — cost dominates the move at 2s timeframes, structurally, and no amount of
+    # gate-stacking fixes negative-EV signals. Shelved off the live loop while we
+    # concentrate on the swing strategy (the only executable, non-disproven edge).
+    # Data feeds and OPEN-position exits still run below; only NEW directional
+    # entry-signal generation + execution are disabled. Re-enable with
+    # DIRECTIONAL_ENABLED=1. See [[directional_cost_bleed_fix]] / proof_scorecard.
+    DIRECTIONAL_ENABLED = os.getenv('DIRECTIONAL_ENABLED', '0') == '1'
+    logger.info(
+        "[DIRECTIONAL] entry engine %s",
+        "ENABLED" if DIRECTIONAL_ENABLED else
+        "SHELVED (proof_scorecard: 229 trades, t=-8.82, FAILED) — "
+        "set DIRECTIONAL_ENABLED=1 to restore"
+    )
 
     # ── Risk-control state ───────────────────────────────────────────────────────
     # Cooldowns prevent re-entering the same losing setup. Bar-dedup prevents
@@ -862,6 +1183,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     last_entry_bar:     Dict[str, float] = {}   # bar-ts of last entry attempt
     last_ws_price_time: Dict[str, float] = {}   # when WS price last refreshed
     last_heartbeat:     float            = 0.0  # for periodic status log
+    last_account_report: float           = 0.0  # for periodic Telegram P&L report
     # Backtests showed 25/33 signal-flip exits hit a 4% win rate — a single
     # opposing bar is mostly noise. Require N consecutive flips before exiting.
     opposing_streak:    Dict[str, int]   = {}
@@ -870,10 +1192,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # Tunables
     COOLDOWN_AFTER_STOP_SEC   = 300.0   # 5 min after STOP_LOSS / SL / signal_stop
     COOLDOWN_AFTER_SIGNAL_SEC = 60.0    # 1 min after signal-driven exits
-    MAX_OPEN_POSITIONS        = 4        # AGGRESSIVE: allow more concurrent positions
+    MAX_OPEN_POSITIONS        = int(os.getenv('MAX_OPEN_POSITIONS',
+                                              risk_cfg.get('max_open_positions', 4)))  # config-authoritative
     WS_PRICE_STALENESS_SEC    = 12.0    # skip entry if WS price older than this
     CORRELATED_GROUPS         = [{'BTC/USD', 'ETH/USD', 'SOL/USD'}]
     HEARTBEAT_INTERVAL_SEC    = 60.0
+    # Periodic account report to Telegram (made/lost + total money). Default hourly.
+    ACCOUNT_REPORT_INTERVAL_SEC = float(os.getenv('ACCOUNT_REPORT_HOURS', '1.0')) * 3600
+    # Push skipped/rejected-signal reasoning to Telegram? Default off → log only.
+    # (This was the source of the "only tells me when it skips" noise.)
+    NOTIFY_SKIPS              = os.getenv('NOTIFY_SKIPS', '0') == '1'
 
     # Daily summary scheduler — fires once when UTC date rolls over
     session_start_utc_date    = datetime.now(timezone.utc).date()
@@ -915,15 +1243,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 sma20   = float(df['volume'].rolling(20).mean().iloc[-2])  # exclude current
                 if sma20 > 0 and cur_vol > sma20 * 10.0:
                     return f"WHALE_PRINT ({cur_vol/sma20:.1f}× SMA20)"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] whale-print check failed for {sym}: {e}")
         # Book imbalance — opposing side stacked → cascade/squeeze risk
         try:
             book_reason = ofi_calc.book_imbalance_blocks(sym, side)
             if book_reason:
                 return book_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] book-imbalance check failed for {sym}: {e}")
         # CVD divergence — price and order flow disagreeing
         try:
             tracker = strategy._cvd_trackers.get(sym) if strategy else None
@@ -931,8 +1259,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 div_reason = tracker.divergence_blocks(side)
                 if div_reason:
                     return div_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] CVD-divergence check failed for {sym}: {e}")
         # Microprice unfair — paying a markup over depth-weighted fair value
         try:
             last_price = float(df['close'].iloc[-1]) if len(df) else 0.0
@@ -940,15 +1268,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 mp_reason = ofi_calc.microprice_blocks(sym, side, last_price)
                 if mp_reason:
                     return mp_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] microprice check failed for {sym}: {e}")
         # Wick rejection — clustered rejections forming a ceiling (long) or floor (short)
         try:
             rej_reason = detect_rejection(df, side=side)
             if rej_reason:
                 return rej_reason
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[KILL-FILTER] wick-rejection check failed for {sym}: {e}")
         return None
 
     async def _seed_cache():
@@ -959,6 +1287,30 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 if ohlcv:
                     ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                     logger.info(f"[CACHE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+                    # Compute initial regime so trades evaluated before the first WS
+                    # candle event don't all get logged as regime=UNKNOWN.
+                    result = regime_detector.detect(ohlcv_cache[sym])
+                    if result:
+                        regime_cache[sym] = result.to_dict()
+                        logger.info(f"[REGIME] {sym} seeded: {result.regime} "
+                                    f"conf={result.confidence:.2f} adx={result.adx:.1f}")
+                    else:
+                        logger.warning(f"[REGIME] {sym} seed detect() returned None "
+                                       f"(bars={len(ohlcv_cache[sym])}); regime will be UNKNOWN "
+                                       f"until a WS candle arrives")
+            except CircuitBreakerOpen as e:
+                wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                logger.error(f"[CACHE] Exchange circuit breaker open during seed — stopping early ({wait:.0f}s remaining): {e}")
+                if notifier:
+                    try:
+                        notifier.send_message(
+                            f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                            f"Data seed interrupted — cooldown {wait:.0f}s.\n"
+                            f"Bot will trade on stale/incomplete cache until exchange recovers."
+                        )
+                    except Exception:
+                        pass
+                break  # no point seeding other symbols while the circuit is open
             except Exception as e:
                 logger.warning(f"[CACHE] seed failed for {sym}: {e}")
 
@@ -1021,15 +1373,41 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 ret = float(df_tmp['close'].pct_change().iloc[-1])
                                 if not pd.isna(ret):
                                     symbol_returns[sym].append(ret)
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(
+                            f"[CACHE] Exchange circuit breaker open — pausing refresher "
+                            f"{wait:.0f}s (symbol={sym})"
+                        )
+                        if notifier:
+                            try:
+                                notifier.send_message(
+                                    f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                                    f"OHLCV refresh paused {wait:.0f}s — trading on stale data."
+                                )
+                            except Exception:
+                                pass
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; refresher will retry next cycle
                     except Exception as e:
                         logger.debug(f"[CACHE] refresh failed for {sym}: {e}")
             except asyncio.TimeoutError:
-                # Fallback: refresh all
+                # Fallback: refresh all (no WS candles seen in 90s — WS may be silent).
+                # Refresh regime here too so the cache doesn't go permanently stale /
+                # empty when the WS event path isn't delivering candles.
                 for sym in symbols:
                     try:
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                            result = regime_detector.detect(ohlcv_cache[sym])
+                            if result:
+                                regime_cache[sym] = result.to_dict()
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[CACHE] Circuit open (fallback path) — sleeping {wait:.0f}s")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; will resume next cycle
                     except Exception as e:
                         logger.warning(f"[CACHE] fallback refresh failed for {sym}: {e}")
             except asyncio.CancelledError:
@@ -1037,7 +1415,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             except Exception as e:
                 logger.error(f"[CACHE] refresher error: {e}")
 
-    asyncio.create_task(_candle_refresher())
+    asyncio.create_task(supervised('candle_refresher', _candle_refresher, notifier=notifier, max_restarts=10))
 
     # ── Startup notification (so we know systemd restarts after a crash) ──────
     if notifier:
@@ -1067,18 +1445,31 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             await asyncio.sleep(EVAL_INTERVAL)
             iteration += 1
 
-            # Daily loss circuit breaker
+            # Daily loss circuit breaker — UTC-day-rolling baseline. Halts NEW
+            # entries for the rest of the day (exits + funding arms keep running)
+            # and resets at midnight UTC, instead of permanently killing the loop.
             current_equity = trader.get_account_summary()['total_equity']
-            daily_loss = session_start_equity - current_equity
-            if daily_loss >= max_daily_loss:
-                logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit")
+            _utc_today = datetime.now(timezone.utc).date()
+            if _utc_today != risk_day:
+                risk_day = _utc_today
+                risk_day_baseline = current_equity
+                if daily_entries_halted:
+                    logger.info("[RISK] New UTC day — daily-loss halt cleared")
+                daily_entries_halted = False
+            daily_loss = risk_day_baseline - current_equity
+            # Expose today's P&L fraction so the microstructure kill filter's
+            # DAILY_LOSS gate (Filter 7) can actually fire.
+            strategy._daily_pnl_pct = (current_equity - risk_day_baseline) / max(risk_day_baseline, 1e-9)
+            if daily_loss >= max_daily_loss and not daily_entries_halted:
+                logger.warning(f"[RISK] Daily loss limit ${daily_loss:.2f} hit — "
+                               f"halting new entries until 00:00 UTC")
                 if notifier:
                     notifier.send_message(
                         f"🛑 <b>Daily loss limit hit</b>\n"
-                        f"Lost ${daily_loss:.2f} today — bot stopped for the day"
+                        f"Lost ${daily_loss:.2f} today — new entries halted until "
+                        f"00:00 UTC (exits and funding arms continue)"
                     )
-                trader.running = False
-                break
+                daily_entries_halted = True
 
             # Refresh CVaR every 50 iterations
             if iteration % 50 == 0 and any(len(v) >= 20 for v in symbol_returns.values()):
@@ -1128,12 +1519,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 funding_rate = _get_funding_rate(symbol)
 
                 # ── Microstructure OFI v2 book update ─────────────────────────
-                # Fetch order book and feed it into OFI v2 + kill filters
+                # Prefer streaming WS book (sub-second updates); fall back to REST
+                # only when WS has no fresh data (<3s old). This wakes the
+                # microstructure scalper from REST-snapshot dormancy.
                 try:
-                    ob = await ofi_calc._exchange.exchange.fetch_order_book(symbol, limit=20)
-                    if ob:
-                        bids_raw = ob.get('bids', [])
-                        asks_raw = ob.get('asks', [])
+                    bids_raw: List = []
+                    asks_raw: List = []
+                    if book_feed is not None and book_feed.staleness(symbol) < 3.0:
+                        bids_raw, asks_raw = book_feed.get_top(symbol, depth=10)
+                    if not (bids_raw and asks_raw):
+                        ob = await ofi_calc._exchange.fetch_order_book(symbol, limit=20)
+                        if ob:
+                            bids_raw = ob.get('bids', [])
+                            asks_raw = ob.get('asks', [])
+                    if bids_raw and asks_raw:
                         strategy.update_book(symbol, bids_raw, asks_raw, time.time())
                         # Update volume SMA for whale filter
                         vol_sma20 = float(df['volume'].rolling(20).mean().iloc[-1]) if len(df) >= 20 else 0.0
@@ -1144,9 +1543,21 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 best_bid = float(bids_raw[0][0])
                                 best_ask = float(asks_raw[0][0])
                                 if best_ask > best_bid > 0:
-                                    trader.live_spreads[symbol] = best_ask - best_bid
-                            except Exception:
-                                pass
+                                    spread_abs = best_ask - best_bid
+                                    trader.live_spreads[symbol] = spread_abs
+                                    mid = (best_ask + best_bid) / 2.0
+                                    if mid > 0:
+                                        spread_tracker.push(symbol, spread_abs / mid)
+                            except Exception as e:
+                                logger.debug(f"[OFI] spread parse failed for {symbol}: {e}")
+                except CircuitBreakerOpen as e:
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    logger.warning(
+                        f"[TICK] Exchange circuit breaker open during book fetch "
+                        f"— skipping remaining symbols, sleeping {wait:.0f}s"
+                    )
+                    await asyncio.sleep(wait)
+                    break  # skip remaining symbols this tick; circuit may half-open by next tick
                 except Exception as e:
                     logger.debug(f"[OFI] order book fetch failed for {symbol}: {e}")
 
@@ -1164,26 +1575,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     if exit_reason is not None:
                         if exit_type == 'PARTIAL':
-                            # T1 partial: close 50% of position
-                            partial_size = pos_check.size * 0.5
+                            # T1 partial: close 50% of position via accounting-correct helpers
                             if pos_check.side == 'buy':
-                                exec_price = current_price * (1 - trader.slippage_pct)
-                                pnl_partial = (exec_price - pos_check.entry_price) * partial_size
-                                pos_check.size -= partial_size
-                                trader.account.cash += exec_price * partial_size - exec_price * partial_size * trader.fee_pct
-                                trader.account.total_pnl += pnl_partial
+                                pnl_partial = trader.execute_partial_sell(
+                                    symbol, current_price, datetime.now(timezone.utc))
                             else:
-                                exec_price = current_price * (1 + trader.slippage_pct)
-                                pnl_partial = (pos_check.entry_price - exec_price) * partial_size
-                                pos_check.size -= partial_size
-                                trader.account.cash += pos_check.entry_price * partial_size + pnl_partial
-                                trader.account.total_pnl += pnl_partial
-                            logger.info(f"[MICRO T1] {symbol} partial exit @ ${current_price:,.2f}  pnl=${pnl_partial:+.4f}")
-                            if notifier:
-                                notifier.send_message(
-                                    f"📊 <b>Half closed</b> — {symbol.split('/')[0]}\n"
-                                    f"Locked in partial profit @ ${current_price:,.2f}"
-                                )
+                                pnl_partial = trader.execute_partial_cover(
+                                    symbol, current_price, datetime.now(timezone.utc))
+                            if pnl_partial is not None:
+                                logger.info(f"[MICRO T1] {symbol} partial exit @ ${current_price:,.2f}  pnl=${pnl_partial:+.4f}")
+                                if notifier:
+                                    notifier.send_message(
+                                        f"📊 <b>Half closed</b> — {symbol.split('/')[0]}\n"
+                                        f"Locked in partial profit @ ${current_price:,.2f}"
+                                    )
                         else:
                             # Full exit
                             if pos_check.side == 'buy':
@@ -1195,13 +1600,34 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 summary = trader.get_account_summary()
                                 equity_curve.append({'t': _ts(datetime.now(timezone.utc)), 'v': round(summary['total_equity'], 2)})
                                 _on_trade_closed(symbol, pos_check, trade, exit_reason,
-                                                 summary['total_equity'], notifier, journal, ml_scorer)
+                                                 summary['total_equity'], notifier, journal, ml_scorer, calibrator)
                                 _record_exit(symbol, exit_reason)
                                 just_halted, halt_msg = circuit_breaker.record_outcome(
                                     won=(trade.pnl > 0), pnl=trade.pnl, symbol=symbol)
                                 if just_halted and notifier:
                                     notifier.send_message(halt_msg)
                         continue   # skip entry logic this tick after an exit
+
+                # ── Directional entry engine (shelved by default) ──────────────
+                # Everything above (data feeds, microstructure book updates, open-
+                # position exits) still runs; only NEW entry signal generation +
+                # execution are gated. The funnel records the shelving so the
+                # heartbeat stays honest about why nothing fires.
+                if not DIRECTIONAL_ENABLED:
+                    funnel.bump('signals_seen')
+                    funnel.bump('skip:directional_shelved')
+                    continue
+
+                # Master kill switch — halt NEW directional entries (exits above
+                # still run). Same flag the funding arms honor; file/env toggled.
+                try:
+                    from .kill_switch import is_killed as _kk
+                    if _kk():
+                        funnel.bump('signals_seen')
+                        funnel.bump('skip:killed')
+                        continue
+                except Exception:
+                    pass
 
                 # ── Strategy evaluation ────────────────────────────────────────
                 sig = strategy.evaluate(df, symbol, ofi_calc, lead_lag,
@@ -1341,11 +1767,71 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 pos      = trader.account.positions.get(symbol)
                 pos_side = pos.side if pos else None
 
+                # ── Funnel: classify this signal (source-level) ────────────────
+                funnel.bump('signals_seen')
+                if sig.signal == Signal.HOLD:
+                    funnel.bump('hold')
+                elif pos is None:
+                    funnel.bump('actionable')   # tradeable entry signal, no position
+
                 # ── Entry: minimum confidence gate ─────────────────────────────
                 min_conf = _adapt['min_confidence']
 
+                # ── Dual-direction probe ───────────────────────────────────────
+                # The signal generator picks ONE direction per tick based on
+                # indicator alignment. Some setups have edges on both sides; the
+                # generator may pick the weaker one. Here we re-evaluate the
+                # OPPOSITE direction through the same prob gate. Three outcomes:
+                #   - opposite leads by ≥ DUAL_MARGIN  → flip the signal
+                #   - both within margin              → reject both (noisy tape)
+                #   - original leads or single-sided  → leave unchanged
+                # Cost: one extra prob_gate.evaluate call per tradeable tick.
+                if (prob_gate and pos is None and (sig.is_buy or sig.is_sell)
+                        and os.getenv("DUAL_DIRECTION_ENABLED", "1") == "1"):
+                    _dual_margin = float(os.getenv("DUAL_DIRECTION_MARGIN", "0.05"))
+                    _orig_buy = bool(sig.is_buy)
+                    try:
+                        _orig = prob_gate.evaluate(
+                            sig, is_buy=_orig_buy, entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=_orig_buy),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        _opp = prob_gate.evaluate(
+                            sig, is_buy=(not _orig_buy), entry_path=_entry_path_tag,
+                            lead_strength=lead_lag.get_strength(symbol) or 0.0,
+                            htf_alignment=htf_filter.alignment_score(symbol, is_buy=(not _orig_buy)),
+                            macro_state=macro_provider.current(),
+                            symbol=symbol,
+                        )
+                        _delta = _opp.calibrated_p - _orig.calibrated_p
+                        if _delta > _dual_margin and not _opp.rejected:
+                            logger.info(
+                                f"[DUAL-FLIP] {symbol} "
+                                f"{'BUY' if _orig_buy else 'SELL'}→"
+                                f"{'SELL' if _orig_buy else 'BUY'} "
+                                f"orig P={_orig.calibrated_p:.2f} opp P={_opp.calibrated_p:.2f}"
+                            )
+                            sig.is_buy  = (not _orig_buy)
+                            sig.is_sell = _orig_buy
+                        elif (not _orig.rejected and not _opp.rejected
+                              and abs(_delta) <= _dual_margin):
+                            # Both directions clear the gate within margin →
+                            # contradictory edges → reject the whole bar.
+                            logger.info(
+                                f"[DUAL-REJECT] {symbol} both directions pass within "
+                                f"±{_dual_margin:.2f} (long P={_orig.calibrated_p if _orig_buy else _opp.calibrated_p:.2f}, "
+                                f"short P={_opp.calibrated_p if _orig_buy else _orig.calibrated_p:.2f}) — noisy tape"
+                            )
+                            funnel.bump('skip:dual_noisy')
+                            sig.is_buy = False
+                            sig.is_sell = False
+                    except Exception as _e:
+                        logger.debug(f"[DUAL] probe failed for {symbol}: {_e}")
+
                 # ── LONG ENTRY ──────────────────────────────────────────────────
-                if sig.is_buy and pos is None:
+                if sig.is_buy and pos is None and not daily_entries_halted:
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
@@ -1367,9 +1853,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                           if sentiment_monitor else True),
                         kill_filter_reason=_kill_filter_skip(symbol, df, side='buy'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
+                        current_spread_pct=spread_tracker.current(symbol),
+                        median_spread_pct=spread_tracker.median(symbol),
+                        vpin=vpin_monitor.current(symbol),
+                        vpin_threshold=_VPIN_THRESH,
+                        entry_hour=time.gmtime(now_ts).tm_hour,
+                        session_verdict=session_edge.verdict_for_hour(
+                            time.gmtime(now_ts).tm_hour),
                     )
                     cl_result = long_checklist.run(long_ctx)
                     if not cl_result.passed:
+                        funnel.bump('skip:checklist')
                         logger.info(f"[SKIP BUY] {symbol} — {cl_result.reason_summary()}")
                         logger.debug(f"[CHECKLIST BUY] {symbol} {cl_result.trace()}")
                         continue
@@ -1382,6 +1876,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     # Position size from confidence + equity (fallback if gate disabled)
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
+                        funnel.bump('skip:size')
                         continue
 
                     if vol_monitor:
@@ -1402,14 +1897,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             macro_state=macro_provider.current(),
                             symbol=symbol,
                         )
+                        _praw = f" (raw {reasoning.combined_p:.2f})" if reasoning.calibration_active else ""
                         logger.info(
-                            f"[PROB-GATE] {symbol} LONG  P={reasoning.combined_p:.2f} "
+                            f"[PROB-GATE] {symbol} LONG  P={reasoning.calibrated_p:.2f}{_praw} "
                             f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
                             f"macro={reasoning.is_macro_driven}"
                         )
                         if reasoning.rejected:
+                            funnel.bump('skip:probgate')
                             logger.info(f"[SKIP BUY] {symbol} — prob gate: {reasoning.rejection_reason}")
-                            if notifier:
+                            if notifier and NOTIFY_SKIPS:
                                 notifier.send_trade_reasoning(
                                     symbol, "LONG", current_price, reasoning, size_usd, _entry_path_tag
                                 )
@@ -1424,18 +1921,31 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
                                     f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
                         if size_usd < 1.50:
+                            funnel.bump('skip:size')
                             logger.info(f"[SKIP BUY] {symbol} — tier-scaled size below floor")
                             continue
                     # Apply correlation block — but allow macro-driven same-direction trades
                     if _corr_blocked_long and not (reasoning and reasoning.is_macro_driven):
+                        funnel.bump('skip:corr')
                         logger.info(f"[SKIP BUY] {symbol} — correlated long already open")
                         continue
                     elif _corr_blocked_long and reasoning and reasoning.is_macro_driven:
                         logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven long, allowing concurrent")
 
+                    # Expectancy gate: cap size until this path proves positive gross expectancy
+                    _exp_cap = expectancy_gate.cap_for(_entry_path_tag)
+                    if _exp_cap is not None and size_usd > _exp_cap:
+                        logger.info(f"[EXPECTANCY] {symbol} {_entry_path_tag} unproven → "
+                                    f"size ${size_usd:.2f}→${_exp_cap:.2f} (probe)")
+                        size_usd = _exp_cap
+                        if size_usd < 1.50:
+                            funnel.bump('skip:size')
+                            continue
+
                     position = trader.execute_buy(symbol, current_price, current_time,
                                                    size_usd=size_usd, signal=sig)
                     if position:
+                        funnel.bump('exec:long')
                         # Tag entry pathway and snapshot market context for the journal
                         position.entry_path = _entry_path_tag
                         if reasoning:
@@ -1445,6 +1955,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             position.intended_hold_min = reasoning.hold_minutes
                             position.trail_style = reasoning.trail_style
                             position.target_usd_at_entry = reasoning.target_usd
+                            position.prob_model_version = PROB_MODEL_VERSION
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
                             if reasoning:
@@ -1457,7 +1968,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             )
 
                 # ── SHORT ENTRY ─────────────────────────────────────────────────
-                elif sig.is_sell and pos is None:
+                elif sig.is_sell and pos is None and not daily_entries_halted:
                     try:
                         bar_ts = float(df.index[-1].timestamp())
                     except Exception:
@@ -1478,9 +1989,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         sentiment_allows=True,   # no sentiment gate for shorts
                         kill_filter_reason=_kill_filter_skip(symbol, df, side='sell'),
                         circuit_breaker_reason=None if cb_ok else cb_reason,
+                        current_spread_pct=spread_tracker.current(symbol),
+                        median_spread_pct=spread_tracker.median(symbol),
+                        vpin=vpin_monitor.current(symbol),
+                        vpin_threshold=_VPIN_THRESH,
+                        entry_hour=time.gmtime(now_ts).tm_hour,
+                        session_verdict=session_edge.verdict_for_hour(
+                            time.gmtime(now_ts).tm_hour),
                     )
                     cl_result = short_checklist.run(short_ctx)
                     if not cl_result.passed:
+                        funnel.bump('skip:checklist')
                         logger.info(f"[SKIP SELL] {symbol} — {cl_result.reason_summary()}")
                         logger.debug(f"[CHECKLIST SELL] {symbol} {cl_result.trace()}")
                         continue
@@ -1491,6 +2010,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 1.50:
+                        funnel.bump('skip:size')
                         continue
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
@@ -1507,14 +2027,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             macro_state=macro_provider.current(),
                             symbol=symbol,
                         )
+                        _praw = f" (raw {reasoning.combined_p:.2f})" if reasoning.calibration_active else ""
                         logger.info(
-                            f"[PROB-GATE] {symbol} SHORT P={reasoning.combined_p:.2f} "
+                            f"[PROB-GATE] {symbol} SHORT P={reasoning.calibrated_p:.2f}{_praw} "
                             f"scale={reasoning.size_scale:.2f} edges={len(reasoning.present_edges)} "
                             f"macro={reasoning.is_macro_driven}"
                         )
                         if reasoning.rejected:
+                            funnel.bump('skip:probgate')
                             logger.info(f"[SKIP SELL] {symbol} — prob gate: {reasoning.rejection_reason}")
-                            if notifier:
+                            if notifier and NOTIFY_SKIPS:
                                 notifier.send_trade_reasoning(
                                     symbol, "SHORT", current_price, reasoning, size_usd, _entry_path_tag
                                 )
@@ -1527,17 +2049,30 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         logger.info(f"[TIER] {symbol} {reasoning.tier} target=${reasoning.target_usd:.0f} "
                                     f"final=${size_usd:.2f} hold={reasoning.hold_minutes}min trail={reasoning.trail_style}")
                         if size_usd < 1.50:
+                            funnel.bump('skip:size')
                             logger.info(f"[SKIP SELL] {symbol} — tier-scaled size below floor")
                             continue
                     if _corr_blocked_short and not (reasoning and reasoning.is_macro_driven):
+                        funnel.bump('skip:corr')
                         logger.info(f"[SKIP SELL] {symbol} — correlated short already open")
                         continue
                     elif _corr_blocked_short and reasoning and reasoning.is_macro_driven:
                         logger.info(f"[CORR-OVERRIDE] {symbol} — macro-driven short, allowing concurrent")
 
+                    # Expectancy gate: cap size until this path proves positive gross expectancy
+                    _exp_cap = expectancy_gate.cap_for(_entry_path_tag)
+                    if _exp_cap is not None and size_usd > _exp_cap:
+                        logger.info(f"[EXPECTANCY] {symbol} {_entry_path_tag} unproven → "
+                                    f"size ${size_usd:.2f}→${_exp_cap:.2f} (probe)")
+                        size_usd = _exp_cap
+                        if size_usd < 1.50:
+                            funnel.bump('skip:size')
+                            continue
+
                     position = trader.execute_short(symbol, current_price, current_time,
                                                      size_usd=size_usd, signal=sig)
                     if position:
+                        funnel.bump('exec:short')
                         position.entry_path = _entry_path_tag
                         if reasoning:
                             position.prob_win = reasoning.combined_p
@@ -1546,6 +2081,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             position.intended_hold_min = reasoning.hold_minutes
                             position.trail_style = reasoning.trail_style
                             position.target_usd_at_entry = reasoning.target_usd
+                            position.prob_model_version = PROB_MODEL_VERSION
                         _annotate_position_context(position, symbol, sentiment_monitor, strategy)
                         if notifier:
                             if reasoning:
@@ -1570,7 +2106,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             summary = trader.get_account_summary()
                             equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                             _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                             notifier, journal, ml_scorer)
+                                             notifier, journal, ml_scorer, calibrator)
                             _record_exit(symbol, "SIGNAL")
                             opposing_streak.pop(symbol, None)
                             just_halted, halt_msg = circuit_breaker.record_outcome(
@@ -1597,7 +2133,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             summary = trader.get_account_summary()
                             equity_curve.append({'t': _ts(current_time), 'v': round(summary['total_equity'], 2)})
                             _on_trade_closed(symbol, pos, trade, "SIGNAL", summary['total_equity'],
-                                             notifier, journal, ml_scorer)
+                                             notifier, journal, ml_scorer, calibrator)
                             _record_exit(symbol, "SIGNAL")
                             opposing_streak.pop(symbol, None)
                             just_halted, halt_msg = circuit_breaker.record_outcome(
@@ -1630,7 +2166,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         prices[sym] = p
                         last_ws_price_time[sym] = time.time()
                         lead_lag.update_price(sym, p)
-            trader.update_unrealized_pnl(prices)
+            liquidated_syms = trader.update_unrealized_pnl(prices)
+            for liq_sym in liquidated_syms:
+                liq_msg = f"⚠️ LIQUIDATED {liq_sym} — full margin lost (paper mode)"
+                logger.warning(liq_msg)
+                if notifier:
+                    try:
+                        notifier.send_message(liq_msg)
+                    except Exception as _liq_err:
+                        logger.debug(f"[NOTIFY] liquidation alert failed: {_liq_err}")
             if trader.perp_mode:
                 trader.accrue_funding(datetime.now(timezone.utc))
 
@@ -1641,14 +2185,129 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 s_hb = trader.get_account_summary()
                 wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
                 open_syms = ','.join(trader.account.positions.keys()) or 'none'
+                # Fold in the funding-arb arms for running combined totals. Read
+                # net P&L straight from the in-memory arm objects — NOT from the
+                # shared state.json, which the main loop rewrites every tick and
+                # clobbers the funding_arb* keys the merge task writes only every
+                # 65s (the state-flush race that made this read +0.00 ~always).
+                # Three arms: aggressive (Binance/Bybit, fantasy baseline), majors
+                # (Binance/Bybit majors-only, also fantasy), kraken (the only arm
+                # whose +$X represents actually-capturable edge).
+                def _arm_pnl(_arm):
+                    try:
+                        return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
+                    except Exception:
+                        return 0.0
+                # Rolling 7d window for the Kraken arm — its lifetime total is
+                # dominated by dead pre-whitelist legacy losses, so the 7d figure
+                # is what actually reflects the CURRENT config's edge.
+                def _arm_pnl_7d(_arm):
+                    try:
+                        return float(_arm.get_summary().get('pnl_7d', 0.0)) if _arm else 0.0
+                    except Exception:
+                        return 0.0
+                # Borrow-corrected lifetime: charges every short-spot leg the carry
+                # it owes. For the aggressive arm this strips the unpaid-borrow
+                # illusion (booked +$16 vs honest ≈ −$14).
+                def _arm_pnl_adj(_arm):
+                    try:
+                        return float(_arm.get_summary().get('borrow_corrected_pnl', 0.0)) if _arm else 0.0
+                    except Exception:
+                        return 0.0
+                _fa_hb  = _arm_pnl(_funding_arb_sim)
+                _fa_adj = _arm_pnl_adj(_funding_arb_sim)
+                _fam_hb = _arm_pnl(_funding_arb_majors)
+                _fak_hb = _arm_pnl(_funding_arb_kraken)
+                _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
+                _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
+                _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
+                # The AI brain runs out-of-process on its own $1k book; read its
+                # mark-to-market equity from state on disk so the heartbeat reflects
+                # its open drawdown (the `equity` field alone hides it). Kept as a
+                # separate segment — its bankroll is distinct from the arms above, so
+                # folding it into netPnL would mix books.
+                def _brain_mtm_hb():
+                    try:
+                        _bp = os.getenv("BRAIN_STATE_FILE", "data/brain_paper_state.json")
+                        with open(_bp) as _bf:
+                            _bd = json.load(_bf)
+                        _bs = float(_bd.get("starting_equity", 0.0) or 0.0)
+                        _bm = float(_bd.get("equity_mtm", _bd.get("equity", _bs)) or _bs)
+                        return _bm, _bm - _bs, bool(_bd.get("halted", False))
+                    except Exception:
+                        return None, 0.0, False
+                _brain_eq, _brain_pnl, _brain_halt = _brain_mtm_hb()
+                _brain_seg = ""
+                if _brain_eq is not None:
+                    _brain_seg = (f" brain={_brain_eq:.2f}[{_brain_pnl:+.2f}"
+                                  f"{' HALTED' if _brain_halt else ''}]")
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
-                    f"open={open_syms} min_conf={_adapt['min_confidence']:.0f}"
+                    f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
+                    f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
+                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f} "
+                    f"aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}]{_brain_seg})"
                 )
+                # Entry funnel — where signals died since the last heartbeat
+                logger.info(f"[FUNNEL] {funnel.render()}")
+                funnel.reset()
+                # Subsystem health — surface any DEAD/DEGRADED background tasks
+                _health = _get_subsystem_health()
+                _unhealthy = {k: v for k, v in _health.items() if v != "OK"}
+                if _unhealthy:
+                    logger.warning(f"[SUBSYSTEMS] degraded/dead: {_unhealthy}")
+                else:
+                    logger.info(f"[SUBSYSTEMS] all OK ({len(_health)} tasks)")
+                # Refresh expectancy-gate stats (growth-gated → cheap until trades close)
+                if expectancy_gate.update(journal):
+                    logger.info(f"[EXPECTANCY] {expectancy_gate.status()}")
                 # Persist open positions so a crash/restart can resume
                 _save_open_positions(trader)
+
+            # Periodic account report to Telegram — made/lost + total money.
+            # Combines the directional paper account with all three funding-arb
+            # arms, read straight from the in-memory arm objects (race-free —
+            # see the heartbeat note above on the state.json clobber race).
+            # Fires on its own cadence (default hourly).
+            if notifier and (now_hb - last_account_report >= ACCOUNT_REPORT_INTERVAL_SEC):
+                last_account_report = now_hb
+                try:
+                    s_rep = trader.get_account_summary()
+                    wr_rep = (s_rep['winning_trades'] / s_rep['closed_trades'] * 100) \
+                        if s_rep['closed_trades'] else 0.0
+                    def _arm_pnl_rep(_arm):
+                        try:
+                            return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
+                        except Exception:
+                            return 0.0
+                    fa_pnl  = _arm_pnl_rep(_funding_arb_sim)
+                    fam_pnl = _arm_pnl_rep(_funding_arb_majors)
+                    fak_pnl = _arm_pnl_rep(_funding_arb_kraken)
+                    dir_pnl, dir_eq = s_rep['total_pnl'], s_rep['total_equity']
+                    combined = dir_pnl + fa_pnl + fam_pnl + fak_pnl
+                    total_money = dir_eq + fa_pnl + fam_pnl + fak_pnl
+                    open_syms = ', '.join(trader.account.positions.keys()) or 'none'
+                    mark = '🟢' if combined >= 0 else '🔴'
+                    verb = 'up' if combined >= 0 else 'down'
+                    notifier.send_message(
+                        f"📊 <b>Account Report</b> (paper)\n"
+                        f"💰 Total money: <b>${total_money:,.2f}</b>\n"
+                        f"{mark} Net P&amp;L: <b>${combined:+,.2f}</b> ({verb} since start)\n\n"
+                        f"• Directional book: ${dir_eq:,.2f} equity "
+                        f"(P&amp;L ${dir_pnl:+,.2f} / {s_rep['pnl_pct']:+.2f}%, "
+                        f"{s_rep['closed_trades']} trades, {wr_rep:.0f}% WR)\n"
+                        f"• Funding Arb (Kraken, executable): ${fak_pnl:+,.2f}\n"
+                        f"• Funding Arb (majors, baseline): ${fam_pnl:+,.2f}\n"
+                        f"• Funding Arb (aggressive, baseline): ${fa_pnl:+,.2f}\n"
+                        f"• Open positions: {open_syms}"
+                    )
+                    logger.info(f"[ACCOUNT REPORT] sent — total=${total_money:.2f} "
+                                f"netPnL=${combined:+.2f} (dir={dir_pnl:+.2f} "
+                                f"kraken={fak_pnl:+.2f} majors={fam_pnl:+.2f} aggr={fa_pnl:+.2f})")
+                except Exception as e:
+                    logger.warning(f"[ACCOUNT REPORT] failed: {e}")
 
             # Daily summary — fires once when UTC date rolls over
             today_utc = datetime.now(timezone.utc).date()
@@ -1753,6 +2412,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
         except asyncio.CancelledError:
             break
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.warning(
+                f"[LOOP] Exchange circuit breaker open — pausing main loop {wait:.0f}s "
+                f"({e})"
+            )
+            await asyncio.sleep(wait)
         except Exception as e:
             logger.error(f"Error in paper trading loop: {e}", exc_info=True)
             await asyncio.sleep(5)
@@ -1760,6 +2426,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     trader.running = False
     logger.info("Paper trading session ended")
     learner.log_summary()
+
+    # Stop funding-arb background tasks (best-effort)
+    for _t in _funding_tasks:
+        _t.cancel()
 
     # Shutdown notification — best-effort (systemd may have already SIGKILL'd us)
     if notifier:
@@ -1785,7 +2455,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
                      exit_reason: str, total_equity: float,
                      notifier: Optional[TelegramNotifier], journal: TradeJournal,
-                     ml_scorer: Optional['MLScorer'] = None):
+                     ml_scorer: Optional['MLScorer'] = None,
+                     calibrator=None):
     if pos is None:
         return
 
@@ -1802,6 +2473,16 @@ def _on_trade_closed(symbol: str, pos: 'PaperPosition', trade: Trade,
     if ml_scorer is not None and ml_scorer.should_retrain():
         logger.info("[ML] Retraining triggered after new trades")
         ml_scorer.train()
+
+    # Refit the probability calibrator on the freshly-updated journal (no-op
+    # until it has grown by CALIB_REFIT_EVERY trades since the last fit).
+    if calibrator is not None:
+        try:
+            if calibrator.maybe_refit(journal):
+                logger.info("[CALIB] refit on %d trades (active=%s)",
+                            calibrator._n_fit, calibrator.is_active)
+        except Exception as e:
+            logger.warning(f"[CALIB] refit skipped: {e}")
 
     adaptations = _update_streaks_and_adapt(trade.pnl > 0, notifier)
 
@@ -1855,10 +2536,15 @@ _POSITIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data
 
 
 def _save_open_positions(trader):
-    """Dump open positions to disk so a restart can resume them."""
+    """Dump open positions to disk so a restart can resume them.
+
+    Writes to a sibling .tmp file then atomically renames it into place so a
+    crash mid-write never leaves a corrupted JSON file on disk.
+    """
     def _iso(dt):
         return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
 
+    _tmp = _POSITIONS_FILE + '.tmp'
     try:
         os.makedirs(os.path.dirname(_POSITIONS_FILE), exist_ok=True)
         out = []
@@ -1894,15 +2580,25 @@ def _save_open_positions(trader):
                 'funding_accrued':  pos.funding_accrued,
                 'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
             })
-        with open(_POSITIONS_FILE, 'w') as f:
-            json.dump({
-                'saved_at': datetime.now(timezone.utc).isoformat(),
-                'cash':     trader.account.cash,
-                'total_pnl': trader.account.total_pnl,
-                'positions': out,
-            }, f, indent=2)
+        payload = json.dumps({
+            'saved_at': datetime.now(timezone.utc).isoformat(),
+            'cash':     trader.account.cash,
+            'total_pnl': trader.account.total_pnl,
+            'positions': out,
+        }, indent=2)
+        # Write to tmp first, then rename — atomic on POSIX; prevents a
+        # mid-write crash from leaving a truncated/corrupt positions file.
+        with open(_tmp, 'w') as f:
+            f.write(payload)
+        os.replace(_tmp, _POSITIONS_FILE)
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to save open positions to {_POSITIONS_FILE}: {e}")
+        # Clean up the temp file if it was created before the failure.
+        try:
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+        except OSError:
+            pass
 
 
 def _load_open_positions(trader):
@@ -1912,6 +2608,18 @@ def _load_open_positions(trader):
     try:
         with open(_POSITIONS_FILE) as f:
             state = json.load(f)
+        saved_at_raw = state.get('saved_at')
+        if saved_at_raw:
+            try:
+                saved_at = datetime.fromisoformat(saved_at_raw)
+                age_hours = (datetime.now(timezone.utc) - saved_at).total_seconds() / 3600.0
+                if age_hours > 1.0:
+                    logger.warning(
+                        f"[POSITIONS] Restoring positions from a snapshot that is "
+                        f"{age_hours:.1f}h old — entry prices may differ from current market"
+                    )
+            except Exception:
+                pass
         restored = 0
         for p in state.get('positions', []):
             try:
@@ -1953,10 +2661,14 @@ def _load_open_positions(trader):
             except Exception as e:
                 logger.warning(f"[POSITIONS] Could not restore position {p.get('symbol', '?')}: {e}")
                 continue
-        # Restore cash if it matches better than what we'd otherwise start with
-        if 'cash' in state and state['cash'] < trader.account.cash:
+        # Restore cash/PnL from the snapshot whenever positions were restored.
+        # The snapshot's cash already has each restored position's margin/notional
+        # deducted, so we MUST adopt it — keeping the fresh initial_capital while
+        # re-adding positions double-counts equity (a winning session, where
+        # saved cash > initial_capital, was previously skipped by the old guard).
+        if restored and 'cash' in state:
             trader.account.cash = float(state['cash'])
-            trader.account.total_pnl = float(state.get('total_pnl', 0.0))
+            trader.account.total_pnl = float(state.get('total_pnl', trader.account.total_pnl))
         return restored
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to load open positions from {_POSITIONS_FILE}: {e}")
