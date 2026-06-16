@@ -1,5 +1,19 @@
 # Crypto Bot — Claude Context
 
+## Multi-agent coordination (READ FIRST)
+More than one autonomous agent works this repo (an interactive Claude Code session on the
+owner's computer, plus scheduled cloud routines such as "dispatch"). **They do not share
+memory** — coordination state lives in-repo, in [`WORKLOG.md`](WORKLOG.md) and here, never in
+any agent's private memory. Rules:
+1. **Never push to `master` directly. Work on a branch, open a PR, let the owner merge.** This
+   is the gate that prevents one agent clobbering another's work (it has already happened once).
+2. **`git fetch` before starting**, and read `WORKLOG.md` — master may have moved.
+3. **Stay in your lane** (lane map in `WORKLOG.md`): directional-strategy files vs.
+   brain/risk/observability files. Cross-lane edits → note it in `WORKLOG.md` first.
+4. After pushing, confirm `python -m pytest tests/ -q` still collects (2 known pre-existing
+   fails). Distrust "dead code" verdicts on files with fresh tests — they may be another agent's
+   in-flight work. See memory `multi_agent_master_races`.
+
 ## Project Location
 `D:\crypto-bot\` (authoritative). Deployed to a Hetzner VPS at `178.105.41.226`.
 

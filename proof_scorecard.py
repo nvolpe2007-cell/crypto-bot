@@ -329,6 +329,32 @@ def _lev_perp_forward() -> dict | None:
     return dict(label='Leveraged perp 3x + take-profit (FORWARD, paper)', executable=True, **s)
 
 
+def _pairs_forward() -> dict | None:
+    """Market-neutral pairs arm forward record (pairs_paper.py): a DOLLAR-NEUTRAL
+    relative-value trade — long the cheap leg, short the rich leg of a major pair when
+    their price ratio stretches >ENTRY_Z, profiting from convergence regardless of market
+    direction. The honest hedge-fund staple; PAPER (short leg simulated w/ funding drag)
+    until Kraken US perps land. Judged on the SAME pre-registered bar — the cost wall is
+    ~4 legs of fees per round-trip, so this earns or kills the neutral edge on the forward
+    clock. Entry-week clustered like the other arms."""
+    path = DATA / 'pairs_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Market-neutral pairs (FORWARD, paper)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -471,6 +497,7 @@ def main():
         _brain_forward(),
         _regime_forward(),
         _lev_perp_forward(),
+        _pairs_forward(),
         _directional(),
     ] if a]
 

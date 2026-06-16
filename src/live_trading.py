@@ -25,17 +25,17 @@ import pandas as pd
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
-from .pairs_strategy import PairsStrategy, PairsSignal
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
-from .exchange import ExchangeConnection
+from .exchange import ExchangeConnection, CircuitBreakerOpen
 from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
 from .kraken_ws import KrakenPublicWS, KrakenPrivateWS
 from .regime_detector import RegimeDetector
 from .order_flow import OrderFlowImbalance
-from .orderflow_ws import OrderFlowWS
+from .lead_lag_detector import LeadLagDetector
+from .multi_timeframe import MultiTimeframeFilter
 from .ml_scorer import MLScorer
 from .state import write_state, read_state
 
@@ -56,13 +56,8 @@ class LivePosition:
     order_id:         str
     stop_loss_price:  float
     take_profit_price: float
-    side:             str = 'long'   # 'long' or 'short'
     entry_signal:     Optional[ScientificSignal] = None
     unrealized_pnl:   float = 0.0
-    # ATR trailing stop state (chandelier exit)
-    atr_at_entry:              float = 0.0
-    highest_price_since_entry: float = 0.0   # for long chandelier
-    lowest_price_since_entry:  float = 0.0   # for short chandelier
 
 
 @dataclass
@@ -93,17 +88,15 @@ class LiveTrader:
         # Trading subsystems (same as paper_trading)
         self.strategy        = ScientificStrategy()
         self.regime_detector = RegimeDetector()
-        self.ofi_calc        = OrderFlowImbalance(exchange, symbols)  # REST fallback (dashboard only)
-        self.ofw             = OrderFlowWS(symbols)                   # WS order flow (primary)
+        self.ofi_calc        = OrderFlowImbalance(exchange, symbols)
+        self.lead_lag        = LeadLagDetector(lead_symbol='BTC/USD')
+        self.htf_filter      = MultiTimeframeFilter(exchange)
         self.journal         = TradeJournal()
         self.learner         = Learner(self.journal)
         self.ml_scorer       = MLScorer(self.journal)
         self.strategy.ml_scorer = self.ml_scorer
         if self.ml_scorer.should_retrain():
             self.ml_scorer.train()
-
-        self.pairs_strategy = PairsStrategy(symbols)
-        self._pairs_symbol: Optional[str] = None   # lagger symbol with an open pairs trade
 
         self.account   = LiveAccount(initial_capital=initial_capital)
         self.positions: Dict[str, LivePosition] = {}
@@ -180,6 +173,8 @@ class LiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, order_type='market', side='buy', amount=size
             )
+        except CircuitBreakerOpen:
+            raise  # propagate to main loop so it can sleep the correct cooldown
         except Exception as e:
             logger.error(f"[LIVE] Buy order FAILED for {symbol}: {e}")
             if self.notifier:
@@ -206,7 +201,6 @@ class LiveTrader:
         actual_fee = float(order.get('fee', {}).get('cost', 0) or safe_usd * FEE_RATE)
         self.account.total_fees += actual_fee
 
-        atr = signal.atr if signal else 0.0
         pos = LivePosition(
             symbol=symbol,
             entry_time=datetime.now(timezone.utc),
@@ -217,15 +211,12 @@ class LiveTrader:
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
             entry_signal=signal,
-            atr_at_entry=atr,
-            highest_price_since_entry=exec_price,
-            lowest_price_since_entry=exec_price,
         )
         self.positions[symbol] = pos
         logger.info(
             f"[LIVE BUY] {symbol} @ ${exec_price:.2f}  "
             f"size ${safe_usd:.2f}  SL ${sl_price:.2f}  TP ${tp_price:.2f}  "
-            f"ATR={atr:.2f}  fee ${actual_fee:.3f}  order={order_id}"
+            f"fee ${actual_fee:.3f}  order={order_id}"
         )
         return pos
 
@@ -240,6 +231,8 @@ class LiveTrader:
             order = await self.exchange.create_order(
                 symbol=symbol, order_type='market', side='sell', amount=pos.size
             )
+        except CircuitBreakerOpen:
+            raise  # propagate to caller; position stays open and will be retried
         except Exception as e:
             logger.error(f"[LIVE] Sell order FAILED for {symbol}: {e}")
             if self.notifier:
@@ -302,138 +295,10 @@ class LiveTrader:
 
         return trade
 
-    async def open_short(self, symbol: str, price: float, size_usd: float,
-                         signal: ScientificSignal) -> Optional[LivePosition]:
-        """Place a real short-sell order.  Records position only after confirmed fill."""
-        usd_balance = await self.get_balance()
-        safe_usd    = min(size_usd, usd_balance * 0.95)
-
-        if safe_usd < 5.0:
-            logger.warning(f"[LIVE] Insufficient balance for short {symbol}: ${usd_balance:.2f} available")
-            return None
-
-        size = safe_usd / price
-
-        try:
-            order = await self.exchange.create_order(
-                symbol=symbol, order_type='market', side='sell', amount=size,
-                params={'reduceOnly': False}     # open a new short, not close a long
-            )
-        except Exception as e:
-            logger.error(f"[LIVE] Short-sell order FAILED for {symbol}: {e}")
-            if self.notifier:
-                self.notifier.send_error(f"Short order failed for {symbol}: {e}")
-            return None
-
-        status     = order.get('status', '')
-        exec_price = float(order.get('average') or order.get('price') or price)
-        order_id   = order.get('id', '')
-
-        if status not in ('closed', 'filled', ''):
-            logger.error(f"[LIVE] Short order {order_id} status={status} — not confirmed filled")
-            if self.notifier:
-                self.notifier.send_error(f"{symbol} short order {order_id} status '{status}' — check Kraken manually")
-            return None
-
-        sl_pct = signal.stop_loss_pct() / 100
-        tp_pct = signal.take_profit_pct() / 100
-        # For shorts: SL is above entry, TP is below entry
-        sl_price = exec_price * (1 + sl_pct)
-        tp_price = exec_price * (1 - tp_pct)
-
-        actual_fee = float(order.get('fee', {}).get('cost', 0) or safe_usd * FEE_RATE)
-        self.account.total_fees += actual_fee
-
-        atr = signal.atr if signal else 0.0
-        pos = LivePosition(
-            symbol=symbol,
-            entry_time=datetime.now(timezone.utc),
-            entry_price=exec_price,
-            size=size,
-            size_usd=safe_usd,
-            order_id=order_id,
-            stop_loss_price=sl_price,
-            take_profit_price=tp_price,
-            side='short',
-            entry_signal=signal,
-            atr_at_entry=atr,
-            highest_price_since_entry=exec_price,
-            lowest_price_since_entry=exec_price,
-        )
-        self.positions[symbol] = pos
-        logger.info(
-            f"[LIVE SHORT] {symbol} @ ${exec_price:.2f}  "
-            f"size ${safe_usd:.2f}  SL ${sl_price:.2f}  TP ${tp_price:.2f}  "
-            f"ATR={atr:.2f}  fee ${actual_fee:.3f}  order={order_id}"
-        )
-        return pos
-
-    async def close_short(self, symbol: str, current_price: float,
-                          reason: str) -> Optional[Trade]:
-        """Buy back to close a short position."""
-        pos = self.positions.get(symbol)
-        if not pos or pos.side != 'short':
-            return None
-
-        try:
-            order = await self.exchange.create_order(
-                symbol=symbol, order_type='market', side='buy', amount=pos.size,
-                params={'reduceOnly': True}
-            )
-        except Exception as e:
-            logger.error(f"[LIVE] Cover-short order FAILED for {symbol}: {e}")
-            if self.notifier:
-                self.notifier.send_error(f"COVER FAILED {symbol} @ ${current_price:.2f} — {e} — close manually on Kraken!")
-            return None
-
-        exec_price = float(order.get('average') or order.get('price') or current_price)
-        exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
-        self.account.total_fees += exit_fee
-
-        # Short P&L: profit when price falls
-        pnl     = (pos.entry_price - exec_price) * pos.size - pos.size_usd * FEE_RATE - exit_fee
-        pnl_pct = (pos.entry_price - exec_price) / pos.entry_price * 100
-
-        trade = Trade(
-            entry_time=pos.entry_time,
-            exit_time=datetime.now(timezone.utc),
-            entry_price=pos.entry_price,
-            exit_price=exec_price,
-            size=pos.size,
-            side='short',
-            pnl=pnl,
-            pnl_pct=pnl_pct,
-            fees=exit_fee,
-        )
-        self.account.closed_trades.append(trade)
-        self.account.total_pnl += pnl
-        del self.positions[symbol]
-
-        logger.info(
-            f"[LIVE COVER] {symbol} @ ${exec_price:.2f}  "
-            f"PnL ${pnl:.2f} ({pnl_pct:.2f}%)  reason={reason}"
-        )
-
-        sig = pos.entry_signal
-        _record_live_trade(self.journal, trade, symbol, reason, sig, direction='short')
-        if self.ml_scorer.should_retrain():
-            logger.info("[ML] Retraining triggered")
-            self.ml_scorer.train()
-
-        total_equity = self.account.initial_capital + self.account.total_pnl
-        if self.notifier:
-            fn = self.notifier.send_win if pnl >= 0 else self.notifier.send_loss
-            fn(symbol, pnl, pnl_pct, exec_price, total_equity, reason=f"SHORT/{reason}")
-
-        return trade
-
     def update_unrealized(self, prices: Dict[str, float]):
         for sym, pos in self.positions.items():
             if sym in prices:
-                if pos.side == 'short':
-                    pos.unrealized_pnl = (pos.entry_price - prices[sym]) * pos.size
-                else:
-                    pos.unrealized_pnl = (prices[sym] - pos.entry_price) * pos.size
+                pos.unrealized_pnl = (prices[sym] - pos.entry_price) * pos.size
 
     def get_summary(self) -> dict:
         total_unr = sum(p.unrealized_pnl for p in self.positions.values())
@@ -475,9 +340,6 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     enable_shorts     = os.getenv('ENABLE_SHORTS', 'false').lower() == 'true'
     session_start_pnl = trader.account.total_pnl
 
-    logger.info(f"[LIVE] Shorting {'ENABLED' if enable_shorts else 'DISABLED'} "
-                f"(set ENABLE_SHORTS=true in .env to enable)")
-
     if notifier:
         notifier.send_message(
             f"<b>Bot started — LIVE</b>\n"
@@ -485,11 +347,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             f"Trading: {', '.join(s.split('/')[0] for s in symbols)}"
         )
 
-    # ── Background: WebSocket order flow (live CVD + OBI) ────────────────────
-    asyncio.create_task(trader.ofw.start())
-    logger.info("[LIVE] WebSocket order flow started (CVD + OBI)")
-
-    # ── Background: OFI prefetch (REST fallback — used only when WS unavailable)
+    # ── Background: OFI prefetch ───────────────────────────────────────────────
     async def _ofi_fetcher():
         while trader.running:
             for sym in symbols:
@@ -501,6 +359,19 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             await asyncio.sleep(20)
 
     asyncio.create_task(_ofi_fetcher())
+
+    # ── Background: 5m HTF cache ───────────────────────────────────────────────
+    async def _htf_fetcher():
+        while trader.running:
+            for sym in symbols:
+                try:
+                    await trader.htf_filter.fetch(sym)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+            await asyncio.sleep(45)
+
+    asyncio.create_task(_htf_fetcher())
 
     # ── Background: SL/TP watcher (checks every second) ───────────────────────
     async def _sltp_watcher():
@@ -521,39 +392,14 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     if not pos:
                         continue
 
-                    # Chandelier trailing stop — ratchet SL up (long) or down (short)
-                    if pos.atr_at_entry > 0:
-                        if pos.side != 'short':
-                            if price > pos.highest_price_since_entry:
-                                pos.highest_price_since_entry = price
-                            trail = pos.highest_price_since_entry - 2.5 * pos.atr_at_entry
-                            if trail > pos.stop_loss_price:
-                                pos.stop_loss_price = trail
-                        else:
-                            if price < pos.lowest_price_since_entry:
-                                pos.lowest_price_since_entry = price
-                            trail = pos.lowest_price_since_entry + 2.5 * pos.atr_at_entry
-                            if trail < pos.stop_loss_price:
-                                pos.stop_loss_price = trail
-
                     exit_reason = None
-                    if pos.side == 'short':
-                        # Short: SL above entry, TP below entry
-                        if price >= pos.stop_loss_price:
-                            exit_reason = 'STOP_LOSS'
-                        elif price <= pos.take_profit_price:
-                            exit_reason = 'TAKE_PROFIT'
-                    else:
-                        if price <= pos.stop_loss_price:
-                            exit_reason = 'STOP_LOSS'
-                        elif price >= pos.take_profit_price:
-                            exit_reason = 'TAKE_PROFIT'
+                    if price <= pos.stop_loss_price:
+                        exit_reason = 'STOP_LOSS'
+                    elif price >= pos.take_profit_price:
+                        exit_reason = 'TAKE_PROFIT'
 
                     if exit_reason:
-                        if pos.side == 'short':
-                            trade = await trader.close_short(sym, price, exit_reason)
-                        else:
-                            trade = await trader.close_long(sym, price, exit_reason)
+                        trade = await trader.close_long(sym, price, exit_reason)
                         if trade:
                             equity = trader.account.initial_capital + trader.account.total_pnl
                             equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
@@ -580,6 +426,19 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             if ohlcv:
                 ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                 logger.info(f"[LIVE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.error(f"[LIVE] Exchange circuit breaker open during seed — stopping early ({wait:.0f}s remaining)")
+            if notifier:
+                try:
+                    notifier.send_message(
+                        f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                        f"Data seed interrupted — cooldown {wait:.0f}s.\n"
+                        f"Bot will trade on stale/incomplete cache until exchange recovers."
+                    )
+                except Exception:
+                    pass
+            break  # no point seeding further while circuit is open
         except Exception as e:
             logger.warning(f"[LIVE] Seed failed for {sym}: {e}")
 
@@ -602,6 +461,11 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                             result = trader.regime_detector.detect(ohlcv_cache[sym])
                             if result:
                                 regime_cache[sym] = result.to_dict()
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[LIVE] Exchange circuit breaker open — pausing refresher {wait:.0f}s (symbol={sym})")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; refresher will retry next cycle
                     except Exception as e:
                         logger.debug(f"[LIVE] Candle refresh failed {sym}: {e}")
             except asyncio.TimeoutError:
@@ -610,6 +474,11 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                    except CircuitBreakerOpen as e:
+                        wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                        logger.warning(f"[LIVE] Circuit open (fallback path) — sleeping {wait:.0f}s")
+                        await asyncio.sleep(wait)
+                        break  # skip remaining symbols; will resume next cycle
                     except Exception:
                         pass
 
@@ -650,18 +519,30 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     continue
 
                 prices[symbol] = current_price
-                trader.pairs_strategy.update_price(symbol, current_price)
+                trader.lead_lag.update_price(symbol, current_price)
 
                 df = _inject_live_price(ohlcv_cache[symbol], current_price)
+
+                cached_regime = regime_cache.get(symbol, {})
+                regime_name   = cached_regime.get('regime', 'UNKNOWN')
+                regime_conf   = cached_regime.get('confidence', 0.5)
 
                 from .paper_trading import _get_funding_rate
                 funding_rate = _get_funding_rate(symbol)
 
                 sig = trader.strategy.evaluate(
-                    df, symbol, funding_rate=funding_rate, ofw=trader.ofw
+                    df, symbol, trader.ofi_calc, trader.lead_lag,
+                    regime_name, regime_conf, funding_rate
                 )
                 if sig is None:
                     continue
+
+                # MTF alignment adjustment
+                if sig.signal != Signal.HOLD:
+                    mtf_adj = trader.htf_filter.alignment_score(symbol, is_buy=sig.is_buy)
+                    if mtf_adj != 0.0:
+                        sig.confidence = max(0.0, min(100.0, sig.confidence + mtf_adj))
+                        sig.size_mult  = _get_size_mult(sig.confidence)
 
                 indicators[symbol] = {
                     'signal':     sig.signal.value,
@@ -672,22 +553,17 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     'ofi':        round(sig.ofi, 3) if sig.ofi is not None else None,
                 }
 
-                pos            = trader.positions.get(symbol)
-                pos_side       = pos.side if pos else None
-                current_equity = trader.account.initial_capital + trader.account.total_pnl
+                pos      = trader.positions.get(symbol)
+                pos_side = pos.entry_signal.signal if pos and pos.entry_signal else None
 
-                # ── Log rationale before any entry ────────────────────────────
-                if sig.signal != Signal.HOLD and sig.confidence >= LIVE_MIN_CONFIDENCE and pos is None:
-                    _log_trade_rationale(symbol, sig)
+                current_equity = trader.account.initial_capital + trader.account.total_pnl
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
                 if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE:
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
 
-                    _base_btc = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
-                    _sz_btc   = _base_btc if sig.score >= 3 else _base_btc * 0.6
-                    size_usd  = _sz_btc * prices.get('BTC/USD', current_price)
+                    size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 5.0:
                         continue
 
@@ -698,108 +574,15 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                             size=size_usd, signal=sig,
                         )
 
-                # ── FLIP: long→short on reversal ───────────────────────────────
-                elif sig.is_sell and pos is not None and pos_side == 'long':
-                    # Close the long first
+                # ── LONG EXIT (signal reversed) ────────────────────────────────
+                elif sig.signal == Signal.SELL and pos is not None:
                     trade = await trader.close_long(symbol, current_price, "SIGNAL")
                     if trade:
                         equity = trader.account.initial_capital + trader.account.total_pnl
                         equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
                         recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
-                    # Then open a short if enabled
-                    if enable_shorts and sig.confidence >= LIVE_MIN_CONFIDENCE:
-                        _base_btc = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
-                        _sz_btc   = _base_btc if sig.score >= 3 else _base_btc * 0.6
-                        size_usd  = _sz_btc * prices.get('BTC/USD', current_price)
-                        if size_usd >= 5.0:
-                            position = await trader.open_short(symbol, current_price, size_usd, sig)
-                            if position and notifier:
-                                notifier.send_trade_alert(
-                                    action="SHORT", symbol=symbol, price=current_price,
-                                    size=size_usd, signal=sig,
-                                )
-
-                # ── SHORT ENTRY (no position, signal is sell) ──────────────────
-                elif sig.is_sell and pos is None and enable_shorts and sig.confidence >= LIVE_MIN_CONFIDENCE:
-                    if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
-                        pass  # sentiment blocks longs, shorts are fine
-                    _base_btc = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
-                    _sz_btc   = _base_btc if sig.score >= 3 else _base_btc * 0.6
-                    size_usd  = _sz_btc * prices.get('BTC/USD', current_price)
-                    if size_usd >= 5.0:
-                        position = await trader.open_short(symbol, current_price, size_usd, sig)
-                        if position and notifier:
-                            notifier.send_trade_alert(
-                                action="SHORT", symbol=symbol, price=current_price,
-                                size=size_usd, signal=sig,
-                            )
-
-                # ── SHORT EXIT (signal reversed to buy) ────────────────────────
-                elif sig.is_buy and pos is not None and pos_side == 'short':
-                    trade = await trader.close_short(symbol, current_price, "SIGNAL")
-                    if trade:
-                        equity = trader.account.initial_capital + trader.account.total_pnl
-                        equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
-                        recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
-                    # Flip to long if confidence is high enough
-                    if sig.confidence >= LIVE_MIN_CONFIDENCE:
-                        _base_btc = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
-                        _sz_btc   = _base_btc if sig.score >= 3 else _base_btc * 0.6
-                        size_usd  = _sz_btc * prices.get('BTC/USD', current_price)
-                        if size_usd >= 5.0:
-                            position = await trader.open_long(symbol, current_price, size_usd, sig)
-                            if position and notifier:
-                                notifier.send_trade_alert(
-                                    action="BUY", symbol=symbol, price=current_price,
-                                    size=size_usd, signal=sig,
-                                )
 
             trader.update_unrealized(prices)
-
-            # ── Pairs trading ─────────────────────────────────────────────────
-            if trader._pairs_symbol is None:
-                psig = trader.pairs_strategy.evaluate()
-                if psig:
-                    lagger       = psig.lagger
-                    lagger_price = prices.get(lagger)
-                    if lagger_price and lagger not in trader.positions:
-                        _log_pairs_rationale(psig)
-                        synth    = _pairs_to_signal(psig, lagger_price)
-                        _base    = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
-                        size_usd = _base * 0.6 * prices.get('BTC/USD', lagger_price)
-                        if size_usd >= 5.0:
-                            if psig.direction == 'long':
-                                pairs_pos = await trader.open_long(lagger, lagger_price, size_usd, synth)
-                            else:
-                                pairs_pos = await trader.open_short(lagger, lagger_price, size_usd, synth)
-                            if pairs_pos:
-                                trader._pairs_symbol = lagger
-                                if notifier:
-                                    notifier.send_message(
-                                        f"<b>PAIRS TRADE</b> {psig.direction.upper()} "
-                                        f"{lagger.split('/')[0]}\n"
-                                        f"PAIRS: {psig.leader.split('/')[0]} led, "
-                                        f"{lagger.split('/')[0]} lagged  z={psig.z_score:.1f}"
-                                    )
-            elif trader._pairs_symbol in trader.positions:
-                psym   = trader._pairs_symbol
-                ppos   = trader.positions[psym]
-                pprice = prices.get(psym)
-                if pprice and ppos.entry_signal:
-                    pair_leader = ppos.entry_signal.rationale.get('pairs_leader')
-                    if pair_leader and trader.pairs_strategy.should_exit(psym, pair_leader):
-                        if ppos.side == 'long':
-                            trade = await trader.close_long(psym, pprice, 'PAIRS_REVERSION')
-                        else:
-                            trade = await trader.close_short(psym, pprice, 'PAIRS_REVERSION')
-                        if trade:
-                            trader._pairs_symbol = None
-                            equity = trader.account.initial_capital + trader.account.total_pnl
-                            equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
-                            recent_trades.append(_trade_dict(trade, psym, 'PAIRS_REVERSION'))
-            else:
-                # Position was closed by SL/TP watcher — clear the pairs slot
-                trader._pairs_symbol = None
 
             # State write for dashboard
             summary = trader.get_summary()
@@ -817,7 +600,6 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                         'stop_loss':      pos.stop_loss_price,
                         'take_profit':    pos.take_profit_price,
                         'unrealized_pnl': round(pos.unrealized_pnl, 4),
-                        'side':           pos.side,
                         'confidence':     pos.entry_signal.confidence if pos.entry_signal else 0,
                         'regime':         pos.entry_signal.regime if pos.entry_signal else 'UNKNOWN',
                     }
@@ -842,6 +624,18 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
 
         except asyncio.CancelledError:
             break
+        except CircuitBreakerOpen as e:
+            wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+            logger.warning(f"[LIVE] Exchange circuit breaker open — pausing main loop {wait:.0f}s")
+            if notifier:
+                try:
+                    notifier.send_message(
+                        f"⚠️ <b>Exchange circuit breaker open</b>\n"
+                        f"Trading paused for {wait:.0f}s — exchange unavailable."
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(wait)
         except Exception as e:
             logger.error(f"[LIVE] Loop error: {e}", exc_info=True)
             await asyncio.sleep(5)
@@ -910,8 +704,7 @@ def _trade_dict(trade, symbol: str, reason: str) -> dict:
     }
 
 def _record_live_trade(journal: TradeJournal, trade: Trade, symbol: str,
-                       reason: str, sig: Optional[ScientificSignal],
-                       direction: str = 'buy'):
+                       reason: str, sig: Optional[ScientificSignal]):
     now = datetime.now(timezone.utc)
     from .trade_journal import TradeRecord
     record = TradeRecord(
@@ -941,63 +734,9 @@ def _record_live_trade(journal: TradeJournal, trade: Trade, symbol: str,
         regime_score      = float(sig.regime_score) if sig else 0.0,
         regime_confidence = 0.5,
         funding_rate      = float(sig.funding_rate or 0.0) if sig else 0.0,
-        direction         = direction,
+        direction         = 'buy',
     )
     journal.add(record)
-
-def _log_trade_rationale(symbol: str, sig: ScientificSignal):
-    r = sig.rationale
-    if not r:
-        return
-    ind = r.get('indicators', {})
-    st  = ind.get('supertrend', {})
-    cvd = ind.get('cvd', {})
-    ofi = ind.get('ofi', {})
-    ok  = lambda v: '+' if v else '-'
-    lines = [
-        f"",
-        f"┌─ ENTRY ─ {symbol} {r.get('direction')} ─── score={r.get('score')}/3 ─────────────",
-        f"│  Supertrend : {'BULL' if st.get('bull') else 'BEAR'}  ({ok(st.get('vote'))})",
-        f"│  CVD        : {cvd.get('trend', '?')}  ({ok(cvd.get('vote'))})",
-        f"│  OFI (OBI)  : {ofi.get('obi', 'n/a')}  ({ok(ofi.get('vote'))})",
-        f"│  ATR        : {sig.atr:.2f}   SL={sig.stop_loss_pct():.2f}%  TP={sig.take_profit_pct():.2f}%",
-        f"└────────────────────────────────────────────────────────────────────────",
-    ]
-    logger.info('\n'.join(lines))
-
-
-def _pairs_to_signal(psig: PairsSignal, price: float) -> ScientificSignal:
-    """Build a synthetic ScientificSignal so open_long/open_short can accept it."""
-    return ScientificSignal(
-        signal=Signal.BUY if psig.direction == 'long' else Signal.SELL,
-        confidence=psig.confidence,
-        size_mult=0.6,
-        score=2,
-        close=price,
-        atr=0.0,   # triggers fallback SL (1.5%) and TP (3.0%)
-        rationale={
-            'direction':    psig.direction.upper(),
-            'score':        2,
-            'confidence':   psig.confidence,
-            'pairs_leader': psig.leader,
-            'pairs_lagger': psig.lagger,
-            'pairs_zscore': psig.z_score,
-        },
-    )
-
-
-def _log_pairs_rationale(psig: PairsSignal):
-    leader_sym = psig.leader.split('/')[0]
-    lagger_sym = psig.lagger.split('/')[0]
-    logger.info(
-        f"\n┌─ PAIRS ENTRY ─ {psig.direction.upper()} {lagger_sym} "
-        f"─────────────────────────────────────────\n"
-        f"│  PAIRS: {leader_sym} led +{abs(psig.z_score * 0.5):.1f}%, "
-        f"{lagger_sym} lagged → {psig.direction} {lagger_sym}  z={psig.z_score:.2f}\n"
-        f"│  Confidence: {psig.confidence:.0f}\n"
-        f"└─────────────────────────────────────────────────────────────────────────"
-    )
-
 
 def _quick_diagnose(pnl: float, reason: str, sig: ScientificSignal):
     issues, positives = [], []
