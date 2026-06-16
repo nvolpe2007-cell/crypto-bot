@@ -25,6 +25,7 @@ import pandas as pd
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
+from .pairs_strategy import PairsStrategy, PairsSignal
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
 from .exchange import ExchangeConnection
@@ -100,6 +101,9 @@ class LiveTrader:
         self.strategy.ml_scorer = self.ml_scorer
         if self.ml_scorer.should_retrain():
             self.ml_scorer.train()
+
+        self.pairs_strategy = PairsStrategy(symbols)
+        self._pairs_symbol: Optional[str] = None   # lagger symbol with an open pairs trade
 
         self.account   = LiveAccount(initial_capital=initial_capital)
         self.positions: Dict[str, LivePosition] = {}
@@ -646,6 +650,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     continue
 
                 prices[symbol] = current_price
+                trader.pairs_strategy.update_price(symbol, current_price)
 
                 df = _inject_live_price(ohlcv_cache[symbol], current_price)
 
@@ -750,6 +755,51 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                                 )
 
             trader.update_unrealized(prices)
+
+            # ── Pairs trading ─────────────────────────────────────────────────
+            if trader._pairs_symbol is None:
+                psig = trader.pairs_strategy.evaluate()
+                if psig:
+                    lagger       = psig.lagger
+                    lagger_price = prices.get(lagger)
+                    if lagger_price and lagger not in trader.positions:
+                        _log_pairs_rationale(psig)
+                        synth    = _pairs_to_signal(psig, lagger_price)
+                        _base    = float(os.getenv('POSITION_SIZE_BTC', '0.001'))
+                        size_usd = _base * 0.6 * prices.get('BTC/USD', lagger_price)
+                        if size_usd >= 5.0:
+                            if psig.direction == 'long':
+                                pairs_pos = await trader.open_long(lagger, lagger_price, size_usd, synth)
+                            else:
+                                pairs_pos = await trader.open_short(lagger, lagger_price, size_usd, synth)
+                            if pairs_pos:
+                                trader._pairs_symbol = lagger
+                                if notifier:
+                                    notifier.send_message(
+                                        f"<b>PAIRS TRADE</b> {psig.direction.upper()} "
+                                        f"{lagger.split('/')[0]}\n"
+                                        f"PAIRS: {psig.leader.split('/')[0]} led, "
+                                        f"{lagger.split('/')[0]} lagged  z={psig.z_score:.1f}"
+                                    )
+            elif trader._pairs_symbol in trader.positions:
+                psym   = trader._pairs_symbol
+                ppos   = trader.positions[psym]
+                pprice = prices.get(psym)
+                if pprice and ppos.entry_signal:
+                    pair_leader = ppos.entry_signal.rationale.get('pairs_leader')
+                    if pair_leader and trader.pairs_strategy.should_exit(psym, pair_leader):
+                        if ppos.side == 'long':
+                            trade = await trader.close_long(psym, pprice, 'PAIRS_REVERSION')
+                        else:
+                            trade = await trader.close_short(psym, pprice, 'PAIRS_REVERSION')
+                        if trade:
+                            trader._pairs_symbol = None
+                            equity = trader.account.initial_capital + trader.account.total_pnl
+                            equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
+                            recent_trades.append(_trade_dict(trade, psym, 'PAIRS_REVERSION'))
+            else:
+                # Position was closed by SL/TP watcher — clear the pairs slot
+                trader._pairs_symbol = None
 
             # State write for dashboard
             summary = trader.get_summary()
@@ -914,6 +964,39 @@ def _log_trade_rationale(symbol: str, sig: ScientificSignal):
         f"└────────────────────────────────────────────────────────────────────────",
     ]
     logger.info('\n'.join(lines))
+
+
+def _pairs_to_signal(psig: PairsSignal, price: float) -> ScientificSignal:
+    """Build a synthetic ScientificSignal so open_long/open_short can accept it."""
+    return ScientificSignal(
+        signal=Signal.BUY if psig.direction == 'long' else Signal.SELL,
+        confidence=psig.confidence,
+        size_mult=0.6,
+        score=2,
+        close=price,
+        atr=0.0,   # triggers fallback SL (1.5%) and TP (3.0%)
+        rationale={
+            'direction':    psig.direction.upper(),
+            'score':        2,
+            'confidence':   psig.confidence,
+            'pairs_leader': psig.leader,
+            'pairs_lagger': psig.lagger,
+            'pairs_zscore': psig.z_score,
+        },
+    )
+
+
+def _log_pairs_rationale(psig: PairsSignal):
+    leader_sym = psig.leader.split('/')[0]
+    lagger_sym = psig.lagger.split('/')[0]
+    logger.info(
+        f"\n┌─ PAIRS ENTRY ─ {psig.direction.upper()} {lagger_sym} "
+        f"─────────────────────────────────────────\n"
+        f"│  PAIRS: {leader_sym} led +{abs(psig.z_score * 0.5):.1f}%, "
+        f"{lagger_sym} lagged → {psig.direction} {lagger_sym}  z={psig.z_score:.2f}\n"
+        f"│  Confidence: {psig.confidence:.0f}\n"
+        f"└─────────────────────────────────────────────────────────────────────────"
+    )
 
 
 def _quick_diagnose(pnl: float, reason: str, sig: ScientificSignal):
