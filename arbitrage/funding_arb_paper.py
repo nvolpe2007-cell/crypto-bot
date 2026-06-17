@@ -63,6 +63,18 @@ KRAKEN_FUNDING_INTERVAL_HOURS = float(
 # fell below the scanner's threshold). Was hardcoded 0.25 (optimistic phantom).
 OFFSCANNER_RATE_FRAC = float(os.getenv('FUNDING_ARB_OFFSCANNER_RATE_FRAC', '0.0'))
 
+# ── Exit-confirmation window ─────────────────────────────────────────────────
+# The SOFT exits (funding_flipped, apy_decayed) used to fire on a SINGLE noisy
+# snapshot. On Kraken's hourly funding one low/negative print would force a full
+# round-trip close + later re-entry — paying the ~0.54% maker wall twice for
+# noise. Requiring the soft condition to hold continuously for this many hours
+# before closing collapses that churn: confirming over 2h costs at most a few
+# thousandths of a percent of extra paid funding on a real flip — two orders of
+# magnitude cheaper than the round-trip it avoids. Hard exits (max_hold,
+# off_scanner_24h) are already time-based and stay immediate. Set 0 to restore
+# the old fire-on-first-snapshot behaviour.
+EXIT_CONFIRM_HOURS = float(os.getenv('FUNDING_ARB_EXIT_CONFIRM_HOURS', '2.0'))
+
 
 def _funding_interval_hours(exchange: Optional[str]) -> float:
     """Funding settlement interval (hours) for a venue. Kraken Futures = 1h."""
@@ -197,6 +209,14 @@ class PaperPosition:
     closed: bool = False
     close_time_iso: Optional[str] = None
     close_reason: Optional[str] = None
+    # Exit-confirmation state: a SOFT exit (funding_flipped / apy_decayed) must
+    # hold continuously for EXIT_CONFIRM_HOURS before we actually close, so a
+    # single noisy snapshot can't trigger a full (cost-paying) round-trip. These
+    # track the candidate reason and when it first appeared; both are cleared the
+    # moment funding recovers. Defaults make legacy state (without these keys)
+    # load cleanly via PaperPosition(**v).
+    pending_exit_reason: Optional[str] = None
+    pending_exit_since_iso: Optional[str] = None
 
     @property
     def entry_time(self) -> datetime:
@@ -245,6 +265,7 @@ class FundingArbPaperSim:
         max_flips: int = 10**9,
         flip_cooldown_hours: float = 0.0,
         max_drawdown_usd: float = 0.0,
+        exit_confirm_hours: float = EXIT_CONFIRM_HOURS,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -269,6 +290,11 @@ class FundingArbPaperSim:
         # The breakeven/persistence gates reason about the funding SERIES; this
         # one reasons about OUR OWN realized P&L on the symbol. 0 disables it.
         self.flip_cooldown_hours = flip_cooldown_hours
+        # Confirmation window (hours) for SOFT exits. A flip/decay must hold this
+        # long continuously before we close, so one noisy snapshot can't churn us
+        # into a costly round-trip. Per-arm (Kraken's hourly funding is noisier
+        # than the 8h venues). 0 restores fire-on-first-snapshot. See _should_exit.
+        self.exit_confirm_hours = exit_confirm_hours
         # Per-arm conviction-sizing band (defaults to the module globals). Set
         # min==max==total for an all-in single-position arm: every entry uses
         # the full allocation, no conviction scaling. The Kraken arm uses this
@@ -704,23 +730,50 @@ class FundingArbPaperSim:
         current_opp: Optional[dict],
         now: datetime,
     ) -> Optional[str]:
-        # 1. Max-hold safety
+        # 1. Max-hold safety (HARD — immediate, time-based)
         age_days = (now - pos.entry_time).total_seconds() / 86400.0
         if age_days >= MAX_HOLD_DAYS:
             return f"max_hold_{MAX_HOLD_DAYS}d"
 
-        # 2. Funding flipped sign (paying instead of collecting)
+        # 2+3. SOFT exits (funding_flipped / apy_decayed) — confirmation-gated.
+        # Evaluate the condition on THIS snapshot, then only act once it has held
+        # continuously for EXIT_CONFIRM_HOURS. A recovery clears the pending state
+        # so transient dips/flips don't churn us into a costly round-trip.
+        soft: Optional[str] = None
         if current_opp is not None:
             current_apy = float(current_opp['apy'])
+            # Funding flipped sign (paying instead of collecting)
             if (pos.entry_apy > 0 and current_apy < 0) or \
                (pos.entry_apy < 0 and current_apy > 0):
-                return "funding_flipped"
+                soft = "funding_flipped"
+            # Funding decayed below exit threshold
+            elif abs(current_apy) < abs(pos.entry_apy) * EXIT_APY_FRACTION:
+                soft = f"apy_decayed_to_{current_apy:.1f}"
 
-            # 3. Funding decayed below exit threshold
-            if abs(current_apy) < abs(pos.entry_apy) * EXIT_APY_FRACTION:
-                return f"apy_decayed_to_{current_apy:.1f}"
+        if soft is None:
+            # Condition no longer holds (funding recovered) — forget any pending
+            # exit. Note: while off-scanner (current_opp is None) we do NOT clear
+            # pending state; absence isn't recovery. The off_scanner_24h hard exit
+            # below handles a persistent disappearance.
+            if current_opp is not None:
+                pos.pending_exit_reason = None
+                pos.pending_exit_since_iso = None
+        else:
+            if pos.pending_exit_since_iso is None:
+                pos.pending_exit_reason = soft
+                pos.pending_exit_since_iso = now.isoformat()
+            else:
+                # Keep the reason fresh (e.g. decay → flip) without resetting the
+                # clock — the position has been unhealthy continuously since first
+                # strike, which is what the confirmation window measures.
+                pos.pending_exit_reason = soft
+            held_h = (
+                now - datetime.fromisoformat(pos.pending_exit_since_iso)
+            ).total_seconds() / 3600.0
+            if held_h >= self.exit_confirm_hours:
+                return pos.pending_exit_reason
 
-        # 4. Symbol disappeared from scanner for an extended period:
+        # 4. Symbol disappeared from scanner for an extended period (HARD):
         # only force-close if we've been "off the radar" for a full day.
         # Use last_seen_iso (updated only when scanner returns data) rather than
         # last_funding_ts_iso (updated on every decayed-rate accrual tick too),
@@ -806,6 +859,29 @@ class FundingArbPaperSim:
         open_pnl = sum(p.net_pnl for p in self.open_positions.values())
         return closed + open_pnl
 
+    @staticmethod
+    def _is_soft_exit(reason: Optional[str]) -> bool:
+        return bool(reason) and (
+            reason.startswith("funding_flipped") or reason.startswith("apy_decayed")
+        )
+
+    def _soft_exit_churn(self) -> dict:
+        """Churn diagnostics for the exit-confirmation fix. A 'churned' close is a
+        SOFT exit (flip/decay) that collected < 2 funding cycles — i.e. we paid a
+        round-trip for noise. After the confirmation window these should trend to
+        zero, and avg cycles/closed-trade should rise."""
+        closed = self.closed_positions
+        soft = [p for p in closed if self._is_soft_exit(p.close_reason)]
+        churned = [p for p in soft if p.cycles_collected < 2]
+        avg_cycles = (sum(p.cycles_collected for p in closed) / len(closed)
+                      if closed else 0.0)
+        return {
+            'closed': len(closed),
+            'soft_exits': len(soft),
+            'churned_soft_exits': len(churned),  # soft exit with <2 cycles collected
+            'avg_cycles_per_close': round(avg_cycles, 2),
+        }
+
     def _total_gross_funding(self) -> float:
         return (sum(p.funding_collected for p in self.open_positions.values())
                 + sum(p.funding_collected for p in self.closed_positions))
@@ -853,7 +929,12 @@ class FundingArbPaperSim:
             + "\n".join(closed_lines)
         )
 
-        logger.info(f"[{self.label}] rollup: ${delta:+.4f} (cum ${total:.4f})")
+        churn = self._soft_exit_churn()
+        logger.info(
+            f"[{self.label}] rollup: ${delta:+.4f} (cum ${total:.4f}) "
+            f"churn: {churn['churned_soft_exits']}/{churn['soft_exits']} soft-exits <2cyc, "
+            f"avg {churn['avg_cycles_per_close']}cyc/close"
+        )
 
         if self.notifier:
             try:
@@ -876,6 +957,7 @@ class FundingArbPaperSim:
                 datetime.now(timezone.utc) - timedelta(days=7)), 4),  # rolling window
             'total_gross_funding': round(self._total_gross_funding(), 4),
             'total_costs': round(self._total_costs(), 4),
+            'soft_exit_churn': self._soft_exit_churn(),  # exit-confirmation diagnostics
             'cooldowns_active': sum(
                 1 for k in list(self._flip_cooldowns)
                 if self._cooldown_remaining_h(k, datetime.now(timezone.utc)) is not None
