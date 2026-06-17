@@ -35,8 +35,10 @@ class _FakeClient:
     def __init__(self, decisions):
         self._decisions = decisions
         self.messages = self
+        self.last_kwargs = None
 
     def create(self, **kwargs):
+        self.last_kwargs = kwargs
         return _Resp(self._decisions)
 
 
@@ -90,6 +92,44 @@ def test_available_false_without_key_or_client(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert tb.TradeBrain(api_key="").available() is False
     assert tb.TradeBrain(client=_FakeClient([])).available() is True
+
+
+# ── chart vision (multimodal user content) ───────────────────────────────────
+
+def test_user_content_is_plain_string_without_charts():
+    content = tb._build_user_content({"BTC": {}}, datetime.now(timezone.utc))
+    assert isinstance(content, str) and "submit_decisions" in content
+
+
+def test_user_content_attaches_image_blocks_with_charts():
+    charts = {"BTC": "QkFTRTY0", "ETH": "aW1hZ2U="}
+    content = tb._build_user_content({"BTC": {}}, datetime.now(timezone.utc), charts=charts)
+    assert isinstance(content, list)
+    imgs = [b for b in content if b.get("type") == "image"]
+    assert len(imgs) == 2
+    assert imgs[0]["source"] == {"type": "base64", "media_type": "image/png", "data": "QkFTRTY0"}
+    assert content[0]["type"] == "text"                      # text picture leads
+
+
+def test_empty_chart_value_is_skipped():
+    charts = {"BTC": "abc", "ETH": ""}                       # ETH render failed → empty
+    content = tb._build_user_content({}, datetime.now(timezone.utc), charts=charts)
+    assert sum(1 for b in content if b.get("type") == "image") == 1
+
+
+def test_decide_passes_images_through_to_client():
+    client = _FakeClient([_dec("BTC", "long")])
+    res = tb.TradeBrain(client=client).decide(
+        {"BTC": {}}, datetime.now(timezone.utc), charts={"BTC": "QUJD"})
+    assert res.ok
+    sent = client.last_kwargs["messages"][0]["content"]
+    assert isinstance(sent, list) and any(b.get("type") == "image" for b in sent)
+
+
+def test_decide_without_charts_sends_string_content():
+    client = _FakeClient([_dec("BTC", "long")])
+    tb.TradeBrain(client=client).decide({"BTC": {}}, datetime.now(timezone.utc))
+    assert isinstance(client.last_kwargs["messages"][0]["content"], str)
 
 
 # ── runner: applying decisions to the paper account ──────────────────────────

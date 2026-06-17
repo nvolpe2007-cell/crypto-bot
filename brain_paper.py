@@ -54,7 +54,8 @@ def fetch_closed_daily(pair: str) -> list[dict]:
     if data.get("error"):
         raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
     series = next(v for k, v in data["result"].items() if k != "last")
-    bars = [{"t": int(row[0]), "c": float(row[4])} for row in series]
+    bars = [{"t": int(row[0]), "o": float(row[1]), "h": float(row[2]),
+             "l": float(row[3]), "c": float(row[4])} for row in series]
     return bars[:-1]
 
 
@@ -288,7 +289,7 @@ def _dry_run_result(snapshot: dict):
 def main():
     from src.trade_brain import TradeBrain
     state = _load_state()
-    closes, prices, latest = {}, {}, {}
+    closes, prices, latest, ohlc = {}, {}, {}, {}
     for coin, pair in KRAKEN_PAIRS.items():
         try:
             bars = fetch_closed_daily(pair)
@@ -297,6 +298,7 @@ def main():
             continue
         if bars:
             closes[coin] = [b["c"] for b in bars]
+            ohlc[coin] = bars
             prices[coin] = bars[-1]["c"]
             latest[coin] = bars[-1]
 
@@ -359,7 +361,22 @@ def main():
         print("[brain_paper] *** DRY RUN / SELF-TEST *** local heuristic, NO API call, "
               f"separate ledger ({STATE_FILE.name}).")
     else:
-        result = brain.decide(snapshot, now, macro=macro)
+        # Chart vision: render a candlestick PNG per coin being decided so the brain
+        # reads structure/patterns, not just numbers. Fail-safe — any coin that won't
+        # render is simply omitted and the brain reasons text-only for it.
+        charts = {}
+        if os.getenv("BRAIN_CHARTS", "1") == "1":
+            try:
+                from src.chart_render import render_candles
+                for c in fresh:
+                    img = render_candles(ohlc.get(c, []), title=c)
+                    if img:
+                        charts[c] = img
+            except Exception as e:
+                print(f"[brain_paper] chart render unavailable: {e}")
+        if charts:
+            print(f"[brain_paper] attached {len(charts)} chart image(s): {list(charts)}")
+        result = brain.decide(snapshot, now, macro=macro, charts=charts)
         if not result.ok:
             print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
             _save_state(state)

@@ -93,6 +93,17 @@ The aggression rule: concentrate size on your highest-conviction coin; don't spr
 thin equal bets across all three out of habit. Being big on a clean trend and flat on \
 the rest beats being medium on everything.
 
+READING THE CHART IMAGES. You may also be shown a daily candlestick chart per coin \
+(last ~140 days) with SMA50 (blue), SMA100 (orange) and SMA200 (purple) overlays. \
+Use it to read STRUCTURE the numbers alone don't show: the shape of the trend, \
+consolidation/range vs expansion, support/resistance, higher-highs/higher-lows (up) \
+or lower-highs/lower-lows (down), and where price sits relative to the MA ribbon. \
+HONESTY ABOUT CHARTS: classic chart patterns are WEAK, contested predictors — the \
+chart is for CONFIRMING or VETOING the trend read and judging conviction, NOT a new \
+set of triggers to trade more. The JSON values are authoritative for exact levels; \
+the image is for context. When the chart and the numbers disagree, trust the numbers \
+and lean toward FLAT. Never trade on a pattern alone.
+
 For EVERY coin, call submit_decisions exactly once with one entry per coin. Be \
 concrete: name the signal that decided it and what would flip your view. Prefer \
 KEEPING the current position when the picture hasn't materially changed — say so."""
@@ -247,6 +258,26 @@ def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None) -> st
             "per coin.\n\n```json\n" + json.dumps(payload, indent=2, default=str) + "\n```")
 
 
+def _build_user_content(snapshot: Dict, now, macro: Optional[Dict] = None,
+                        charts: Optional[Dict[str, str]] = None):
+    """User-message content. Text-only (a str) when no charts are given — identical
+    to before. When `charts` (coin -> base64 PNG) is provided, returns a multimodal
+    content list (text + labeled image blocks) so a vision model reads the charts."""
+    text = _build_user_message(snapshot, now, macro)
+    if not charts:
+        return text
+    content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+    for coin, b64 in charts.items():
+        if not b64:
+            continue
+        content.append({"type": "text",
+                        "text": f"Daily candlestick chart for {coin} "
+                                f"(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):"})
+        content.append({"type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+    return content
+
+
 def _parse(resp) -> Dict[str, CoinDecision]:
     for block in getattr(resp, "content", []) or []:
         if (getattr(block, "type", None) == "tool_use"
@@ -291,10 +322,12 @@ class TradeBrain:
             self._client = anthropic.Anthropic(api_key=self._api_key, timeout=TIMEOUT_SECS)
         return self._client
 
-    def decide(self, snapshot: Dict, now, macro: Optional[Dict] = None) -> BrainResult:
+    def decide(self, snapshot: Dict, now, macro: Optional[Dict] = None,
+               charts: Optional[Dict[str, str]] = None) -> BrainResult:
         """Consult the brain for all coins. Never raises — fail-safe to empty
         decisions (the runner then holds current positions). `macro` carries
-        portfolio-wide context (sentiment, dominance, staleness)."""
+        portfolio-wide context (sentiment, dominance, staleness); `charts` (coin ->
+        base64 PNG) attaches candlestick images for the vision-capable model to read."""
         t0 = time.time()
         try:
             client = self._get_client()
@@ -306,7 +339,7 @@ class TradeBrain:
                 tools=[DECISION_TOOL],
                 tool_choice={"type": "tool", "name": "submit_decisions"},
                 messages=[{"role": "user",
-                           "content": _build_user_message(snapshot, now, macro)}],
+                           "content": _build_user_content(snapshot, now, macro, charts)}],
             )
             decisions = _parse(resp)
             res = BrainResult(decisions=decisions, model=self.model,

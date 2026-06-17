@@ -22,16 +22,21 @@ append an entry when you begin meaningful work and when you finish.
 ---
 
 ## In-flight / open items
-- [ ] **Combine pending.** Dispatch's rewrite (`54675f4`) replaced `src/paper_trading.py` and
-  dropped the multi-arm wiring (funding arb, brain arm, brain overseer, triarb, funnel). The
-  arm code still exists as standalone files (`brain_*.py`, `trade_brain.py`, `market_context.py`)
-  — only the ~30 lines of in-process launchers + the heartbeat brain-MTM segment need re-attaching
-  to the new loop. Held until concurrent work is confirmed idle.
-- [ ] **Policy fork — ATR gate.** `cef65a2` lowered `atr_alive` 0.15% → 0.08% (below the ~0.3%
-  round-trip cost wall). This contradicts the documented core principle ("do not loosen gates to
-  force trades"). NOT yet on the VPS. Owner to decide keep vs revert.
-- [ ] **Policy fork — funding arms.** Removed by the rewrite. They were the only thing trading in
-  calm markets, but the attribution ledger had them net-negative. Owner to decide re-add vs retire.
+- [x] **Combine pending — RESOLVED.** `c506627` + PR #8 (`20e462d`) restored `src/paper_trading.py`
+  with all multi-arm wiring intact: funding arb (3 arms as asyncio tasks), regime_arm, conf_paper,
+  tsmom_ls, lev_perp (all as supervised subprocesses), brain_paper + brain_overseer (subprocess),
+  triarb, and the funnel/heartbeat brain-MTM. Verified 2026-06-17: arms are running on VPS (state
+  files present, heartbeat shows all 25 subsystems OK).
+- [x] **Policy fork — ATR gate — RESOLVED.** Restored to `_ATR_ALIVE_COST_MULT=0.5` → ATR ≥ 0.15%
+  (half the 0.30% round-trip cost) by the same restore. The 0.08% loosening from `cef65a2` is gone.
+- [x] **Policy fork — funding arms — RESOLVED.** All 3 funding arms re-wired into paper_trading.py.
+  Running on VPS; scanning but skipping positions in current fear/low-APY environment (correct).
+- [ ] **pairs_paper.py cron gap.** The arm was wired via VPS crontab (`10 * * * *`) not run_all_bots.py
+  — which is correct (it's a single-shot script like swing_paper). Crontab entry already present.
+  No action needed, but note: **swing_paper.py uses bare `/usr/bin/python3`** (no venv), while
+  pairs_paper.py uses `./venv/bin/python` — verify swing_paper still imports OK after venv updates.
+- [ ] **Open PRs awaiting owner merge:** #10 brain-chart-vision (my lane), #9 btc-trend-focus,
+  #5 fix-sentiment-fng-attr-bug, #4 funding-arb-confirm-exits.
 
 ## Log
 | Date (UTC) | Agent | Branch/PR | What |
@@ -40,3 +45,5 @@ append an entry when you begin meaningful work and when you finish.
 | 2026-06-15 ~23:00–05:15 | dispatch | merged to master | Strategy rewrite (ATR trailing stops / 3-signal consensus / session filter / tiered sizing), statarb pairs trading, supertrend fix, ATR-gate loosening (commits 54675f4→cef65a2). Overwrote `paper_trading.py`, dropping the multi-arm wiring above. |
 | 2026-06-16 | Claude (computer) | `coordination-scaffolding` → PR | Added this WORKLOG + CLAUDE.md coordination section. No code/strategy changes. |
 | 2026-06-16 | Claude (computer) | `btc-trend-focus` → PR | Owner-requested focused single strategy: `btc_trend_paper.py` — BTC-only, 100%-book, SMA100 + 20d-momentum confluence (long/cash), paper forward. Wired into `proof_scorecard.py` as another forward arm (k→+1). Non-destructive: other arms untouched. Seeds CASH (BTC confluence currently off). |
+| 2026-06-16 | Claude (computer) | `brain-chart-vision` → PR | Owner-requested chart-vision for the AI brain: `src/chart_render.py` (dependency-free candlestick+SMA PNG via numpy/zlib, no matplotlib), brain `decide()` now attaches per-coin chart images for the vision model + chart-reading discipline in the prompt (charts confirm/veto, never trade a pattern alone). Brain lane (mine). Fail-safe to text-only; BRAIN_CHARTS=0 disables. Tests added; suite green (2 known fails). |
+| 2026-06-17 | Claude (computer) | no branch — coordination only | Confirmed all WORKLOG open items resolved: arms are wired (paper_trading.py lines 504-900), ATR gate back at 0.15%, VPS active + 25 subsystems OK, pairs_paper.py in crontab. Marked items ✓. Pytest: 2459 pass / 2 pre-existing fails. |
