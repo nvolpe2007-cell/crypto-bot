@@ -29,7 +29,9 @@ MAX_BARS = 140                  # ~4-5 months of daily candles: enough structure
 BG = (255, 255, 255)
 UP = (0, 158, 84)
 DOWN = (214, 48, 49)
-SMA = {50: (30, 90, 220), 100: (230, 145, 0), 200: (150, 30, 185)}
+SMA_COLORS = [(30, 90, 220), (230, 145, 0), (150, 30, 185)]   # short, mid, long
+DAILY_SMAS = (50, 100, 200)         # daily chart: ~2-7mo / 3-7mo / long-term
+WEEKLY_SMAS = (13, 26, 52)          # weekly chart: ~quarter / half / full year
 GRID = (232, 232, 232)
 
 
@@ -119,28 +121,65 @@ def _sma(closes: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def render_candles(bars: List[Dict], title: str = "") -> Optional[str]:
-    """Render up to the last MAX_BARS daily OHLC bars as a base64 PNG candlestick
-    chart with SMA overlays. `bars` items need 'o','h','l','c' (floats). Returns a
-    base64 string (no data: prefix) or None on any failure (brain falls back to text)."""
+def resample_weekly(daily_bars: List[Dict]) -> List[Dict]:
+    """Aggregate daily OHLC bars into weekly bars (7-day buckets, oldest→newest).
+    open=first, high=max, low=min, close=last of each bucket. Needs 'o','h','l','c'."""
+    bars = [b for b in daily_bars if all(k in b for k in ("o", "h", "l", "c"))]
+    weekly = []
+    for i in range(0, len(bars), 7):
+        chunk = bars[i:i + 7]
+        if not chunk:
+            continue
+        weekly.append({
+            "t": chunk[0].get("t", i),
+            "o": float(chunk[0]["o"]),
+            "h": max(float(b["h"]) for b in chunk),
+            "l": min(float(b["l"]) for b in chunk),
+            "c": float(chunk[-1]["c"]),
+        })
+    return weekly
+
+
+def render_multi_timeframe(daily_bars: List[Dict], title: str = "") -> List[tuple]:
+    """Render a (weekly, daily) pair of labeled charts for one symbol — the way a
+    discretionary trader checks the dominant trend (weekly) then the entry (daily).
+    Returns a list of (label, base64) for whichever timeframes rendered (each is
+    independently fail-safe; an empty list means neither could be drawn)."""
+    out = []
+    weekly = render_candles(resample_weekly(daily_bars), title=f"{title} weekly",
+                            sma_periods=WEEKLY_SMAS)
+    if weekly:
+        out.append((f"{title} WEEKLY (~2yr; SMA13/26/52w — the dominant trend)", weekly))
+    daily = render_candles(daily_bars, title=f"{title} daily", sma_periods=DAILY_SMAS)
+    if daily:
+        out.append((f"{title} DAILY (~140d; SMA50/100/200d — recent action & entry)", daily))
+    return out
+
+
+def render_candles(bars: List[Dict], title: str = "",
+                   sma_periods: Sequence[int] = DAILY_SMAS) -> Optional[str]:
+    """Render up to the last MAX_BARS OHLC bars as a base64 PNG candlestick chart
+    with SMA overlays. `bars` items need 'o','h','l','c' (floats); `sma_periods` are
+    drawn in SMA_COLORS order (short→long). Returns a base64 string (no data: prefix)
+    or None on any failure (brain falls back to text)."""
     try:
         bars = [b for b in bars if all(k in b for k in ("o", "h", "l", "c"))]
         if len(bars) < 10:
             return None
         full_close = np.array([float(b["c"]) for b in bars])
         # SMAs computed on the FULL history, then sliced to the visible window so the
-        # 200-line is correct even when we only show the last MAX_BARS candles.
-        sma_full = {n: _sma(full_close, n) for n in SMA}
+        # longest line is correct even when we only show the last MAX_BARS candles.
+        sma_full = {n: _sma(full_close, n) for n in sma_periods}
         view = bars[-MAX_BARS:]
         o = np.array([float(b["o"]) for b in view])
         hi = np.array([float(b["h"]) for b in view])
         lo = np.array([float(b["l"]) for b in view])
         cl = np.array([float(b["c"]) for b in view])
-        sma_view = {n: sma_full[n][-len(view):] for n in SMA}
+        sma_view = {n: sma_full[n][-len(view):] for n in sma_periods}
 
         # price range spans candles AND any visible SMA point
         ymax = float(hi.max()); ymin = float(lo.min())
-        for n in SMA:
+        for n in sma_periods:
             s = sma_view[n]
             s = s[~np.isnan(s)]
             if len(s):
@@ -164,11 +203,13 @@ def render_candles(bars: List[Dict], title: str = "") -> Optional[str]:
         for f in (0.25, 0.5, 0.75):
             _hline(arr, py(ymin + (ymax - ymin) * f), x0, x1, GRID)
 
-        # SMA overlays (drawn under candles)
+        # SMA overlays (drawn under candles), longest first so the shortest sits on top
         xs = [int(x0 + (i + 0.5) * slot) for i in range(n)]
-        for nn in (200, 100, 50):
+        for idx in reversed(range(len(sma_periods))):
+            nn = sma_periods[idx]
+            color = SMA_COLORS[idx] if idx < len(SMA_COLORS) else SMA_COLORS[-1]
             ys = [py(v) if not np.isnan(v) else None for v in sma_view[nn]]
-            _polyline(arr, xs, ys, SMA[nn])
+            _polyline(arr, xs, ys, color)
 
         # candles
         for i in range(n):

@@ -28,9 +28,16 @@ logger = logging.getLogger(__name__)
 
 import os
 
-MODEL = os.getenv("BRAIN_MODEL", "claude-sonnet-4-6")
-MAX_TOKENS = int(os.getenv("BRAIN_MAX_TOKENS", "1500"))
-TIMEOUT_SECS = float(os.getenv("BRAIN_TIMEOUT_SECS", "40"))
+MODEL = os.getenv("BRAIN_MODEL", "claude-opus-4-8")     # upgraded engine (was sonnet-4-6)
+MAX_TOKENS = int(os.getenv("BRAIN_MAX_TOKENS", "2000"))
+TIMEOUT_SECS = float(os.getenv("BRAIN_TIMEOUT_SECS", "90"))   # extended thinking needs headroom
+# Adaptive thinking: let Opus 4.8 reason before deciding (the modern API — there is
+# no fixed token budget; `output_config.effort` controls depth). Forcing a specific
+# tool is incompatible with thinking, so tool_choice falls back to "auto" and the
+# prompt instructs the brain to finish by calling submit_decisions. BRAIN_THINKING=0
+# restores the forced-tool path (e.g. for an older non-thinking model).
+THINKING = os.getenv("BRAIN_THINKING", "1") == "1"
+EFFORT = os.getenv("BRAIN_EFFORT", "high")              # low | medium | high | xhigh | max
 
 # Static strategy knowledge → cache_control so the daily call hits the prompt cache.
 SYSTEM_PROMPT = """\
@@ -79,6 +86,21 @@ If `market.stale` is true, IGNORE this context and decide on price/trend alone.
 The context should mostly REINFORCE or VETO a trend call, and tune size — it is not a \
 new set of triggers to trade more. When signals conflict, that is itself a reason for FLAT.
 
+DESK BLOCKS (composable context in `market.desk_blocks`, any subset may be present):
+  • cross_asset: the macro risk backdrop (S&P, dollar/dxy, gold, 10Y yield, 20d moves \
+    + a regime: risk_on/risk_off/mixed). Crypto tracks RISK-ON; a strong/rising dollar \
+    and rising yields are headwinds. In risk_off, demand a cleaner long and lean FLAT/short.
+  • flow (per coin): SLOW directional volume — buy_pressure_20d/5d in [-1,1] (net up-day \
+    minus down-day volume) and vs_price. This is NOT a tick scalp signal; use it to \
+    confirm or fade. 'bearish_divergence' (price up on net selling) = a weak rally, be \
+    wary of fresh longs; 'bullish_divergence' (price down on net buying) = quiet \
+    accumulation, a downtrend may be tiring. Weigh lightly; never trade on it alone.
+  • risk_budget: YOUR OWN book — net/gross exposure and directional_concentration. \
+    BTC/ETH/SOL co-move, so an all_long or all_short book is really ONE bet at gross \
+    size. If you are already concentrated, do NOT pile more onto the same correlated \
+    direction; prefer trimming or diversifying the read. Respect this before sizing up.
+These blocks REFINE and RISK-CHECK the decision; they are not new reasons to trade.
+
 HOW TO SIZE — BE AGGRESSIVE WHEN YOU ARE RIGHT, FLAT WHEN YOU ARE NOT. Sizing is \
 BIMODAL, not a dial of small bets. size_mult scales a fixed base allocation and is \
 clamped 0.0-2.5 by the runner. Tie it to conviction:
@@ -93,20 +115,43 @@ The aggression rule: concentrate size on your highest-conviction coin; don't spr
 thin equal bets across all three out of habit. Being big on a clean trend and flat on \
 the rest beats being medium on everything.
 
-READING THE CHART IMAGES. You may also be shown a daily candlestick chart per coin \
-(last ~140 days) with SMA50 (blue), SMA100 (orange) and SMA200 (purple) overlays. \
-Use it to read STRUCTURE the numbers alone don't show: the shape of the trend, \
-consolidation/range vs expansion, support/resistance, higher-highs/higher-lows (up) \
-or lower-highs/lower-lows (down), and where price sits relative to the MA ribbon. \
-HONESTY ABOUT CHARTS: classic chart patterns are WEAK, contested predictors — the \
-chart is for CONFIRMING or VETOING the trend read and judging conviction, NOT a new \
-set of triggers to trade more. The JSON values are authoritative for exact levels; \
-the image is for context. When the chart and the numbers disagree, trust the numbers \
-and lean toward FLAT. Never trade on a pattern alone.
+READING THE CHART IMAGES. You may be shown TWO candlestick charts per coin: a WEEKLY \
+chart (~2 years, SMA13/26/52-week — the DOMINANT, higher-timeframe trend) and a DAILY \
+chart (~140 days, SMA50/100/200-day — recent action and entry timing). Read them \
+TOGETHER the way a discretionary trader does: the WEEKLY sets the regime/bias (only \
+fight it with strong evidence), the DAILY times the entry within that bias. ALIGNMENT \
+is the high-conviction setup — weekly uptrend + daily pullback-then-resumption → LONG; \
+weekly downtrend + daily bounce-into-resistance → SHORT or FLAT. CONFLICT between the \
+two timeframes (weekly up, daily breaking down, or vice-versa) is itself a reason for \
+FLAT or smaller size. Read STRUCTURE the numbers don't show: trend shape, \
+consolidation vs expansion, support/resistance, higher-highs/lows vs lower-highs/lows, \
+position relative to the MA ribbon. HONESTY ABOUT CHARTS: classic chart patterns are \
+WEAK, contested predictors — the charts CONFIRM or VETO the trend read and tune \
+conviction, they are NOT new triggers to trade more. The JSON values are authoritative \
+for exact levels; images are for context. When charts and numbers disagree, trust the \
+numbers and lean FLAT. Never trade on a pattern alone.
+
+YOUR TRACK RECORD & MEMORY. The payload may include a `memory` block: your own recent
+decisions, your CLOSED trades (entry rationale + how each turned out), your equity and
+drawdown, and a conviction-calibration table (did your high-conviction calls actually
+win?). USE IT like a professional reviewing their journal:
+  • LEARN from outcomes, not vibes. If a setup you keep taking keeps losing (e.g. shorting
+    a bounce that then squeezes), STOP taking it — say which past trade taught you this.
+  • WEIGHT BY SAMPLE SIZE, NOT RECENCY. A handful of recent losses is noise; do not
+    abandon a sound process over 2-3 trades, and do not get cocky after 2-3 wins. Only
+    update your behaviour when the record is big enough to mean something.
+  • CALIBRATE CONVICTION. If your "conviction 8" calls have only won ~50%, your scale is
+    inflated — pull conviction (and size) down until the record earns it back.
+  • RESPECT DRAWDOWN. If the book is underwater, get smaller and more selective, not
+    bigger trying to win it back. Revenge-sizing is how accounts die.
+  • If memory is sparse (few/no closed trades), say so and lean on the principles above —
+    do not invent lessons from an empty record.
 
 For EVERY coin, call submit_decisions exactly once with one entry per coin. Be \
 concrete: name the signal that decided it and what would flip your view. Prefer \
-KEEPING the current position when the picture hasn't materially changed — say so."""
+KEEPING the current position when the picture hasn't materially changed — say so. \
+You MUST finish your turn by calling the submit_decisions tool — reasoning in text \
+without calling it is an incomplete answer."""
 
 DECISION_TOOL = {
     "name": "submit_decisions",
@@ -246,35 +291,53 @@ class BrainResult:
         return self.error is None and bool(self.decisions)
 
 
-def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None) -> str:
+def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None,
+                        memory: Optional[Dict] = None) -> str:
     payload = {
         "utc_time": now.isoformat() if hasattr(now, "isoformat") else str(now),
         "note": "Decide long/short/flat per coin. Holding yesterday's position is "
                 "free of cost; changing it is not. Do nothing unless there's a reason.",
+        "memory": memory or {},
         "market": macro or {},
         "coins": snapshot,
     }
-    return ("Here is today's market picture. Call submit_decisions with one entry "
-            "per coin.\n\n```json\n" + json.dumps(payload, indent=2, default=str) + "\n```")
+    return ("Here is today's market picture (and your `memory` / track record). Call "
+            "submit_decisions with one entry per coin.\n\n```json\n"
+            + json.dumps(payload, indent=2, default=str) + "\n```")
+
+
+def _coin_charts(coin: str, val) -> List[tuple]:
+    """Normalise one coin's chart payload to a list of (label, base64). Accepts a
+    bare base64 str (single daily chart — back-compat) or a list of (label, b64)
+    tuples (multi-timeframe). Drops empties."""
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [(f"Daily candlestick chart for {coin} "
+                 f"(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):", val)]
+    out = []
+    for item in val:
+        if isinstance(item, (list, tuple)) and len(item) == 2 and item[1]:
+            out.append((str(item[0]), item[1]))
+    return out
 
 
 def _build_user_content(snapshot: Dict, now, macro: Optional[Dict] = None,
-                        charts: Optional[Dict[str, str]] = None):
+                        charts: Optional[Dict] = None, memory: Optional[Dict] = None):
     """User-message content. Text-only (a str) when no charts are given — identical
-    to before. When `charts` (coin -> base64 PNG) is provided, returns a multimodal
-    content list (text + labeled image blocks) so a vision model reads the charts."""
-    text = _build_user_message(snapshot, now, macro)
+    to before. When `charts` (coin -> base64 str OR list of (label, base64)) is given,
+    returns a multimodal content list (text + labeled image blocks) so a vision model
+    reads the charts. Multiple timeframes per coin are supported via the list form.
+    `memory` (track record / past decisions) is folded into the text payload."""
+    text = _build_user_message(snapshot, now, macro, memory)
     if not charts:
         return text
     content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
-    for coin, b64 in charts.items():
-        if not b64:
-            continue
-        content.append({"type": "text",
-                        "text": f"Daily candlestick chart for {coin} "
-                                f"(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):"})
-        content.append({"type": "image",
-                        "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+    for coin, val in charts.items():
+        for label, b64 in _coin_charts(coin, val):
+            content.append({"type": "text", "text": label})
+            content.append({"type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": b64}})
     return content
 
 
@@ -323,24 +386,36 @@ class TradeBrain:
         return self._client
 
     def decide(self, snapshot: Dict, now, macro: Optional[Dict] = None,
-               charts: Optional[Dict[str, str]] = None) -> BrainResult:
+               charts: Optional[Dict[str, str]] = None,
+               memory: Optional[Dict] = None) -> BrainResult:
         """Consult the brain for all coins. Never raises — fail-safe to empty
         decisions (the runner then holds current positions). `macro` carries
-        portfolio-wide context (sentiment, dominance, staleness); `charts` (coin ->
-        base64 PNG) attaches candlestick images for the vision-capable model to read."""
+        portfolio-wide context; `charts` (coin -> base64 PNG, or list of (label,b64))
+        attaches candlestick images for the vision model; `memory` carries the brain's
+        own track record (past decisions, closed-trade outcomes, equity/drawdown,
+        conviction calibration) so it can learn from its results."""
         t0 = time.time()
         try:
             client = self._get_client()
-            resp = client.messages.create(
+            kwargs = dict(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=[{"type": "text", "text": SYSTEM_PROMPT,
                          "cache_control": {"type": "ephemeral"}}],
                 tools=[DECISION_TOOL],
-                tool_choice={"type": "tool", "name": "submit_decisions"},
                 messages=[{"role": "user",
-                           "content": _build_user_content(snapshot, now, macro, charts)}],
+                           "content": _build_user_content(snapshot, now, macro, charts, memory)}],
             )
+            if THINKING:
+                # Adaptive thinking forbids forcing a specific tool → use auto and let
+                # the prompt drive the tool call; give max_tokens room for think+answer.
+                kwargs["thinking"] = {"type": "adaptive"}
+                kwargs["output_config"] = {"effort": EFFORT}
+                kwargs["tool_choice"] = {"type": "auto"}
+                kwargs["max_tokens"] = max(MAX_TOKENS, 8000)
+            else:
+                kwargs["tool_choice"] = {"type": "tool", "name": "submit_decisions"}
+            resp = client.messages.create(**kwargs)
             decisions = _parse(resp)
             res = BrainResult(decisions=decisions, model=self.model,
                               latency_ms=int((time.time() - t0) * 1000))
