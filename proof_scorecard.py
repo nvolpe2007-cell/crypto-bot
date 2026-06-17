@@ -256,6 +256,30 @@ def _conf_forward() -> dict | None:
     return dict(label='Trend+momo confluence (FORWARD)', executable=True, **s)
 
 
+def _btc_trend_forward() -> dict | None:
+    """Focused BTC-only trend allocation forward record (btc_trend_paper.py): the
+    confluence signal (>SMA100 AND 20d momentum up) on BTC alone with the WHOLE book —
+    the owner's 'one simple strategy for BTC'. Same pre-registered bar as the other
+    trend arms; week-clustered. NOTE: one asset trades ~4-10x/yr, so n>=30 is a ~5-year
+    clock — expect a qualitative (drawdown vs B&H) read long before the t-test can fire."""
+    path = DATA / 'btc_trend_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='BTC trend (focused, FORWARD)', executable=True, **s)
+
+
 def _tsmom_ls_forward() -> dict | None:
     """Trend LONG/SHORT perp allocation forward record (tsmom_ls_paper.py): tsmom_50
     that goes SHORT in downtrends instead of cash, via paper perps, 1x, charged a
@@ -493,6 +517,7 @@ def main():
         _tsmom_forward(),
         _tsmom_fast_forward(),
         _conf_forward(),
+        _btc_trend_forward(),
         _tsmom_ls_forward(),
         _brain_forward(),
         _regime_forward(),
