@@ -117,6 +117,26 @@ def test_empty_chart_value_is_skipped():
     assert sum(1 for b in content if b.get("type") == "image") == 1
 
 
+def test_multi_timeframe_charts_attach_two_images_per_coin():
+    charts = {"BTC": [("BTC WEEKLY ...", "d2Vla2x5"), ("BTC DAILY ...", "ZGFpbHk=")]}
+    content = tb._build_user_content({"BTC": {}}, datetime.now(timezone.utc), charts=charts)
+    imgs = [b for b in content if b.get("type") == "image"]
+    assert len(imgs) == 2
+    assert imgs[0]["source"]["data"] == "d2Vla2x5"      # weekly first
+    assert imgs[1]["source"]["data"] == "ZGFpbHk="       # then daily
+    # the label text precedes each image
+    texts = [b["text"] for b in content if b.get("type") == "text"]
+    assert any("WEEKLY" in t for t in texts) and any("DAILY" in t for t in texts)
+
+
+def test_coin_charts_accepts_both_str_and_list():
+    assert tb._coin_charts("BTC", "abc") == [(
+        "Daily candlestick chart for BTC "
+        "(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):", "abc")]
+    assert tb._coin_charts("ETH", [("wk", "x"), ("dy", "")]) == [("wk", "x")]   # empty dropped
+    assert tb._coin_charts("SOL", None) == []
+
+
 def test_decide_passes_images_through_to_client():
     client = _FakeClient([_dec("BTC", "long")])
     res = tb.TradeBrain(client=client).decide(

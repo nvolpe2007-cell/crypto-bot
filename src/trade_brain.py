@@ -93,16 +93,21 @@ The aggression rule: concentrate size on your highest-conviction coin; don't spr
 thin equal bets across all three out of habit. Being big on a clean trend and flat on \
 the rest beats being medium on everything.
 
-READING THE CHART IMAGES. You may also be shown a daily candlestick chart per coin \
-(last ~140 days) with SMA50 (blue), SMA100 (orange) and SMA200 (purple) overlays. \
-Use it to read STRUCTURE the numbers alone don't show: the shape of the trend, \
-consolidation/range vs expansion, support/resistance, higher-highs/higher-lows (up) \
-or lower-highs/lower-lows (down), and where price sits relative to the MA ribbon. \
-HONESTY ABOUT CHARTS: classic chart patterns are WEAK, contested predictors — the \
-chart is for CONFIRMING or VETOING the trend read and judging conviction, NOT a new \
-set of triggers to trade more. The JSON values are authoritative for exact levels; \
-the image is for context. When the chart and the numbers disagree, trust the numbers \
-and lean toward FLAT. Never trade on a pattern alone.
+READING THE CHART IMAGES. You may be shown TWO candlestick charts per coin: a WEEKLY \
+chart (~2 years, SMA13/26/52-week — the DOMINANT, higher-timeframe trend) and a DAILY \
+chart (~140 days, SMA50/100/200-day — recent action and entry timing). Read them \
+TOGETHER the way a discretionary trader does: the WEEKLY sets the regime/bias (only \
+fight it with strong evidence), the DAILY times the entry within that bias. ALIGNMENT \
+is the high-conviction setup — weekly uptrend + daily pullback-then-resumption → LONG; \
+weekly downtrend + daily bounce-into-resistance → SHORT or FLAT. CONFLICT between the \
+two timeframes (weekly up, daily breaking down, or vice-versa) is itself a reason for \
+FLAT or smaller size. Read STRUCTURE the numbers don't show: trend shape, \
+consolidation vs expansion, support/resistance, higher-highs/lows vs lower-highs/lows, \
+position relative to the MA ribbon. HONESTY ABOUT CHARTS: classic chart patterns are \
+WEAK, contested predictors — the charts CONFIRM or VETO the trend read and tune \
+conviction, they are NOT new triggers to trade more. The JSON values are authoritative \
+for exact levels; images are for context. When charts and numbers disagree, trust the \
+numbers and lean FLAT. Never trade on a pattern alone.
 
 For EVERY coin, call submit_decisions exactly once with one entry per coin. Be \
 concrete: name the signal that decided it and what would flip your view. Prefer \
@@ -258,23 +263,37 @@ def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None) -> st
             "per coin.\n\n```json\n" + json.dumps(payload, indent=2, default=str) + "\n```")
 
 
+def _coin_charts(coin: str, val) -> List[tuple]:
+    """Normalise one coin's chart payload to a list of (label, base64). Accepts a
+    bare base64 str (single daily chart — back-compat) or a list of (label, b64)
+    tuples (multi-timeframe). Drops empties."""
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [(f"Daily candlestick chart for {coin} "
+                 f"(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):", val)]
+    out = []
+    for item in val:
+        if isinstance(item, (list, tuple)) and len(item) == 2 and item[1]:
+            out.append((str(item[0]), item[1]))
+    return out
+
+
 def _build_user_content(snapshot: Dict, now, macro: Optional[Dict] = None,
-                        charts: Optional[Dict[str, str]] = None):
+                        charts: Optional[Dict] = None):
     """User-message content. Text-only (a str) when no charts are given — identical
-    to before. When `charts` (coin -> base64 PNG) is provided, returns a multimodal
-    content list (text + labeled image blocks) so a vision model reads the charts."""
+    to before. When `charts` (coin -> base64 str OR list of (label, base64)) is given,
+    returns a multimodal content list (text + labeled image blocks) so a vision model
+    reads the charts. Multiple timeframes per coin are supported via the list form."""
     text = _build_user_message(snapshot, now, macro)
     if not charts:
         return text
     content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
-    for coin, b64 in charts.items():
-        if not b64:
-            continue
-        content.append({"type": "text",
-                        "text": f"Daily candlestick chart for {coin} "
-                                f"(last ~140d; SMA50=blue, SMA100=orange, SMA200=purple):"})
-        content.append({"type": "image",
-                        "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+    for coin, val in charts.items():
+        for label, b64 in _coin_charts(coin, val):
+            content.append({"type": "text", "text": label})
+            content.append({"type": "image",
+                            "source": {"type": "base64", "media_type": "image/png", "data": b64}})
     return content
 
 
