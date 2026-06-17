@@ -2689,7 +2689,7 @@ def _annotate_position_context(position, symbol, sentiment_monitor, strategy):
         if sentiment_monitor:
             snap = sentiment_monitor.get_snapshot()
             if snap:
-                position.sentiment_fng     = getattr(snap, 'fear_greed', None)
+                position.sentiment_fng     = getattr(snap, 'fear_greed_score', None)
                 position.sentiment_btc_dom = getattr(snap, 'btc_dominance', None)
     except Exception:
         pass
