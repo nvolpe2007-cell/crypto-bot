@@ -35,8 +35,12 @@ append an entry when you begin meaningful work and when you finish.
   — which is correct (it's a single-shot script like swing_paper). Crontab entry already present.
   No action needed, but note: **swing_paper.py uses bare `/usr/bin/python3`** (no venv), while
   pairs_paper.py uses `./venv/bin/python` — verify swing_paper still imports OK after venv updates.
-- [ ] **Open PRs awaiting owner merge:** #10 brain-chart-vision (my lane), #9 btc-trend-focus,
-  #5 fix-sentiment-fng-attr-bug, #4 funding-arb-confirm-exits.
+- [x] **Open PRs — ALL MERGED 2026-06-17.** #5 (sentiment attr bug), #4 (funding exit confirmation
+  + aggressive arm quarantine), #9 (BTC trend arm), #10 (brain chart vision). PRs #4 and #5 required
+  rebase onto master (conflict in `funding_arb_paper.py` constructor — added both `max_drawdown_usd`
+  and `exit_confirm_hours`; `paper_trading.py` heartbeat — kept brain MTM segment AND added
+  conditional `_aggr_seg`). All tests: 2481 pass / 2 known pre-existing fails. VPS deployed, service
+  healthy, aggressive arm correctly absent from heartbeat.
 
 ## Log
 | Date (UTC) | Agent | Branch/PR | What |
@@ -47,3 +51,4 @@ append an entry when you begin meaningful work and when you finish.
 | 2026-06-16 | Claude (computer) | `btc-trend-focus` → PR | Owner-requested focused single strategy: `btc_trend_paper.py` — BTC-only, 100%-book, SMA100 + 20d-momentum confluence (long/cash), paper forward. Wired into `proof_scorecard.py` as another forward arm (k→+1). Non-destructive: other arms untouched. Seeds CASH (BTC confluence currently off). |
 | 2026-06-16 | Claude (computer) | `brain-chart-vision` → PR | Owner-requested chart-vision for the AI brain: `src/chart_render.py` (dependency-free candlestick+SMA PNG via numpy/zlib, no matplotlib), brain `decide()` now attaches per-coin chart images for the vision model + chart-reading discipline in the prompt (charts confirm/veto, never trade a pattern alone). Brain lane (mine). Fail-safe to text-only; BRAIN_CHARTS=0 disables. Tests added; suite green (2 known fails). |
 | 2026-06-17 | Claude (computer) | no branch — coordination only | Confirmed all WORKLOG open items resolved: arms are wired (paper_trading.py lines 504-900), ATR gate back at 0.15%, VPS active + 25 subsystems OK, pairs_paper.py in crontab. Marked items ✓. Pytest: 2459 pass / 2 pre-existing fails. |
+| 2026-06-17 | Claude (computer) | merged to master | Reviewed + merged PRs #4, #5, #9, #10. Fixed rebase conflicts for #4 and #5 (both behind master by 20-30 commits). #4 conflict: kept `max_drawdown_usd` + added `exit_confirm_hours` to FundingArbPaperSim ctor; kept brain MTM heartbeat AND conditional aggr segment. No logic bugs found in any PR. Deployed to VPS — 24 subsystems OK, aggressive arm quarantined (absent from heartbeat as expected). |
