@@ -86,6 +86,21 @@ If `market.stale` is true, IGNORE this context and decide on price/trend alone.
 The context should mostly REINFORCE or VETO a trend call, and tune size — it is not a \
 new set of triggers to trade more. When signals conflict, that is itself a reason for FLAT.
 
+DESK BLOCKS (composable context in `market.desk_blocks`, any subset may be present):
+  • cross_asset: the macro risk backdrop (S&P, dollar/dxy, gold, 10Y yield, 20d moves \
+    + a regime: risk_on/risk_off/mixed). Crypto tracks RISK-ON; a strong/rising dollar \
+    and rising yields are headwinds. In risk_off, demand a cleaner long and lean FLAT/short.
+  • flow (per coin): SLOW directional volume — buy_pressure_20d/5d in [-1,1] (net up-day \
+    minus down-day volume) and vs_price. This is NOT a tick scalp signal; use it to \
+    confirm or fade. 'bearish_divergence' (price up on net selling) = a weak rally, be \
+    wary of fresh longs; 'bullish_divergence' (price down on net buying) = quiet \
+    accumulation, a downtrend may be tiring. Weigh lightly; never trade on it alone.
+  • risk_budget: YOUR OWN book — net/gross exposure and directional_concentration. \
+    BTC/ETH/SOL co-move, so an all_long or all_short book is really ONE bet at gross \
+    size. If you are already concentrated, do NOT pile more onto the same correlated \
+    direction; prefer trimming or diversifying the read. Respect this before sizing up.
+These blocks REFINE and RISK-CHECK the decision; they are not new reasons to trade.
+
 HOW TO SIZE — BE AGGRESSIVE WHEN YOU ARE RIGHT, FLAT WHEN YOU ARE NOT. Sizing is \
 BIMODAL, not a dial of small bets. size_mult scales a fixed base allocation and is \
 clamped 0.0-2.5 by the runner. Tie it to conviction:

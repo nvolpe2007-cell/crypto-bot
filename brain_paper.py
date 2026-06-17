@@ -55,7 +55,8 @@ def fetch_closed_daily(pair: str) -> list[dict]:
         raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
     series = next(v for k, v in data["result"].items() if k != "last")
     bars = [{"t": int(row[0]), "o": float(row[1]), "h": float(row[2]),
-             "l": float(row[3]), "c": float(row[4])} for row in series]
+             "l": float(row[3]), "c": float(row[4]), "v": float(row[6])}
+            for row in series]
     return bars[:-1]
 
 
@@ -458,6 +459,18 @@ def main():
         memory = build_memory(state, prices)
         print(f"[brain_paper] memory: {memory['closed_trades_total']} closed trades, "
               f"equity_mtm ${memory['equity_mtm']:.0f}, dd {memory['drawdown_from_peak_pct']}%")
+        # Composable desk-context blocks (cross-asset macro / slow volume flow / risk
+        # budget). Each is fail-safe and toggleable; merged into macro so the brain
+        # reasons over one cohesive picture. BRAIN_DESK_BLOCKS=0 disables the whole set.
+        if os.getenv("BRAIN_DESK_BLOCKS", "1") == "1":
+            try:
+                from src.desk_blocks import build_desk_blocks
+                blocks = build_desk_blocks(ohlc, state, prices)
+                if blocks:
+                    macro["desk_blocks"] = blocks
+                    print(f"[brain_paper] desk blocks: {list(blocks)}")
+            except Exception as e:
+                print(f"[brain_paper] desk blocks unavailable: {e}")
         result = brain.decide(snapshot, now, macro=macro, charts=charts, memory=memory)
         if not result.ok:
             print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
