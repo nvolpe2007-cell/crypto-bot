@@ -280,6 +280,30 @@ def _btc_trend_forward() -> dict | None:
     return dict(label='BTC trend (focused, FORWARD)', executable=True, **s)
 
 
+def _kelly_trend_forward() -> dict | None:
+    """Conviction-scaled fractional-Kelly COMPOUNDING on the SAME BTC trend signal
+    (kelly_trend_paper.py). Identical entries/exits to BTC trend (focused) — the only
+    difference is sizing (bet a conviction-scaled fraction of CURRENT equity, no
+    leverage). The head-to-head test of whether compounding+conviction sizing beats
+    flat. Same pre-registered bar; week-clustered."""
+    path = DATA / 'kelly_trend_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='BTC trend Kelly-compound (FORWARD)', executable=True, **s)
+
+
 def _tsmom_ls_forward() -> dict | None:
     """Trend LONG/SHORT perp allocation forward record (tsmom_ls_paper.py): tsmom_50
     that goes SHORT in downtrends instead of cash, via paper perps, 1x, charged a
@@ -518,6 +542,7 @@ def main():
         _tsmom_fast_forward(),
         _conf_forward(),
         _btc_trend_forward(),
+        _kelly_trend_forward(),
         _tsmom_ls_forward(),
         _brain_forward(),
         _regime_forward(),
