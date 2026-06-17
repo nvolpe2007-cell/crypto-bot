@@ -334,6 +334,21 @@ class ExchangeConnection:
             retries=retries, label='get_balance',
         )
 
+    async def get_positions(self, symbols: Optional[List[str]] = None,
+                            retries: int = 3) -> List:
+        """Get open positions (e.g. margin) with retry.
+
+        Unlike fetch_ohlcv/fetch_order_book, a persistent failure here raises
+        instead of returning []: this is used for startup reconciliation,
+        where treating "couldn't ask the exchange" as "no positions" risks
+        opening a duplicate position on top of one already live.
+        """
+        return await self._retry(
+            self.exchange.fetch_positions, symbols,
+            retries=retries, label='get_positions',
+            circuit=self._data_circuit,
+        )
+
     async def create_order(self, symbol: str, order_type: str, side: str,
                            amount: float, price: Optional[float] = None,
                            order_timeout: float = 30.0) -> Dict:
