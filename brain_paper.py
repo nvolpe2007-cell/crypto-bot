@@ -367,15 +367,17 @@ def main():
         charts = {}
         if os.getenv("BRAIN_CHARTS", "1") == "1":
             try:
-                from src.chart_render import render_candles
+                from src.chart_render import render_multi_timeframe
                 for c in fresh:
-                    img = render_candles(ohlc.get(c, []), title=c)
-                    if img:
-                        charts[c] = img
+                    imgs = render_multi_timeframe(ohlc.get(c, []), title=c)
+                    if imgs:
+                        charts[c] = imgs        # list of (label, base64): weekly + daily
             except Exception as e:
                 print(f"[brain_paper] chart render unavailable: {e}")
         if charts:
-            print(f"[brain_paper] attached {len(charts)} chart image(s): {list(charts)}")
+            n_imgs = sum(len(v) for v in charts.values())
+            print(f"[brain_paper] attached {n_imgs} chart image(s) across {list(charts)} "
+                  f"(weekly+daily per coin)")
         result = brain.decide(snapshot, now, macro=macro, charts=charts)
         if not result.ok:
             print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
