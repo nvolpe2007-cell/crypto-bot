@@ -152,6 +152,76 @@ def test_decide_without_charts_sends_string_content():
     assert isinstance(client.last_kwargs["messages"][0]["content"], str)
 
 
+# ── memory / track record fed back to the brain ──────────────────────────────
+
+def test_memory_folds_into_user_message():
+    mem = {"closed_trades_total": 3, "win_rate": 0.33, "conviction_calibration": "x"}
+    msg = tb._build_user_message({"BTC": {}}, datetime.now(timezone.utc), memory=mem)
+    assert "memory" in msg and "closed_trades_total" in msg
+
+
+def test_decide_passes_memory_through_to_client():
+    client = _FakeClient([_dec("BTC", "long")])
+    tb.TradeBrain(client=client).decide(
+        {"BTC": {}}, datetime.now(timezone.utc), memory={"win_rate": 0.5})
+    content = client.last_kwargs["messages"][0]["content"]
+    text = content if isinstance(content, str) else content[0]["text"]
+    assert "win_rate" in text
+
+
+# ── extended thinking ⇒ auto tool_choice (forced tool is disallowed) ──────────
+
+def test_thinking_on_uses_adaptive_and_auto_tool_choice(monkeypatch):
+    monkeypatch.setattr(tb, "THINKING", True)
+    monkeypatch.setattr(tb, "EFFORT", "high")
+    client = _FakeClient([_dec("BTC", "long")])
+    tb.TradeBrain(client=client).decide({"BTC": {}}, datetime.now(timezone.utc))
+    kw = client.last_kwargs
+    assert kw["thinking"] == {"type": "adaptive"}        # no budget_tokens on Opus 4.8
+    assert kw["output_config"] == {"effort": "high"}
+    assert kw["tool_choice"] == {"type": "auto"}         # forced tool incompatible w/ thinking
+    assert kw["max_tokens"] >= 8000
+
+
+def test_thinking_off_forces_the_tool(monkeypatch):
+    monkeypatch.setattr(tb, "THINKING", False)
+    client = _FakeClient([_dec("BTC", "long")])
+    tb.TradeBrain(client=client).decide({"BTC": {}}, datetime.now(timezone.utc))
+    kw = client.last_kwargs
+    assert "thinking" not in kw
+    assert kw["tool_choice"] == {"type": "tool", "name": "submit_decisions"}
+
+
+# ── closed trades carry their entry thesis (reflection material) ──────────────
+
+def test_close_carries_entry_conviction_and_signal(monkeypatch):
+    monkeypatch.setattr(bp, "BASE_ALLOC", 100.0)
+    monkeypatch.setattr(bp, "COST_FRAC", 0.0)
+    monkeypatch.setattr(bp, "FUNDING_APY", 0.0)
+    st = _state()
+    d = tb.CoinDecision("BTC", "long", size_mult=1.0, conviction=8, key_signal="weekly uptrend")
+    bp.apply_decision(st, "BTC", d, 100.0, "1000")
+    bp.apply_decision(st, "BTC", tb.CoinDecision("BTC", "flat"), 110.0, "2000")
+    rec = st["closed"][0]
+    assert rec["entry_conviction"] == 8 and rec["entry_signal"] == "weekly uptrend"
+
+
+def test_build_memory_summarizes_record():
+    st = _state()
+    st["closed"] = [
+        {"symbol": "BTC", "side": 1, "pnl": 20.0, "pnl_pct": 2.0, "reason": "x",
+         "entry_conviction": 8, "entry_signal": "trend"},
+        {"symbol": "ETH", "side": -1, "pnl": -10.0, "pnl_pct": -1.0, "reason": "y",
+         "entry_conviction": 8, "entry_signal": "bounce short"},
+    ]
+    st["decisions"] = [{"ts": "t1", "decisions": {"BTC": {"action": "long", "conviction": 8}}}]
+    mem = bp.build_memory(st, {"BTC": 100.0})
+    assert mem["closed_trades_total"] == 2 and mem["win_rate"] == 0.5
+    assert mem["conviction_calibration"]["8-10"] == {"trades": 2, "win_rate": 0.5, "total_pnl": 10.0}
+    assert len(mem["recent_closed_trades"]) == 2
+    assert mem["recent_closed_trades"][0]["entry_signal"] == "trend"
+
+
 # ── runner: applying decisions to the paper account ──────────────────────────
 
 def _state():

@@ -28,9 +28,16 @@ logger = logging.getLogger(__name__)
 
 import os
 
-MODEL = os.getenv("BRAIN_MODEL", "claude-sonnet-4-6")
-MAX_TOKENS = int(os.getenv("BRAIN_MAX_TOKENS", "1500"))
-TIMEOUT_SECS = float(os.getenv("BRAIN_TIMEOUT_SECS", "40"))
+MODEL = os.getenv("BRAIN_MODEL", "claude-opus-4-8")     # upgraded engine (was sonnet-4-6)
+MAX_TOKENS = int(os.getenv("BRAIN_MAX_TOKENS", "2000"))
+TIMEOUT_SECS = float(os.getenv("BRAIN_TIMEOUT_SECS", "90"))   # extended thinking needs headroom
+# Adaptive thinking: let Opus 4.8 reason before deciding (the modern API — there is
+# no fixed token budget; `output_config.effort` controls depth). Forcing a specific
+# tool is incompatible with thinking, so tool_choice falls back to "auto" and the
+# prompt instructs the brain to finish by calling submit_decisions. BRAIN_THINKING=0
+# restores the forced-tool path (e.g. for an older non-thinking model).
+THINKING = os.getenv("BRAIN_THINKING", "1") == "1"
+EFFORT = os.getenv("BRAIN_EFFORT", "high")              # low | medium | high | xhigh | max
 
 # Static strategy knowledge → cache_control so the daily call hits the prompt cache.
 SYSTEM_PROMPT = """\
@@ -109,9 +116,27 @@ conviction, they are NOT new triggers to trade more. The JSON values are authori
 for exact levels; images are for context. When charts and numbers disagree, trust the \
 numbers and lean FLAT. Never trade on a pattern alone.
 
+YOUR TRACK RECORD & MEMORY. The payload may include a `memory` block: your own recent
+decisions, your CLOSED trades (entry rationale + how each turned out), your equity and
+drawdown, and a conviction-calibration table (did your high-conviction calls actually
+win?). USE IT like a professional reviewing their journal:
+  • LEARN from outcomes, not vibes. If a setup you keep taking keeps losing (e.g. shorting
+    a bounce that then squeezes), STOP taking it — say which past trade taught you this.
+  • WEIGHT BY SAMPLE SIZE, NOT RECENCY. A handful of recent losses is noise; do not
+    abandon a sound process over 2-3 trades, and do not get cocky after 2-3 wins. Only
+    update your behaviour when the record is big enough to mean something.
+  • CALIBRATE CONVICTION. If your "conviction 8" calls have only won ~50%, your scale is
+    inflated — pull conviction (and size) down until the record earns it back.
+  • RESPECT DRAWDOWN. If the book is underwater, get smaller and more selective, not
+    bigger trying to win it back. Revenge-sizing is how accounts die.
+  • If memory is sparse (few/no closed trades), say so and lean on the principles above —
+    do not invent lessons from an empty record.
+
 For EVERY coin, call submit_decisions exactly once with one entry per coin. Be \
 concrete: name the signal that decided it and what would flip your view. Prefer \
-KEEPING the current position when the picture hasn't materially changed — say so."""
+KEEPING the current position when the picture hasn't materially changed — say so. \
+You MUST finish your turn by calling the submit_decisions tool — reasoning in text \
+without calling it is an incomplete answer."""
 
 DECISION_TOOL = {
     "name": "submit_decisions",
@@ -251,16 +276,19 @@ class BrainResult:
         return self.error is None and bool(self.decisions)
 
 
-def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None) -> str:
+def _build_user_message(snapshot: Dict, now, macro: Optional[Dict] = None,
+                        memory: Optional[Dict] = None) -> str:
     payload = {
         "utc_time": now.isoformat() if hasattr(now, "isoformat") else str(now),
         "note": "Decide long/short/flat per coin. Holding yesterday's position is "
                 "free of cost; changing it is not. Do nothing unless there's a reason.",
+        "memory": memory or {},
         "market": macro or {},
         "coins": snapshot,
     }
-    return ("Here is today's market picture. Call submit_decisions with one entry "
-            "per coin.\n\n```json\n" + json.dumps(payload, indent=2, default=str) + "\n```")
+    return ("Here is today's market picture (and your `memory` / track record). Call "
+            "submit_decisions with one entry per coin.\n\n```json\n"
+            + json.dumps(payload, indent=2, default=str) + "\n```")
 
 
 def _coin_charts(coin: str, val) -> List[tuple]:
@@ -280,12 +308,13 @@ def _coin_charts(coin: str, val) -> List[tuple]:
 
 
 def _build_user_content(snapshot: Dict, now, macro: Optional[Dict] = None,
-                        charts: Optional[Dict] = None):
+                        charts: Optional[Dict] = None, memory: Optional[Dict] = None):
     """User-message content. Text-only (a str) when no charts are given — identical
     to before. When `charts` (coin -> base64 str OR list of (label, base64)) is given,
     returns a multimodal content list (text + labeled image blocks) so a vision model
-    reads the charts. Multiple timeframes per coin are supported via the list form."""
-    text = _build_user_message(snapshot, now, macro)
+    reads the charts. Multiple timeframes per coin are supported via the list form.
+    `memory` (track record / past decisions) is folded into the text payload."""
+    text = _build_user_message(snapshot, now, macro, memory)
     if not charts:
         return text
     content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
@@ -342,24 +371,36 @@ class TradeBrain:
         return self._client
 
     def decide(self, snapshot: Dict, now, macro: Optional[Dict] = None,
-               charts: Optional[Dict[str, str]] = None) -> BrainResult:
+               charts: Optional[Dict[str, str]] = None,
+               memory: Optional[Dict] = None) -> BrainResult:
         """Consult the brain for all coins. Never raises — fail-safe to empty
         decisions (the runner then holds current positions). `macro` carries
-        portfolio-wide context (sentiment, dominance, staleness); `charts` (coin ->
-        base64 PNG) attaches candlestick images for the vision-capable model to read."""
+        portfolio-wide context; `charts` (coin -> base64 PNG, or list of (label,b64))
+        attaches candlestick images for the vision model; `memory` carries the brain's
+        own track record (past decisions, closed-trade outcomes, equity/drawdown,
+        conviction calibration) so it can learn from its results."""
         t0 = time.time()
         try:
             client = self._get_client()
-            resp = client.messages.create(
+            kwargs = dict(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
                 system=[{"type": "text", "text": SYSTEM_PROMPT,
                          "cache_control": {"type": "ephemeral"}}],
                 tools=[DECISION_TOOL],
-                tool_choice={"type": "tool", "name": "submit_decisions"},
                 messages=[{"role": "user",
-                           "content": _build_user_content(snapshot, now, macro, charts)}],
+                           "content": _build_user_content(snapshot, now, macro, charts, memory)}],
             )
+            if THINKING:
+                # Adaptive thinking forbids forcing a specific tool → use auto and let
+                # the prompt drive the tool call; give max_tokens room for think+answer.
+                kwargs["thinking"] = {"type": "adaptive"}
+                kwargs["output_config"] = {"effort": EFFORT}
+                kwargs["tool_choice"] = {"type": "auto"}
+                kwargs["max_tokens"] = max(MAX_TOKENS, 8000)
+            else:
+                kwargs["tool_choice"] = {"type": "tool", "name": "submit_decisions"}
+            resp = client.messages.create(**kwargs)
             decisions = _parse(resp)
             res = BrainResult(decisions=decisions, model=self.model,
                               latency_ms=int((time.time() - t0) * 1000))
