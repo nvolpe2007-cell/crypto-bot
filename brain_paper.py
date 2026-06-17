@@ -100,6 +100,75 @@ def build_snapshot(closes_by_coin: dict[str, list[float]], state: dict,
     return snap
 
 
+def build_memory(state: dict, prices: dict, n_trades: int = 8,
+                 n_rounds: int = 4) -> dict:
+    """The brain's own track record, fed back so it can learn (FinMem-style). Holds:
+    current book (equity/MTM/drawdown/open positions), recent CLOSED trades with their
+    ENTRY thesis + outcome (the reflection material), recent decision rounds (to spot
+    flip-flopping), and a conviction-calibration table (did high-conviction calls win?).
+    All derived from the realised ledger — no fabricated lessons."""
+    start = state.get("starting_equity", STARTING_EQUITY)
+    eq = state.get("equity", start)
+    eq_mtm = mtm_equity(state, prices)
+    curve = state.get("equity_curve", [])
+    peak = max([c.get("equity_mtm", start) for c in curve] + [eq_mtm, start])
+    closed = state.get("closed", [])
+    n = len(closed)
+    wins = sum(1 for c in closed if c.get("pnl", 0) > 0)
+
+    recent_trades = [
+        {"symbol": c.get("symbol"), "side": "long" if c.get("side", 0) > 0 else "short",
+         "entry_conviction": c.get("entry_conviction"),
+         "entry_signal": (c.get("entry_signal") or "")[:80],
+         "pnl_pct": c.get("pnl_pct"), "pnl_usd": c.get("pnl"), "exit_reason": c.get("reason")}
+        for c in closed[-n_trades:]
+    ]
+
+    rounds = state.get("decisions", [])[-n_rounds:]
+    recent_decisions = [
+        {"ts": r.get("ts"),
+         "calls": {coin: f"{d.get('action')}({d.get('conviction')})"
+                   for coin, d in (r.get("decisions") or {}).items()}}
+        for r in rounds
+    ]
+
+    # conviction calibration: realised win rate by conviction bucket (only if we have trades)
+    calib = {}
+    for c in closed:
+        cv = c.get("entry_conviction")
+        if cv is None:
+            continue
+        bucket = "8-10" if cv >= 8 else "5-7" if cv >= 5 else "1-4"
+        b = calib.setdefault(bucket, {"n": 0, "wins": 0, "pnl": 0.0})
+        b["n"] += 1; b["wins"] += int(c.get("pnl", 0) > 0); b["pnl"] += c.get("pnl", 0) or 0.0
+    calibration = {k: {"trades": v["n"], "win_rate": round(v["wins"] / v["n"], 2),
+                       "total_pnl": round(v["pnl"], 2)} for k, v in calib.items()}
+
+    open_positions = {
+        coin: {"side": "long" if p["side"] > 0 else "short", "entry": p.get("entry"),
+               "unrealized_pct": round(p["side"] * (prices[coin] - p["entry"]) / p["entry"] * 100, 2)
+               if prices.get(coin) and p.get("entry") else None,
+               "entry_conviction": p.get("entry_conviction"),
+               "entry_signal": (p.get("entry_signal") or "")[:80]}
+        for coin, p in state.get("positions", {}).items()
+    }
+
+    return {
+        "guidance": "This is YOUR realised record. Learn from it; weight by sample size, "
+                    "not recency. If closed-trade count is small, lessons are weak.",
+        "equity_mtm": round(eq_mtm, 2), "realized_equity": round(eq, 2),
+        "starting_equity": start,
+        "pnl_pct": round((eq_mtm / start - 1) * 100, 2),
+        "drawdown_from_peak_pct": round((eq_mtm / peak - 1) * 100, 2) if peak else 0.0,
+        "halted": state.get("halted", False),
+        "closed_trades_total": n,
+        "win_rate": round(wins / n, 2) if n else None,
+        "recent_closed_trades": recent_trades,
+        "recent_decision_rounds": recent_decisions,
+        "conviction_calibration": calibration or "insufficient history",
+    }
+
+
 def _load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -134,14 +203,22 @@ def _close(state: dict, coin: str, price: float, ts: str, reason: str) -> dict:
            "entry": pos["entry"], "exit": price, "size_usd": pos["size_usd"],
            "funding_cost": round(funding, 4), "pnl": round(net, 4),
            "pnl_pct": round(ret * 100, 3), "reason": reason,
+           "entry_conviction": pos.get("entry_conviction"),
+           "entry_signal": pos.get("entry_signal", ""),
            "equity_after": round(state["equity"], 2)}
     state["closed"].append(rec)
     return rec
 
 
-def _open(state: dict, coin: str, side: int, size_usd: float, price: float, ts: str) -> None:
-    state["positions"][coin] = {"symbol": coin, "side": side, "entry": price,
-                                "entry_ts": ts, "size_usd": round(size_usd, 2)}
+def _open(state: dict, coin: str, side: int, size_usd: float, price: float, ts: str,
+          dec=None) -> None:
+    pos = {"symbol": coin, "side": side, "entry": price,
+           "entry_ts": ts, "size_usd": round(size_usd, 2)}
+    if dec is not None:                         # stash the entry thesis for later reflection
+        pos["entry_conviction"] = getattr(dec, "conviction", None)
+        pos["entry_signal"] = getattr(dec, "key_signal", "")
+        pos["entry_reasoning"] = getattr(dec, "reasoning", "")
+    state["positions"][coin] = pos
 
 
 def _unrealized(state: dict, prices: dict) -> float:
@@ -211,7 +288,7 @@ def apply_decision(state: dict, coin: str, dec, price: float, ts: str,
         if not allow_open:
             print(f"{coin}: OPEN {dec.action.upper()} SKIPPED — book halted (drawdown stop)")
             return acted
-        _open(state, coin, target, size_usd, price, ts)
+        _open(state, coin, target, size_usd, price, ts, dec=dec)
         print(f"{coin}: OPEN {dec.action.upper()} @ {price:.4f} size=${size_usd:.0f} "
               f"conv={dec.conviction} ({dec.key_signal[:40]})")
         acted += 1
@@ -378,7 +455,10 @@ def main():
             n_imgs = sum(len(v) for v in charts.values())
             print(f"[brain_paper] attached {n_imgs} chart image(s) across {list(charts)} "
                   f"(weekly+daily per coin)")
-        result = brain.decide(snapshot, now, macro=macro, charts=charts)
+        memory = build_memory(state, prices)
+        print(f"[brain_paper] memory: {memory['closed_trades_total']} closed trades, "
+              f"equity_mtm ${memory['equity_mtm']:.0f}, dd {memory['drawdown_from_peak_pct']}%")
+        result = brain.decide(snapshot, now, macro=macro, charts=charts, memory=memory)
         if not result.ok:
             print(f"[brain_paper] brain unavailable ({result.error}) — holding.")
             _save_state(state)
