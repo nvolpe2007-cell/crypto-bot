@@ -131,6 +131,19 @@ arms' combined net breaches it, the merge loop engages the master kill. The dire
 arm also honors the kill (funnel `skip:killed`). See memory `attribution_ledger` /
 `risk_controls`.
 
+## Swing cadence env knobs (no code change)
+`swing_paper.py` now CAPS new entries toward "a few good trades, day and night" — it never
+forces a trade (flat sessions take 0). `SWING_MAX_TRADES_DAY` (default 3) per day-window
+(EU+US, 8-23 UTC), `SWING_MAX_TRADES_NIGHT` (default 3) per night-window (Asia, 0-7 UTC),
+`SWING_MAX_OPEN_POSITIONS` (default 7; 7×$62.50≈$440 of the $500 paper bankroll). When more
+setups qualify on one bar-close than the budget allows, conviction ranking (`_conviction`:
+20-bar ROC + distance above EMA50) keeps the strongest. The locked 4h-majors entry edge
+(`src/swing_strategy.py`) is untouched. **Universe stays the proven 6 majors** — the
+2026-06-08 sweep found broadening bled, so `deploy/swing_cron.txt` keeps
+`SWING_SYMBOLS=BTC,ETH,SOL,LTC,BCH,XRP`; a wider set must forward-prove on a SEPARATE
+ledger first (`SWING_STATE_FILE` override + the commented measure-first cron line). See
+memory `swing-frequency-1h-band`.
+
 ## Proof bar (proof_scorecard.py)
 Pre-registered bar unchanged (executable & n≥30 & expectancy>0 & correlation-adjusted t>2)
 but now **selection-bias aware**: with k arms judged at once it also requires a Šidák
