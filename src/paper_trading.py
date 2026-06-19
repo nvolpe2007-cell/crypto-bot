@@ -674,8 +674,18 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
             # CAVEAT (paper): maker fills + all-in on illiquid microcaps are not
             # realistically executable live; the sim assumes fills.
             _kraken_cost = float(os.getenv('FUNDING_ARB_KRAKEN_COST_FRAC', '0.0054'))
+            # Tightened 6 → 4 (2026-06-19): demand funding pay back the round-trip
+            # cost within ~4 cycles (~32h, Kraken's hourly... in 8h-cycle terms),
+            # i.e. only richer/cleaner carry clears the gate. Fewer, higher-quality
+            # entries — selectivity, not loosening. Override via env.
             _kraken_max_be = float(
-                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '6')
+                os.getenv('FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES', '4')
+            )
+            # Deleveraging-regime veto: pause NEW entries when majors funding breadth
+            # turns broadly negative (the regime this arm bled in). ON by default for
+            # the executable arm now that it's re-armed. 0 disables. See funding_arb_paper.
+            _kraken_regime_veto = float(
+                os.getenv('FUNDING_ARB_KRAKEN_REGIME_VETO', '0.6')
             )
             _kraken_cap = float(os.getenv('FUNDING_ARB_KRAKEN_MAX_APY', '300'))
             _kraken_alloc = float(os.getenv('FUNDING_ARB_KRAKEN_ALLOC', '100'))
@@ -726,16 +736,20 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 min_persistence_cycles=_kraken_min_persist,
                 max_flips=_kraken_max_flips,
                 flip_cooldown_hours=_kraken_flip_cooldown,
+                regime_veto_frac=_kraken_regime_veto,
                 state_file=_Path('data/funding_arb_kraken_state.json'),
                 label="Funding Arb (Kraken)",
-                # Per-arm loss cap (the real executable bleed): halt new entries if
-                # cumulative net <= -cap. RETIRED 2026-06-13: this arm has negative
-                # realized EV (-$2.14/trade, 23% win) and funding-arb is dead in the
-                # current fear regime (memory edge_search_verdict). Cap lowered 40->25
-                # so the current ~-$28 net trips the halt IMMEDIATELY (no new entries;
-                # exits still run). Honest history kept; re-arm by raising the cap if a
-                # real persistent-funding majors opportunity appears. 0 disables the cap.
-                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '25')),
+                # Per-arm loss cap: halt new entries if cumulative net <= -cap.
+                # History: retired 2026-06-13 by lowering the cap 40->25 so the
+                # then ~-$28 net tripped the halt immediately (negative EV in the
+                # fear regime). RE-ARMED 2026-06-19 back to 40 as a MEASURED forward
+                # test — justified ONLY because this commit adds the deleveraging
+                # regime veto (the bleed was regime-driven) and tightened the
+                # breakeven gate (6->4). The honest -$28 stays on the books; raising
+                # the cap above it simply lets the better-protected arm trade again,
+                # and proof_scorecard judges whether the protections actually worked.
+                # 0 disables the cap.
+                max_drawdown_usd=float(os.getenv('FUNDING_ARB_KRAKEN_MAX_DRAWDOWN', '40')),
             )
 
             async def _merge_funding_state():
