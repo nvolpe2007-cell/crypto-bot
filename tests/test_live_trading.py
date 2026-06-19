@@ -3,7 +3,10 @@ Unit tests for src/live_trading.py — LiveTrader order execution & accounting.
 
 What is tested (all without real network calls or real money):
   - get_balance()        : happy path + exception → 0.0
-  - reconcile_positions(): adds untracked exchange pos, removes ghost pos
+  - reconcile_positions(): adds untracked exchange pos, removes ghost pos,
+                           raises (does not swallow) on fetch failure
+  - run_live_trading_session(): aborts startup without trading when
+                           reconciliation fails, instead of proceeding blind
   - open_long()          : successful fill, insufficient balance, order failure,
                            unconfirmed fill status, correct SL/TP math
   - close_long()         : no position early-return, order failure, PnL sign
@@ -59,10 +62,13 @@ from src.live_trading import (
     _inject_live_price,
     _quick_diagnose,
     _update_chandelier_stop,
+    _kill_switch_engaged,
+    run_live_trading_session,
     FEE_RATE,
     ATR_TRAIL_MULT,
 )
 from src.scientific_strategy import ScientificSignal
+import src.kill_switch as kill_switch
 from src.indicators import Signal
 from src.exchange import ExchangeConnection, CircuitBreakerOpen
 from src.backtester import Trade
@@ -112,6 +118,7 @@ def _make_exchange() -> MagicMock:
     """Return a mock ExchangeConnection with async methods."""
     ex = MagicMock(spec=ExchangeConnection)
     ex.get_balance = AsyncMock(return_value={"USD": {"free": 1000.0}})
+    ex.get_positions = AsyncMock(return_value=[])
     ex.create_order = AsyncMock(return_value={
         "id": "order-001",
         "status": "closed",
@@ -119,8 +126,6 @@ def _make_exchange() -> MagicMock:
         "price": 50_000.0,
         "fee": {"cost": 1.30},
     })
-    ex.exchange = MagicMock()
-    ex.exchange.fetch_positions = AsyncMock(return_value=[])
     return ex
 
 
@@ -204,7 +209,7 @@ class TestGetBalance:
 class TestReconcilePositions:
     def test_adds_untracked_exchange_position(self):
         trader = _make_trader()
-        trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
+        trader.exchange.get_positions = AsyncMock(return_value=[
             {"symbol": "BTC/USD", "contracts": 0.001, "entryPrice": 50_000.0}
         ])
         asyncio.run(trader.reconcile_positions())
@@ -217,21 +222,25 @@ class TestReconcilePositions:
         """Bot thinks it has a position but exchange has none."""
         trader = _make_trader()
         trader.positions["ETH/USD"] = _open_position("ETH/USD")
-        trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[])
+        trader.exchange.get_positions = AsyncMock(return_value=[])
         asyncio.run(trader.reconcile_positions())
         assert "ETH/USD" not in trader.positions
 
-    def test_handles_fetch_exception_gracefully(self):
+    def test_fetch_failure_propagates_instead_of_assuming_empty(self):
+        """A reconciliation failure must NOT be swallowed into "no open
+        positions" — that could let the bot open a duplicate position on top
+        of one already live on Kraken. The caller (run_live_trading_session)
+        is responsible for aborting startup when this raises."""
         trader = _make_trader()
-        trader.exchange.exchange.fetch_positions = AsyncMock(
+        trader.exchange.get_positions = AsyncMock(
             side_effect=RuntimeError("network error")
         )
-        asyncio.run(trader.reconcile_positions())
-        assert trader.positions == {}
+        with pytest.raises(RuntimeError):
+            asyncio.run(trader.reconcile_positions())
 
     def test_ignores_zero_size_positions(self):
         trader = _make_trader()
-        trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
+        trader.exchange.get_positions = AsyncMock(return_value=[
             {"symbol": "BTC/USD", "contracts": 0, "entryPrice": 50_000.0}
         ])
         asyncio.run(trader.reconcile_positions())
@@ -239,7 +248,7 @@ class TestReconcilePositions:
 
     def test_ignores_unknown_symbol(self):
         trader = _make_trader()
-        trader.exchange.exchange.fetch_positions = AsyncMock(return_value=[
+        trader.exchange.get_positions = AsyncMock(return_value=[
             {"symbol": "DOGE/USD", "contracts": 1000.0, "entryPrice": 0.15}
         ])
         asyncio.run(trader.reconcile_positions())
@@ -356,6 +365,19 @@ class TestOpenLong:
         assert pos.atr_at_entry == pytest.approx(500.0)
         assert pos.highest_price_since_entry == pytest.approx(50_000.0)
 
+    def test_entry_fee_recorded_on_position(self):
+        """The actual order fee must be stashed on the position so close_long()
+        can use it later instead of re-deriving an estimate."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 2.60},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
+        assert pos.entry_fee == pytest.approx(2.60)
+
 
 # ── _update_chandelier_stop ─────────────────────────────────────────────────────
 
@@ -418,7 +440,8 @@ class TestCloseLong:
         return asyncio.run(coro)
 
     def _setup_position(self, trader, symbol="BTC/USD",
-                        entry_price=50_000.0, size=0.001, size_usd=50.0):
+                        entry_price=50_000.0, size=0.001, size_usd=50.0,
+                        entry_fee=0.0):
         sig = _make_signal(close=entry_price)
         trader.positions[symbol] = LivePosition(
             symbol=symbol,
@@ -430,6 +453,7 @@ class TestCloseLong:
             stop_loss_price=entry_price * 0.98,
             take_profit_price=entry_price * 1.03,
             entry_signal=sig,
+            entry_fee=entry_fee,
         )
 
     def test_no_position_returns_none(self):
@@ -501,6 +525,26 @@ class TestCloseLong:
         })
         self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
         assert trader.account.total_pnl != 0.0
+
+    def test_pnl_uses_actual_entry_fee_not_flat_rate_reestimate(self):
+        """Regression: PnL must subtract the real fee charged at entry (pos.entry_fee),
+        not FEE_RATE * size_usd recomputed from scratch — those diverge whenever the
+        actual fill fee differs from the flat-rate guess (maker fills, fee tiers...).
+        Exit at the entry price isolates the fee math: price PnL is 0, so total PnL
+        must equal exactly -(entry_fee + exit_fee).
+        """
+        trader = _make_trader()
+        entry_fee = 5.0  # deliberately far from FEE_RATE * 100.0 == 0.26
+        self._setup_position(trader, entry_price=50_000.0, size=0.002, size_usd=100.0,
+                             entry_fee=entry_fee)
+        exit_fee = 0.13
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": exit_fee},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 50_000.0, "SIGNAL"))
+        assert trade.pnl == pytest.approx(-(entry_fee + exit_fee))
+        assert trade.fees == pytest.approx(entry_fee + exit_fee)
 
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
@@ -751,3 +795,96 @@ class TestCircuitBreakerOpenHandling:
         sig = _make_signal()
         result = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
         assert result is None  # swallowed as before — circuit breaker change is non-breaking
+
+
+# ── run_live_trading_session: reconciliation-failure abort ────────────────────────
+
+class TestRunLiveTradingSessionReconcileAbort:
+    """A reconciliation failure at startup must abort before any trading
+    begins, rather than proceeding with an unknown position state."""
+
+    def test_aborts_without_trading_when_reconciliation_fails(self):
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(side_effect=RuntimeError("network error"))
+        notifier = MagicMock()
+        asyncio.run(run_live_trading_session(
+            exchange=trader.exchange, trader=trader, symbols=trader.symbols,
+            notifier=notifier,
+        ))
+        assert trader.running is False
+        assert trader.positions == {}
+        notifier.send_message.assert_called_once()
+        assert "aborted" in notifier.send_message.call_args[0][0].lower()
+
+    def test_does_not_raise_when_no_notifier_configured(self):
+        """The abort path must not blow up just because no notifier is wired."""
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(side_effect=RuntimeError("network error"))
+        asyncio.run(run_live_trading_session(
+            exchange=trader.exchange, trader=trader, symbols=trader.symbols,
+            notifier=None,
+        ))
+        assert trader.running is False
+
+
+# ── _kill_switch_engaged ────────────────────────────────────────────────────────
+#
+# The master kill switch (src/kill_switch.py) halts NEW entries across every
+# paper arm via BOT_KILL_SWITCH=1 or the data/KILL_SWITCH flag file. Before this
+# fix, run_live_trading_session never checked it — engaging the kill switch
+# would not have stopped the live trader from opening new real positions. These
+# tests guard that the live loop now honors the same flag.
+
+@pytest.fixture
+def kill_isolated(tmp_path, monkeypatch):
+    """Isolate the flag file and clear the env trigger so tests don't collide
+    with any real data/KILL_SWITCH or ambient env."""
+    monkeypatch.setattr(kill_switch, "KILL_FILE", str(tmp_path / "KILL_SWITCH"))
+    monkeypatch.delenv("BOT_KILL_SWITCH", raising=False)
+    return kill_switch
+
+
+class TestKillSwitchEngaged:
+    def test_not_killed_returns_false(self, kill_isolated):
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is False
+
+    def test_engaged_via_flag_file_returns_true(self, kill_isolated):
+        kill_isolated.engage("test")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_engaged_via_env_returns_true(self, kill_isolated, monkeypatch):
+        monkeypatch.setenv("BOT_KILL_SWITCH", "1")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_notifies_once_on_engage_transition(self, kill_isolated):
+        notifier = MagicMock()
+        kill_isolated.engage("test")
+        # First check: transition False -> True, should notify
+        killed = _kill_switch_engaged(notifier, was_killed=False)
+        assert killed is True
+        assert notifier.send_message.call_count == 1
+        assert "engaged" in notifier.send_message.call_args[0][0].lower()
+
+        # Second check: still killed, no new transition, no extra notification
+        killed = _kill_switch_engaged(notifier, was_killed=killed)
+        assert killed is True
+        assert notifier.send_message.call_count == 1
+
+    def test_notifies_once_on_release_transition(self, kill_isolated):
+        notifier = MagicMock()
+        # Transition True -> False should notify "released"
+        killed = _kill_switch_engaged(notifier, was_killed=True)
+        assert killed is False
+        assert notifier.send_message.call_count == 1
+        assert "released" in notifier.send_message.call_args[0][0].lower()
+
+    def test_no_notifier_does_not_raise(self, kill_isolated):
+        kill_isolated.engage("test")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_notifier_exception_swallowed(self, kill_isolated):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        kill_isolated.engage("test")
+        # Must not raise even though send_message blows up
+        assert _kill_switch_engaged(notifier, was_killed=False) is True

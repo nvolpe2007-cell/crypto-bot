@@ -59,6 +59,7 @@ class LivePosition:
     take_profit_price: float
     entry_signal:     Optional[ScientificSignal] = None
     unrealized_pnl:   float = 0.0
+    entry_fee:        float = 0.0  # actual fee charged on the opening order
     # ATR trailing stop state (chandelier exit) — ratchets stop_loss_price up as
     # price makes new highs so a winner can't fully round-trip back to a loss.
     # atr_at_entry=0 (reconciled positions) disables the trail; static SL/TP only.
@@ -123,43 +124,46 @@ class LiveTrader:
         """
         On startup, sync bot position state with actual Kraken open positions.
         Prevents ghost positions after a crash/restart.
+
+        Raises on failure (after the exchange wrapper's own retries are
+        exhausted) instead of swallowing the error and assuming "no open
+        positions" — that assumption could let the bot open a duplicate
+        position on top of one already live on Kraken. The caller must not
+        start trading if this raises.
         """
-        try:
-            exchange_positions = await self.exchange.exchange.fetch_positions(self.symbols)
-            open_syms = set()
-            for ep in (exchange_positions or []):
-                sym    = ep.get('symbol', '')
-                size   = float(ep.get('contracts', 0) or ep.get('size', 0) or 0)
-                if size > 0 and sym in self.symbols:
-                    open_syms.add(sym)
-                    if sym not in self.positions:
-                        # Exchange has a position we don't know about — record it
-                        price = float(ep.get('entryPrice') or ep.get('markPrice') or 0)
-                        if price > 0:
-                            self.positions[sym] = LivePosition(
-                                symbol=sym,
-                                entry_time=datetime.now(timezone.utc),
-                                entry_price=price,
-                                size=size,
-                                size_usd=size * price,
-                                order_id='reconciled',
-                                stop_loss_price=price * 0.98,   # 2% default SL
-                                take_profit_price=price * 1.03,
-                            )
-                            logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
+        exchange_positions = await self.exchange.get_positions(self.symbols)
+        open_syms = set()
+        for ep in (exchange_positions or []):
+            sym    = ep.get('symbol', '')
+            size   = float(ep.get('contracts', 0) or ep.get('size', 0) or 0)
+            if size > 0 and sym in self.symbols:
+                open_syms.add(sym)
+                if sym not in self.positions:
+                    # Exchange has a position we don't know about — record it
+                    price = float(ep.get('entryPrice') or ep.get('markPrice') or 0)
+                    if price > 0:
+                        self.positions[sym] = LivePosition(
+                            symbol=sym,
+                            entry_time=datetime.now(timezone.utc),
+                            entry_price=price,
+                            size=size,
+                            size_usd=size * price,
+                            order_id='reconciled',
+                            stop_loss_price=price * 0.98,   # 2% default SL
+                            take_profit_price=price * 1.03,
+                        )
+                        logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
 
-            # Remove positions bot thinks are open but exchange doesn't
-            for sym in list(self.positions.keys()):
-                if sym not in open_syms:
-                    logger.warning(f"[RECONCILE] {sym} was in bot state but not on exchange — removing")
-                    del self.positions[sym]
+        # Remove positions bot thinks are open but exchange doesn't
+        for sym in list(self.positions.keys()):
+            if sym not in open_syms:
+                logger.warning(f"[RECONCILE] {sym} was in bot state but not on exchange — removing")
+                del self.positions[sym]
 
-            if self.positions:
-                logger.info(f"[RECONCILE] Active positions after sync: {list(self.positions.keys())}")
-            else:
-                logger.info("[RECONCILE] No open positions on exchange — clean start")
-        except Exception as e:
-            logger.warning(f"[RECONCILE] Could not reconcile positions: {e} — proceeding with empty state")
+        if self.positions:
+            logger.info(f"[RECONCILE] Active positions after sync: {list(self.positions.keys())}")
+        else:
+            logger.info("[RECONCILE] No open positions on exchange — clean start")
 
     # ── Order execution ────────────────────────────────────────────────────────
 
@@ -217,6 +221,7 @@ class LiveTrader:
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
             entry_signal=signal,
+            entry_fee=actual_fee,
             atr_at_entry=float(getattr(signal, 'atr', 0.0) or 0.0),
             highest_price_since_entry=exec_price,
         )
@@ -251,7 +256,9 @@ class LiveTrader:
         exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
         self.account.total_fees += exit_fee
 
-        pnl     = (exec_price - pos.entry_price) * pos.size - pos.size_usd * FEE_RATE - exit_fee
+        # Use the actual entry fee charged at open (not a re-estimate) so realized
+        # PnL matches the real account balance change.
+        pnl     = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
         pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
 
         trade = Trade(
@@ -263,7 +270,7 @@ class LiveTrader:
             side='sell',
             pnl=pnl,
             pnl_pct=pnl_pct,
-            fees=exit_fee,
+            fees=pos.entry_fee + exit_fee,
         )
         self.account.closed_trades.append(trade)
         self.account.total_pnl += pnl
@@ -342,7 +349,23 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     trader.account.initial_capital = real_balance
     logger.info(f"[LIVE] Real USD balance: ${real_balance:.2f}")
 
-    await trader.reconcile_positions()
+    try:
+        await trader.reconcile_positions()
+    except Exception as e:
+        logger.error(f"[LIVE] Position reconciliation failed — refusing to start trading blind: {e}")
+        if notifier:
+            try:
+                notifier.send_message(
+                    "🛑 <b>LIVE start aborted</b>\n"
+                    "Could not verify open positions on Kraken — refusing to trade blind "
+                    "(treating this as \"no positions\" could open a duplicate on top of "
+                    "one already live).\n"
+                    f"Error: {e}\nCheck Kraken manually, then restart."
+                )
+            except Exception:
+                pass
+        trader.running = False
+        return
 
     max_daily_loss    = float(os.getenv('MAX_DAILY_LOSS', 15))
     enable_shorts     = os.getenv('ENABLE_SHORTS', 'false').lower() == 'true'
@@ -428,6 +451,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     recent_trades:  List[dict]              = []
     equity_curve:   List[dict]              = []
     iteration = 0
+    killed = False  # master kill switch state — see _kill_switch_engaged()
 
     # Seed OHLCV
     for sym in symbols:
@@ -500,6 +524,10 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             await asyncio.sleep(EVAL_INTERVAL)
             iteration += 1
 
+            # Master kill switch — halts NEW entries (exits below still run).
+            # Same flag the paper arms honor; file/env toggled, no restart needed.
+            killed = _kill_switch_engaged(notifier, killed)
+
             # Daily loss circuit breaker
             session_loss = session_start_pnl - trader.account.total_pnl
             if session_loss >= max_daily_loss:
@@ -569,7 +597,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 current_equity = trader.account.initial_capital + trader.account.total_pnl
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
-                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE:
+                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE and not killed:
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
 
@@ -701,6 +729,39 @@ def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
     trail = pos.highest_price_since_entry - ATR_TRAIL_MULT * pos.atr_at_entry
     if trail > pos.stop_loss_price:
         pos.stop_loss_price = trail
+
+
+def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool) -> bool:
+    """Check the master kill switch (src/kill_switch.py) and notify on transitions.
+
+    Mirrors the check paper_trading.py runs before every directional entry:
+    BOT_KILL_SWITCH=1 or the data/KILL_SWITCH flag file halts NEW entries only —
+    exits (SL/TP, signal-reversal close) keep running so real positions can
+    always be closed. Returns the current killed state.
+    """
+    from .kill_switch import is_killed
+    killed = is_killed()
+    if killed and not was_killed:
+        logger.warning("[LIVE] Master kill switch engaged — halting new entries (exits continue)")
+        if notifier:
+            try:
+                notifier.send_message(
+                    "🛑 <b>Master kill switch engaged</b>\n"
+                    "LIVE trading: new entries halted, exits continue."
+                )
+            except Exception:
+                pass
+    elif not killed and was_killed:
+        logger.info("[LIVE] Master kill switch released — resuming entries")
+        if notifier:
+            try:
+                notifier.send_message(
+                    "✅ <b>Master kill switch released</b>\n"
+                    "LIVE trading: entries resumed."
+                )
+            except Exception:
+                pass
+    return killed
 
 
 def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
