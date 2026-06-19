@@ -402,6 +402,44 @@ class _FunnelStats:
         self._c.clear()
 
 
+class _SubsystemFailureTracker:
+    """Per-symbol consecutive-failure counter for background prefetchers.
+
+    A single shared counter is wrong here: any symbol's success would reset it,
+    so a chronically-broken symbol (e.g. BTC/USD OFI failing every cycle) could
+    be masked forever by other symbols succeeding in between, and the degraded
+    alert would never fire. Each symbol gets its own count; the alert fires
+    once when a symbol crosses the threshold, and a recovery message fires once
+    when it next succeeds — not on every failure/success after that.
+    """
+
+    def __init__(self, threshold: int = 10):
+        self.threshold = threshold
+        self._counts: Dict[str, int] = {}
+        self._alerted: set = set()
+
+    def record_failure(self, sym: str) -> bool:
+        """Bump this symbol's failure count. Returns True the first time it
+        crosses the threshold (i.e. exactly when the alert should fire)."""
+        n = self._counts.get(sym, 0) + 1
+        self._counts[sym] = n
+        if n >= self.threshold and sym not in self._alerted:
+            self._alerted.add(sym)
+            return True
+        return False
+
+    def record_success(self, sym: str) -> bool:
+        """Reset this symbol's failure count. Returns True if it had an active
+        alert (i.e. a recovery message should fire)."""
+        had_alerted = sym in self._alerted
+        self._counts[sym] = 0
+        self._alerted.discard(sym)
+        return had_alerted
+
+    def count(self, sym: str) -> int:
+        return self._counts.get(sym, 0)
+
+
 # ── Main paper trading session ─────────────────────────────────────────────────
 
 async def run_paper_trading_session(exchange: ExchangeConnection,
@@ -1122,13 +1160,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
-        consecutive_failures = 0
+        failure_tracker = _SubsystemFailureTracker()
         while trader.running:
             circuit_paused = False
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
-                    consecutive_failures = 0
+                    if failure_tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>OFI subsystem recovered</b>\n{sym} fetching normally again"
+                        )
                 except CircuitBreakerOpen as e:
                     wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                     logger.warning(
@@ -1139,13 +1180,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     circuit_paused = True
                     break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    should_alert = failure_tracker.record_failure(sym)
+                    logger.warning(f"[OFI] fetch failed for {sym} (#{failure_tracker.count(sym)}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>OFI subsystem degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
-                            f"trading without live order flow data"
+                            f"{sym} failed {failure_tracker.count(sym)} times in a row — "
+                            f"trading without live order flow data for this symbol"
                         )
                 await asyncio.sleep(2)
             if not circuit_paused:
@@ -1155,13 +1196,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
-        consecutive_failures = 0
+        failure_tracker = _SubsystemFailureTracker()
         while trader.running:
             circuit_paused = False
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
-                    consecutive_failures = 0
+                    if failure_tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>HTF filter recovered</b>\n{sym} fetching normally again"
+                        )
                 except CircuitBreakerOpen as e:
                     wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                     logger.warning(
@@ -1172,13 +1216,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     circuit_paused = True
                     break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    should_alert = failure_tracker.record_failure(sym)
+                    logger.warning(f"[HTF] fetch failed for {sym} (#{failure_tracker.count(sym)}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>HTF filter degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
-                            f"multi-timeframe alignment unavailable"
+                            f"{sym} failed {failure_tracker.count(sym)} times in a row — "
+                            f"multi-timeframe alignment unavailable for this symbol"
                         )
                 await asyncio.sleep(3)
             if not circuit_paused:
