@@ -58,7 +58,9 @@ from src.live_trading import (
     LiveAccount,
     _inject_live_price,
     _quick_diagnose,
+    _update_chandelier_stop,
     FEE_RATE,
+    ATR_TRAIL_MULT,
 )
 from src.scientific_strategy import ScientificSignal
 from src.indicators import Signal
@@ -339,6 +341,74 @@ class TestOpenLong:
         sig = _make_signal()
         self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
         assert trader.account.total_fees == pytest.approx(2.60)
+
+    def test_atr_and_high_water_mark_seeded_from_entry(self):
+        """The chandelier trail needs atr_at_entry + a starting high-water mark —
+        both must be populated at open, not left at the dataclass default."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 1.0},
+        })
+        sig = _make_signal(atr=500.0, close=50_000.0)
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos.atr_at_entry == pytest.approx(500.0)
+        assert pos.highest_price_since_entry == pytest.approx(50_000.0)
+
+
+# ── _update_chandelier_stop ─────────────────────────────────────────────────────
+
+class TestUpdateChandelierStop:
+    def _pos(self, entry=50_000.0, sl=49_000.0, atr=500.0, high=None):
+        return LivePosition(
+            symbol="BTC/USD", entry_time=datetime.now(timezone.utc),
+            entry_price=entry, size=0.001, size_usd=50.0, order_id="o",
+            stop_loss_price=sl, take_profit_price=entry * 1.03,
+            atr_at_entry=atr, highest_price_since_entry=high if high is not None else entry,
+        )
+
+    def test_noop_when_atr_at_entry_unset(self):
+        """Reconciled positions (atr_at_entry=0, the dataclass default) keep their
+        static SL — the trail must not touch stop_loss_price or raise."""
+        pos = self._pos(atr=0.0, sl=49_000.0)
+        _update_chandelier_stop(pos, 60_000.0)
+        assert pos.stop_loss_price == pytest.approx(49_000.0)
+
+    def test_stop_unchanged_below_trail_distance(self):
+        """Price hasn't moved enough above entry for the trail to exceed the
+        original stop yet."""
+        pos = self._pos(entry=50_000.0, sl=49_000.0, atr=500.0)
+        _update_chandelier_stop(pos, 50_100.0)
+        # trail = 50,100 - 2.5*500 = 48,850 < 49,000 original stop
+        assert pos.stop_loss_price == pytest.approx(49_000.0)
+
+    def test_stop_ratchets_up_on_new_high(self):
+        pos = self._pos(entry=50_000.0, sl=49_000.0, atr=500.0)
+        _update_chandelier_stop(pos, 52_000.0)
+        # trail = 52,000 - 2.5*500 = 50,750 > 49,000 → ratchets up
+        assert pos.stop_loss_price == pytest.approx(50_750.0)
+        assert pos.highest_price_since_entry == pytest.approx(52_000.0)
+
+    def test_stop_never_loosens_on_pullback(self):
+        """A retrace after a new high must not pull the stop back down."""
+        pos = self._pos(entry=50_000.0, sl=49_000.0, atr=500.0)
+        _update_chandelier_stop(pos, 53_000.0)
+        raised_stop = pos.stop_loss_price
+        _update_chandelier_stop(pos, 51_500.0)   # pulls back, still above raised stop
+        assert pos.stop_loss_price == pytest.approx(raised_stop)
+        assert pos.highest_price_since_entry == pytest.approx(53_000.0)  # unchanged
+
+    def test_high_water_mark_tracks_new_highs_only(self):
+        pos = self._pos(entry=50_000.0, atr=500.0)
+        _update_chandelier_stop(pos, 51_000.0)
+        _update_chandelier_stop(pos, 50_500.0)   # lower — must not reset the mark
+        assert pos.highest_price_since_entry == pytest.approx(51_000.0)
+
+    def test_uses_module_atr_trail_mult_constant(self):
+        pos = self._pos(entry=50_000.0, sl=0.0, atr=400.0)
+        _update_chandelier_stop(pos, 55_000.0)
+        assert pos.stop_loss_price == pytest.approx(55_000.0 - ATR_TRAIL_MULT * 400.0)
 
 
 # ── close_long ───────────────────────────────────────────────────────────────────

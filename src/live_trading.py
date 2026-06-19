@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 LIVE_MIN_CONFIDENCE = 70.0   # higher bar than paper (60) — real money
 EVAL_INTERVAL       = 2.0    # seconds between signal evaluations per symbol
 FEE_RATE            = 0.0026  # Kraken taker fee (0.26%) — overridden by actual order fee
+ATR_TRAIL_MULT      = 2.5    # chandelier exit: trail = highest_since_entry - ATR_TRAIL_MULT × entry ATR
 
 
 @dataclass
@@ -58,6 +59,11 @@ class LivePosition:
     take_profit_price: float
     entry_signal:     Optional[ScientificSignal] = None
     unrealized_pnl:   float = 0.0
+    # ATR trailing stop state (chandelier exit) — ratchets stop_loss_price up as
+    # price makes new highs so a winner can't fully round-trip back to a loss.
+    # atr_at_entry=0 (reconciled positions) disables the trail; static SL/TP only.
+    atr_at_entry:              float = 0.0
+    highest_price_since_entry: float = 0.0
 
 
 @dataclass
@@ -211,6 +217,8 @@ class LiveTrader:
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
             entry_signal=signal,
+            atr_at_entry=float(getattr(signal, 'atr', 0.0) or 0.0),
+            highest_price_since_entry=exec_price,
         )
         self.positions[symbol] = pos
         logger.info(
@@ -391,6 +399,8 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     pos = trader.positions.get(sym)
                     if not pos:
                         continue
+
+                    _update_chandelier_stop(pos, price)
 
                     exit_reason = None
                     if price <= pos.stop_loss_price:
@@ -679,6 +689,19 @@ async def start_live_session(exchange, symbols, timeframe, notifier, sentiment,
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
+    """Ratchet pos.stop_loss_price up as price makes new highs (chandelier exit) —
+    never loosens it. No-op when atr_at_entry is unset (e.g. reconciled positions
+    with no signal context), in which case the static entry SL/TP still applies."""
+    if pos.atr_at_entry <= 0:
+        return
+    if current_price > pos.highest_price_since_entry:
+        pos.highest_price_since_entry = current_price
+    trail = pos.highest_price_since_entry - ATR_TRAIL_MULT * pos.atr_at_entry
+    if trail > pos.stop_loss_price:
+        pos.stop_loss_price = trail
+
 
 def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
     df = df.copy()
