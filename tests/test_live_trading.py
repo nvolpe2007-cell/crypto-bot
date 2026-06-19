@@ -347,6 +347,19 @@ class TestOpenLong:
         self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
         assert trader.account.total_fees == pytest.approx(2.60)
 
+    def test_entry_fee_recorded_on_position(self):
+        """The actual order fee must be stashed on the position so close_long()
+        can use it later instead of re-deriving an estimate."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 2.60},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
+        assert pos.entry_fee == pytest.approx(2.60)
+
 
 # ── close_long ───────────────────────────────────────────────────────────────────
 
@@ -355,7 +368,8 @@ class TestCloseLong:
         return asyncio.run(coro)
 
     def _setup_position(self, trader, symbol="BTC/USD",
-                        entry_price=50_000.0, size=0.001, size_usd=50.0):
+                        entry_price=50_000.0, size=0.001, size_usd=50.0,
+                        entry_fee=0.0):
         sig = _make_signal(close=entry_price)
         trader.positions[symbol] = LivePosition(
             symbol=symbol,
@@ -367,6 +381,7 @@ class TestCloseLong:
             stop_loss_price=entry_price * 0.98,
             take_profit_price=entry_price * 1.03,
             entry_signal=sig,
+            entry_fee=entry_fee,
         )
 
     def test_no_position_returns_none(self):
@@ -438,6 +453,26 @@ class TestCloseLong:
         })
         self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
         assert trader.account.total_pnl != 0.0
+
+    def test_pnl_uses_actual_entry_fee_not_flat_rate_reestimate(self):
+        """Regression: PnL must subtract the real fee charged at entry (pos.entry_fee),
+        not FEE_RATE * size_usd recomputed from scratch — those diverge whenever the
+        actual fill fee differs from the flat-rate guess (maker fills, fee tiers...).
+        Exit at the entry price isolates the fee math: price PnL is 0, so total PnL
+        must equal exactly -(entry_fee + exit_fee).
+        """
+        trader = _make_trader()
+        entry_fee = 5.0  # deliberately far from FEE_RATE * 100.0 == 0.26
+        self._setup_position(trader, entry_price=50_000.0, size=0.002, size_usd=100.0,
+                             entry_fee=entry_fee)
+        exit_fee = 0.13
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": exit_fee},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 50_000.0, "SIGNAL"))
+        assert trade.pnl == pytest.approx(-(entry_fee + exit_fee))
+        assert trade.fees == pytest.approx(entry_fee + exit_fee)
 
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
