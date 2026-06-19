@@ -25,7 +25,29 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-KRAKEN_PAIRS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
+# Trading universe. BTC/ETH/SOL co-move ~0.8, so they are effectively ONE bet — too few
+# INDEPENDENT setups for the brain to build a track record (it needs ~30 closed trades for
+# the memory/calibration loop to mean anything, and was stuck flat on 3 correlated coins).
+# Widening the universe gives more genuinely independent shots on goal WITHOUT lowering the
+# per-trade conviction bar — it does not loosen any gate, it just gives the same selectivity
+# more candidates. Subset/extend with BRAIN_COINS="BTC,ETH,ADA,..." (bases from the map
+# below; an unknown base falls back to "<BASE>USD"). Pair codes vetted in swing_paper.py.
+KRAKEN_PAIRS_ALL = {
+    "BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "ADA": "ADAUSD",
+    "DOT": "DOTUSD", "LINK": "LINKUSD", "AVAX": "AVAXUSD", "LTC": "LTCUSD",
+    "XRP": "XRPUSD", "ATOM": "ATOMUSD", "UNI": "UNIUSD", "BCH": "BCHUSD",
+    "DOGE": "XDGUSD", "AAVE": "AAVEUSD", "FIL": "FILUSD", "ALGO": "ALGOUSD",
+}
+# Default to a 10-coin liquid set (was just BTC/ETH/SOL). All are in the map above.
+_DEFAULT_BRAIN_COINS = "BTC,ETH,SOL,ADA,AVAX,LINK,DOT,XRP,LTC,ATOM"
+_env_coins = os.getenv("BRAIN_COINS", _DEFAULT_BRAIN_COINS).strip()
+_want = [s.strip().upper() for s in _env_coins.split(",") if s.strip()]
+KRAKEN_PAIRS = {b: KRAKEN_PAIRS_ALL.get(b, f"{b}USD") for b in _want} or dict(KRAKEN_PAIRS_ALL)
+# Chart vision is expensive per coin (2 images each). On a wide universe, cap how many
+# coins get charts so the daily call stays fast/cheap; the rest decide on numbers alone
+# (charts only CONFIRM/VETO — numbers are authoritative). Majors come first in the list,
+# so they keep their charts. 0 = chart every decided coin (old behaviour).
+MAX_CHART_COINS = int(os.getenv("BRAIN_MAX_CHART_COINS", "4"))
 COST_FRAC = float(os.getenv("BRAIN_COST_FRAC", "0.0015"))      # perp taker + slippage round-trip
 FUNDING_APY = float(os.getenv("BRAIN_FUNDING_APY", "0.10"))    # conservative funding drag
 STARTING_EQUITY = float(os.getenv("BRAIN_START_EQUITY", "1000"))
@@ -481,7 +503,12 @@ def main():
         if os.getenv("BRAIN_CHARTS", "1") == "1":
             try:
                 from src.chart_render import render_multi_timeframe
-                for c in fresh:
+                # Cap charted coins on a wide universe (cost/latency). Preserve list order
+                # so the majors (listed first) keep their charts; the rest go text-only.
+                chart_coins = list(fresh)
+                if MAX_CHART_COINS > 0:
+                    chart_coins = chart_coins[:MAX_CHART_COINS]
+                for c in chart_coins:
                     imgs = render_multi_timeframe(ohlc.get(c, []), title=c)
                     if imgs:
                         charts[c] = imgs        # list of (label, base64): weekly + daily
