@@ -153,6 +153,23 @@ counts as proof. An arm clearing the single bar but not the family bar reads `PR
 reproduces the original bar exactly. The weekly Telegram report (`scripts/weekly_report.py`)
 now surfaces both the per-arm verdicts (§7) and the session-edge table (§8).
 
+## AI brain context (what it's fed — no code change)
+The Claude-Opus discretionary brain (`src/trade_brain.py`, runner `brain_paper.py`) is
+prompt/context-based — it "learns" from what we feed it each run, not gradient training. It is
+fed only **curated repo truth + its own record**, scoped to six understanding-targets (cost,
+this system's unproven epistemic state, regime+persistence, correlation/BTC-beta, self-
+calibration, the graveyard). Surfaces: (1) a durable **curated knowledge base**
+(`src/brain_knowledge.py`) injected as a 2nd cached system block (`BRAIN_KNOWLEDGE=1`); (2)
+**measure-first desk blocks** (`src/desk_blocks.py`): `proof_status` (system-wide proof verdicts
+→ epistemic humility), `session_edge`, `swing_attribution` — toggles `BRAIN_BLOCK_PROOF`/
+`_SESSION`/`_SWING` (default 1), each fail-safe→absent; (3) an enriched **memory** loop
+(`build_memory`: win-rate by coin & action + worst-trade post-mortems with the losing thesis).
+All REFINE/RISK-CHECK only — never new triggers; the brain's risk controls (drawdown stop,
+F&G short-veto, correlation cap) are untouched. **ML models NOT trained:** XGBoost/calibrator
+only train on the shelved negative-EV directional journal (empty OFI/lead-lag features); training
+them would teach the losing scalper's patterns. Revisit only after retargeting ML to a strategy
+that actually trades + full-feature labeled data. See memory `trade_brain`.
+
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
 
