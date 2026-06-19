@@ -82,6 +82,32 @@ def _get_funding_rate(symbol: str) -> Optional[float]:
     return None
 
 
+def _arb_arm_breakdown(arm) -> tuple:
+    """Honest arb attribution for reporting. Returns (active_net, n_trades, legacy_net).
+
+    `active` comes from the persistent attribution ledger (src/attribution.py) — it
+    counts ACTUAL recorded fills only, so an arm that has booked nothing this era
+    reads $0.00 / 0 trades instead of the in-memory sim's frozen pre-attribution
+    legacy losses (which also don't survive the funding-arb state.json clobber race).
+    `legacy` = sim lifetime P&L minus `active`: the dead pre-ledger era, surfaced
+    separately so it is never folded into — or misread as — live P&L."""
+    if arm is None:
+        return 0.0, 0, 0.0
+    try:
+        lifetime = float(arm.get_summary().get('total_pnl', 0.0))
+    except Exception:
+        lifetime = 0.0
+    try:
+        from arbitrage.funding_arb_paper import _arm_id
+        from src.attribution import get_ledger
+        row = get_ledger().summary_by_arm().get(_arm_id(getattr(arm, 'label', '')), {})
+        active = float(row.get('net', 0.0))
+        n = int(row.get('n', 0))
+    except Exception:
+        active, n = 0.0, 0
+    return active, n, round(lifetime - active, 4)
+
+
 # ── Adaptation state ───────────────────────────────────────────────────────────
 _ADAPT_FILE = 'logs/strategy_adaptations.json'
 
@@ -374,6 +400,44 @@ class _FunnelStats:
 
     def reset(self):
         self._c.clear()
+
+
+class _SubsystemFailureTracker:
+    """Per-symbol consecutive-failure counter for background prefetchers.
+
+    A single shared counter is wrong here: any symbol's success would reset it,
+    so a chronically-broken symbol (e.g. BTC/USD OFI failing every cycle) could
+    be masked forever by other symbols succeeding in between, and the degraded
+    alert would never fire. Each symbol gets its own count; the alert fires
+    once when a symbol crosses the threshold, and a recovery message fires once
+    when it next succeeds — not on every failure/success after that.
+    """
+
+    def __init__(self, threshold: int = 10):
+        self.threshold = threshold
+        self._counts: Dict[str, int] = {}
+        self._alerted: set = set()
+
+    def record_failure(self, sym: str) -> bool:
+        """Bump this symbol's failure count. Returns True the first time it
+        crosses the threshold (i.e. exactly when the alert should fire)."""
+        n = self._counts.get(sym, 0) + 1
+        self._counts[sym] = n
+        if n >= self.threshold and sym not in self._alerted:
+            self._alerted.add(sym)
+            return True
+        return False
+
+    def record_success(self, sym: str) -> bool:
+        """Reset this symbol's failure count. Returns True if it had an active
+        alert (i.e. a recovery message should fire)."""
+        had_alerted = sym in self._alerted
+        self._counts[sym] = 0
+        self._alerted.discard(sym)
+        return had_alerted
+
+    def count(self, sym: str) -> int:
+        return self._counts.get(sym, 0)
 
 
 # ── Main paper trading session ─────────────────────────────────────────────────
@@ -1096,13 +1160,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── OFI prefetch (runs every 30s in background) ────────────────────────────
     async def _ofi_prefetcher():
-        consecutive_failures = 0
+        failure_tracker = _SubsystemFailureTracker()
         while trader.running:
             circuit_paused = False
             for sym in symbols:
                 try:
                     await ofi_calc.fetch(sym)
-                    consecutive_failures = 0
+                    if failure_tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>OFI subsystem recovered</b>\n{sym} fetching normally again"
+                        )
                 except CircuitBreakerOpen as e:
                     wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                     logger.warning(
@@ -1113,13 +1180,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     circuit_paused = True
                     break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[OFI] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    should_alert = failure_tracker.record_failure(sym)
+                    logger.warning(f"[OFI] fetch failed for {sym} (#{failure_tracker.count(sym)}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>OFI subsystem degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
-                            f"trading without live order flow data"
+                            f"{sym} failed {failure_tracker.count(sym)} times in a row — "
+                            f"trading without live order flow data for this symbol"
                         )
                 await asyncio.sleep(2)
             if not circuit_paused:
@@ -1129,13 +1196,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
     # ── 5-minute HTF cache (refreshed every 60s in background) ────────────────
     async def _htf_fetcher():
-        consecutive_failures = 0
+        failure_tracker = _SubsystemFailureTracker()
         while trader.running:
             circuit_paused = False
             for sym in symbols:
                 try:
                     await htf_filter.fetch(sym)
-                    consecutive_failures = 0
+                    if failure_tracker.record_success(sym) and notifier:
+                        notifier.send_message(
+                            f"✅ <b>HTF filter recovered</b>\n{sym} fetching normally again"
+                        )
                 except CircuitBreakerOpen as e:
                     wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                     logger.warning(
@@ -1146,13 +1216,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     circuit_paused = True
                     break  # skip remaining symbols; will retry next cycle
                 except Exception as e:
-                    consecutive_failures += 1
-                    logger.warning(f"[HTF] fetch failed for {sym} (#{consecutive_failures}): {e}")
-                    if consecutive_failures == 10 and notifier:
+                    should_alert = failure_tracker.record_failure(sym)
+                    logger.warning(f"[HTF] fetch failed for {sym} (#{failure_tracker.count(sym)}): {e}")
+                    if should_alert and notifier:
                         notifier.send_message(
                             f"⚠️ <b>HTF filter degraded</b>\n"
-                            f"Failed {consecutive_failures} times in a row — "
-                            f"multi-timeframe alignment unavailable"
+                            f"{sym} failed {failure_tracker.count(sym)} times in a row — "
+                            f"multi-timeframe alignment unavailable for this symbol"
                         )
                 await asyncio.sleep(3)
             if not circuit_paused:
@@ -2193,27 +2263,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                 s_hb = trader.get_account_summary()
                 wr_hb = (s_hb['winning_trades'] / s_hb['closed_trades'] * 100) if s_hb['closed_trades'] else 0.0
                 open_syms = ','.join(trader.account.positions.keys()) or 'none'
-                # Fold in the funding-arb arms for running combined totals. Read
-                # net P&L straight from the in-memory arm objects — NOT from the
-                # shared state.json, which the main loop rewrites every tick and
-                # clobbers the funding_arb* keys the merge task writes only every
-                # 65s (the state-flush race that made this read +0.00 ~always).
-                # Three arms: aggressive (Binance/Bybit, fantasy baseline), majors
-                # (Binance/Bybit majors-only, also fantasy), kraken (the only arm
-                # whose +$X represents actually-capturable edge).
-                def _arm_pnl(_arm):
-                    try:
-                        return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
-                    except Exception:
-                        return 0.0
-                # Rolling 7d window for the Kraken arm — its lifetime total is
-                # dominated by dead pre-whitelist legacy losses, so the 7d figure
-                # is what actually reflects the CURRENT config's edge.
-                def _arm_pnl_7d(_arm):
-                    try:
-                        return float(_arm.get_summary().get('pnl_7d', 0.0)) if _arm else 0.0
-                    except Exception:
-                        return 0.0
+                # Fold the funding-arb arms into running combined totals. Net P&L
+                # comes from the attribution ledger (recorded fills only) via
+                # _arb_arm_breakdown — see below. Three arms: aggressive
+                # (Binance/Bybit, fantasy baseline), majors (Binance/Bybit
+                # majors-only, also fantasy), kraken (the only executable arm).
                 # Borrow-corrected lifetime: charges every short-spot leg the carry
                 # it owes. For the aggressive arm this strips the unpaid-borrow
                 # illusion (booked +$16 vs honest ≈ −$14).
@@ -2222,13 +2276,17 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         return float(_arm.get_summary().get('borrow_corrected_pnl', 0.0)) if _arm else 0.0
                     except Exception:
                         return 0.0
-                _fa_hb  = _arm_pnl(_funding_arb_sim)
+                # Report arb from the attribution ledger (recorded fills only), not
+                # the in-memory sim lifetime — so never-traded arms read $0/0tr and
+                # frozen pre-attribution legacy losses are surfaced separately, never
+                # folded into the live headline. See _arb_arm_breakdown().
+                _fa_act,  _fa_n,  _fa_leg  = _arb_arm_breakdown(_funding_arb_sim)
+                _fam_act, _fam_n, _fam_leg = _arb_arm_breakdown(_funding_arb_majors)
+                _fak_act, _fak_n, _fak_leg = _arb_arm_breakdown(_funding_arb_kraken)
                 _fa_adj = _arm_pnl_adj(_funding_arb_sim)
-                _fam_hb = _arm_pnl(_funding_arb_majors)
-                _fak_hb = _arm_pnl(_funding_arb_kraken)
-                _fak_7d = _arm_pnl_7d(_funding_arb_kraken)
-                _combined_hb = s_hb['total_pnl'] + _fa_hb + _fam_hb + _fak_hb
-                _total_money_hb = s_hb['total_equity'] + _fa_hb + _fam_hb + _fak_hb
+                _arb_legacy = round(_fa_leg + _fam_leg + _fak_leg, 2)
+                _combined_hb = s_hb['total_pnl'] + _fa_act + _fam_act + _fak_act
+                _total_money_hb = s_hb['total_equity'] + _fa_act + _fam_act + _fak_act
                 # The AI brain runs out-of-process on its own $1k book; read its
                 # mark-to-market equity from state on disk so the heartbeat reflects
                 # its open drawdown (the `equity` field alone hides it). Kept as a
@@ -2250,15 +2308,18 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     _brain_seg = (f" brain={_brain_eq:.2f}[{_brain_pnl:+.2f}"
                                   f"{' HALTED' if _brain_halt else ''}]")
                 # Only show the aggressive (FANTASY) arm when it's actually running.
-                _aggr_seg = (f" aggr={_fa_hb:+.2f}[borrow-adj {_fa_adj:+.2f}]"
+                _aggr_seg = (f" aggr={_fa_act:+.2f}/{_fa_n}tr[borrow-adj {_fa_adj:+.2f}]"
                              if _funding_arb_sim is not None else "")
+                _legacy_seg = (f" legacy={_arb_legacy:+.2f}(frozen,pre-attrib)"
+                               if abs(_arb_legacy) >= 0.01 else "")
                 logger.info(
                     f"[HEARTBEAT] equity=${s_hb['total_equity']:.2f} "
                     f"pnl=${s_hb['total_pnl']:+.2f} ({s_hb['pnl_pct']:+.2f}%) "
                     f"trades={s_hb['closed_trades']}({s_hb['winning_trades']}W/{s_hb['losing_trades']}L WR={wr_hb:.0f}%) "
                     f"open={open_syms} min_conf={_adapt['min_confidence']:.0f} "
                     f"| TOTAL=${_total_money_hb:.2f} netPnL=${_combined_hb:+.2f} "
-                    f"(arb kraken={_fak_hb:+.2f}[7d {_fak_7d:+.2f}] maj={_fam_hb:+.2f}{_aggr_seg}{_brain_seg})"
+                    f"(arb kraken={_fak_act:+.2f}/{_fak_n}tr maj={_fam_act:+.2f}/{_fam_n}tr"
+                    f"{_aggr_seg}{_legacy_seg}{_brain_seg})"
                 )
                 # Entry funnel — where signals died since the last heartbeat
                 logger.info(f"[FUNNEL] {funnel.render()}")
@@ -2287,20 +2348,24 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     s_rep = trader.get_account_summary()
                     wr_rep = (s_rep['winning_trades'] / s_rep['closed_trades'] * 100) \
                         if s_rep['closed_trades'] else 0.0
-                    def _arm_pnl_rep(_arm):
-                        try:
-                            return float(_arm.get_summary()['total_pnl']) if _arm else 0.0
-                        except Exception:
-                            return 0.0
-                    fa_pnl  = _arm_pnl_rep(_funding_arb_sim)
-                    fam_pnl = _arm_pnl_rep(_funding_arb_majors)
-                    fak_pnl = _arm_pnl_rep(_funding_arb_kraken)
+                    # Arb P&L from the attribution ledger (recorded fills only) so
+                    # never-traded arms report $0.00/0 trades instead of frozen
+                    # pre-attribution legacy losses. Legacy is shown as a separate,
+                    # clearly-labelled line and is NOT folded into the live net.
+                    fak_act, fak_n, fak_leg = _arb_arm_breakdown(_funding_arb_kraken)
+                    fam_act, fam_n, fam_leg = _arb_arm_breakdown(_funding_arb_majors)
+                    fa_act,  fa_n,  fa_leg  = _arb_arm_breakdown(_funding_arb_sim)
+                    arb_active = fak_act + fam_act + fa_act
+                    arb_legacy = round(fak_leg + fam_leg + fa_leg, 2)
                     dir_pnl, dir_eq = s_rep['total_pnl'], s_rep['total_equity']
-                    combined = dir_pnl + fa_pnl + fam_pnl + fak_pnl
-                    total_money = dir_eq + fa_pnl + fam_pnl + fak_pnl
+                    combined = dir_pnl + arb_active
+                    total_money = dir_eq + arb_active
                     open_syms = ', '.join(trader.account.positions.keys()) or 'none'
                     mark = '🟢' if combined >= 0 else '🔴'
                     verb = 'up' if combined >= 0 else 'down'
+                    legacy_line = (
+                        f"• Legacy arb (frozen, pre-attribution, not in net): "
+                        f"${arb_legacy:+,.2f}\n" if abs(arb_legacy) >= 0.01 else "")
                     notifier.send_message(
                         f"📊 <b>Account Report</b> (paper)\n"
                         f"💰 Total money: <b>${total_money:,.2f}</b>\n"
@@ -2308,14 +2373,16 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         f"• Directional book: ${dir_eq:,.2f} equity "
                         f"(P&amp;L ${dir_pnl:+,.2f} / {s_rep['pnl_pct']:+.2f}%, "
                         f"{s_rep['closed_trades']} trades, {wr_rep:.0f}% WR)\n"
-                        f"• Funding Arb (Kraken, executable): ${fak_pnl:+,.2f}\n"
-                        f"• Funding Arb (majors, baseline): ${fam_pnl:+,.2f}\n"
-                        f"• Funding Arb (aggressive, baseline): ${fa_pnl:+,.2f}\n"
+                        f"• Funding Arb (Kraken, executable): ${fak_act:+,.2f} ({fak_n} trades)\n"
+                        f"• Funding Arb (majors): ${fam_act:+,.2f} ({fam_n} trades)\n"
+                        f"• Funding Arb (aggressive): ${fa_act:+,.2f} ({fa_n} trades)\n"
+                        f"{legacy_line}"
                         f"• Open positions: {open_syms}"
                     )
                     logger.info(f"[ACCOUNT REPORT] sent — total=${total_money:.2f} "
                                 f"netPnL=${combined:+.2f} (dir={dir_pnl:+.2f} "
-                                f"kraken={fak_pnl:+.2f} majors={fam_pnl:+.2f} aggr={fa_pnl:+.2f})")
+                                f"kraken={fak_act:+.2f}/{fak_n}tr majors={fam_act:+.2f}/{fam_n}tr "
+                                f"aggr={fa_act:+.2f}/{fa_n}tr legacy={arb_legacy:+.2f})")
                 except Exception as e:
                     logger.warning(f"[ACCOUNT REPORT] failed: {e}")
 

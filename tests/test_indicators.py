@@ -5,6 +5,11 @@ Covers:
 - prepare_ohlcv_dataframe: type conversions, index, empty input
 - EMACrossRSI: column presence, signal types, insufficient-data guard,
   crossover detection, RSI filter (overbought blocks buys)
+- supertrend, atr, ema_htf: the indicator helpers actually consumed by the
+  live/paper strategies (paper_trading.py, scientific_strategy.py,
+  microstructure_strategy.py, mean_reversion_strategy.py, live_trading.py) —
+  previously zero coverage even though EMACrossRSI (used only by the legacy
+  backtester) was thoroughly tested.
 """
 
 import pytest
@@ -17,6 +22,9 @@ from src.indicators import (
     EMACrossRSI,
     Signal,
     IndicatorResult,
+    supertrend,
+    atr,
+    ema_htf,
 )
 
 
@@ -183,3 +191,145 @@ class TestEMACrossRSIGetLatestSignal:
         assert isinstance(history, pd.DataFrame)
         assert "signal" in history.columns
         assert len(history) == len(df)
+
+
+# ── helpers for supertrend / atr / ema_htf ───────────────────────────────────
+
+def _trending_df(n: int = 50, start: float = 100.0, end: float = 200.0,
+                  band: float = 1.0) -> pd.DataFrame:
+    """Plain (non-datetime-indexed) OHLC df with a linear close trend."""
+    closes = np.linspace(start, end, n)
+    return pd.DataFrame({
+        "open": closes - band * 0.5,
+        "high": closes + band,
+        "low": closes - band,
+        "close": closes,
+        "volume": np.full(n, 100.0),
+    })
+
+
+# ── atr ───────────────────────────────────────────────────────────────────
+
+class TestAtr:
+    def test_returns_series_for_valid_df(self):
+        df = _trending_df(30)
+        result = atr(df, period=14)
+        assert isinstance(result, pd.Series)
+        assert len(result) == len(df)
+
+    def test_values_non_negative(self):
+        df = _trending_df(30)
+        result = atr(df, period=14)
+        assert (result.dropna() >= 0).all()
+
+    def test_returns_none_on_missing_columns(self):
+        # atr() requires 'high'/'low'/'close' — a df without them should hit
+        # the except-path and return None rather than raising.
+        df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+        assert atr(df) is None
+
+    def test_custom_period_accepted(self):
+        df = _trending_df(40)
+        result = atr(df, period=7)
+        assert isinstance(result, pd.Series)
+
+
+# ── ema_htf ───────────────────────────────────────────────────────────────
+
+class TestEmaHtf:
+    def test_too_few_candles_returns_none_none(self):
+        closes = pd.Series(np.linspace(100, 200, 55))  # slow=55 needs >= 56
+        assert ema_htf(closes, fast=21, slow=55) == (None, None)
+
+    def test_exact_boundary_returns_values(self):
+        closes = pd.Series(np.linspace(100, 200, 56))  # exactly slow + 1
+        fast_v, slow_v = ema_htf(closes, fast=21, slow=55)
+        assert isinstance(fast_v, float)
+        assert isinstance(slow_v, float)
+
+    def test_uptrend_fast_above_slow(self):
+        closes = pd.Series(np.linspace(100, 300, 100))
+        fast_v, slow_v = ema_htf(closes, fast=21, slow=55)
+        assert fast_v > slow_v
+
+    def test_downtrend_fast_below_slow(self):
+        closes = pd.Series(np.linspace(300, 100, 100))
+        fast_v, slow_v = ema_htf(closes, fast=21, slow=55)
+        assert fast_v < slow_v
+
+    def test_matches_manual_ewm_calculation(self):
+        closes = pd.Series(np.linspace(100, 250, 80))
+        fast_v, slow_v = ema_htf(closes, fast=10, slow=30)
+        expected_fast = closes.ewm(span=10, adjust=False).mean().iloc[-1]
+        expected_slow = closes.ewm(span=30, adjust=False).mean().iloc[-1]
+        assert fast_v == pytest.approx(expected_fast)
+        assert slow_v == pytest.approx(expected_slow)
+
+    def test_default_periods(self):
+        closes = pd.Series(np.linspace(100, 200, 60))
+        fast_v, slow_v = ema_htf(closes)
+        assert fast_v is not None and slow_v is not None
+
+
+# ── supertrend ────────────────────────────────────────────────────────────
+
+class TestSupertrend:
+    def test_adds_expected_columns(self):
+        df = _trending_df(50)
+        out = supertrend(df, period=10, multiplier=2.5)
+        for col in ("supertrend", "supertrend_bull", "supertrend_flip"):
+            assert col in out.columns
+
+    def test_does_not_mutate_input(self):
+        df = _trending_df(50)
+        original_cols = set(df.columns)
+        supertrend(df, period=10, multiplier=2.5)
+        assert set(df.columns) == original_cols
+
+    def test_uptrend_is_mostly_bullish(self):
+        df = _trending_df(50, start=100, end=200)
+        out = supertrend(df, period=10, multiplier=2.5)
+        # Skip the first `period` rows (warm-up / initial-direction artifact)
+        assert out["supertrend_bull"].iloc[15:].all()
+
+    def test_downtrend_is_mostly_bearish(self):
+        df = _trending_df(50, start=200, end=100)
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert not out["supertrend_bull"].iloc[15:].any()
+
+    def test_flip_only_marks_bear_to_bull_transition(self):
+        # Downtrend for 30 candles, then a sharp reversal into an uptrend.
+        down = np.linspace(200, 100, 30)
+        up = np.linspace(100, 250, 30)
+        closes = np.concatenate([down, up])
+        df = pd.DataFrame({
+            "open": closes + 0.5, "high": closes + 1.0,
+            "low": closes - 1.0, "close": closes,
+            "volume": np.full(len(closes), 100.0),
+        })
+        out = supertrend(df, period=10, multiplier=2.5)
+        flip_idx = out.index[out["supertrend_flip"]].tolist()
+        assert flip_idx, "expected at least one flip on a downtrend->uptrend reversal"
+        for i in flip_idx:
+            assert bool(out["supertrend_bull"].iloc[i]) is True
+            assert bool(out["supertrend_bull"].iloc[i - 1]) is False
+
+    def test_bullish_line_acts_as_support_below_close(self):
+        df = _trending_df(50, start=100, end=200)
+        out = supertrend(df, period=10, multiplier=2.5).iloc[15:]
+        assert (out["supertrend"] <= out["close"]).all()
+
+    def test_bearish_line_acts_as_resistance_above_close(self):
+        df = _trending_df(50, start=200, end=100)
+        out = supertrend(df, period=10, multiplier=2.5).iloc[15:]
+        assert (out["supertrend"] >= out["close"]).all()
+
+    def test_minimal_length_df_does_not_raise(self):
+        df = _trending_df(1)
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert len(out) == 1
+
+    def test_default_period_and_multiplier(self):
+        df = _trending_df(60)
+        out = supertrend(df)  # no explicit period/multiplier
+        assert out["supertrend"].notna().all()
