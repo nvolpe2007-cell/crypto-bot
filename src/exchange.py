@@ -359,6 +359,16 @@ class ExchangeConnection:
         retrying blindly would create a duplicate position.  Callers must
         handle exceptions explicitly and reconcile via get_open_orders().
 
+        Even without retrying, transient failures (NetworkError,
+        RequestTimeout, RateLimitExceeded) still count against
+        self._order_circuit, same as cancel_order/get_open_orders. Without
+        this, a persistently failing order endpoint would be hammered once
+        per caller attempt forever (e.g. a stop-loss watcher retrying every
+        second) instead of tripping the same cooldown protection every other
+        order-management call gets. Non-transient rejections (insufficient
+        funds, bad params, auth) propagate immediately and do not touch the
+        circuit, matching _retry's philosophy elsewhere in this file.
+
         order_timeout: Per-call wall-clock timeout in seconds (default 30).
             If the exchange connection stalls, asyncio.wait_for cancels the call
             and raises ccxt.RequestTimeout.  Callers should treat this the same
@@ -366,6 +376,8 @@ class ExchangeConnection:
             placed; always reconcile via get_open_orders() before retrying.
             Pass None to disable (not recommended in production).
         """
+        self._order_circuit.check()  # raises CircuitBreakerOpen if open
+
         params = {'symbol': symbol, 'type': order_type,
                   'side': side, 'amount': amount}
         if price and order_type == 'limit':
@@ -376,14 +388,21 @@ class ExchangeConnection:
         coro = self.exchange.create_order(**params)
         try:
             if order_timeout is not None:
-                return await asyncio.wait_for(coro, timeout=order_timeout)
-            return await coro
+                result = await asyncio.wait_for(coro, timeout=order_timeout)
+            else:
+                result = await coro
         except asyncio.TimeoutError:
+            self._order_circuit.record_failure()
             raise ccxt.RequestTimeout(
                 f"create_order({symbol} {side} {amount}) timed out after "
                 f"{order_timeout:.0f}s — order state unknown; "
                 "reconcile via get_open_orders() before retrying"
             )
+        except _RETRYABLE:
+            self._order_circuit.record_failure()
+            raise
+        self._order_circuit.record_success()
+        return result
 
     async def cancel_order(self, order_id: str, symbol: str,
                            retries: int = 3) -> Dict:
@@ -624,11 +643,18 @@ class KrakenFuturesConnection:
                            leverage: int = 1, order_timeout: float = 30.0) -> Dict:
         """Place a futures order. No retry — order creation is not idempotent.
 
+        Transient failures still count against self._order_circuit (same
+        rationale as ExchangeConnection.create_order) so a persistently
+        failing order endpoint trips the cooldown instead of being hammered
+        once per caller attempt forever.
+
         order_timeout: Per-call wall-clock timeout in seconds (default 30).
             On hang, asyncio.wait_for raises ccxt.RequestTimeout.  Callers
             must reconcile via get_open_positions() before retrying.
             Pass None to disable.
         """
+        self._order_circuit.check()  # raises CircuitBreakerOpen if open
+
         perp = self.perp_symbol(symbol)
         params = {}
         if leverage > 1:
@@ -637,14 +663,21 @@ class KrakenFuturesConnection:
         coro = self.exchange.create_order(perp, order_type, side, amount, price, params)
         try:
             if order_timeout is not None:
-                return await asyncio.wait_for(coro, timeout=order_timeout)
-            return await coro
+                result = await asyncio.wait_for(coro, timeout=order_timeout)
+            else:
+                result = await coro
         except asyncio.TimeoutError:
+            self._order_circuit.record_failure()
             raise ccxt.RequestTimeout(
                 f"futures.create_order({perp} {side} {amount}) timed out after "
                 f"{order_timeout:.0f}s — order state unknown; "
                 "reconcile via get_open_positions() before retrying"
             )
+        except _RETRYABLE:
+            self._order_circuit.record_failure()
+            raise
+        self._order_circuit.record_success()
+        return result
 
     async def cancel_order(self, order_id: str, symbol: str,
                            retries: int = 3) -> Dict:

@@ -405,6 +405,8 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     asyncio.create_task(_htf_fetcher())
 
     # ── Background: SL/TP watcher (checks every second) ───────────────────────
+    sltp_circuit_blocked: Dict[str, bool] = {}  # per-symbol: exit currently blocked by circuit breaker
+
     async def _sltp_watcher():
         while trader.running:
             await asyncio.sleep(1)
@@ -437,6 +439,21 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                             equity = trader.account.initial_capital + trader.account.total_pnl
                             equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
                             recent_trades.append(_trade_dict(trade, sym, exit_reason))
+
+                    if sltp_circuit_blocked.get(sym):
+                        sltp_circuit_blocked[sym] = _sltp_circuit_cleared(notifier, sym)
+                except CircuitBreakerOpen as e:
+                    # The exchange order/data circuit is open — a triggered
+                    # stop-loss/take-profit could NOT be executed. Silently
+                    # swallowing this (like a generic fetch failure) would mean
+                    # a real-money position sits past its stop with no signal
+                    # to the operator. Alert once on the transition, not every
+                    # second, then keep retrying — close_long left the position
+                    # open, so the next tick will try again automatically.
+                    wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
+                    sltp_circuit_blocked[sym] = _sltp_circuit_alert(
+                        notifier, sym, wait, sltp_circuit_blocked.get(sym, False)
+                    )
                 except Exception as e:
                     logger.debug(f"[LIVE SL/TP] {sym}: {e}")
 
@@ -762,6 +779,50 @@ def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool)
             except Exception:
                 pass
     return killed
+
+
+def _sltp_circuit_alert(notifier: Optional[TelegramNotifier], symbol: str,
+                        wait: float, was_blocked: bool) -> bool:
+    """Alert once when the exchange circuit breaker starts blocking a
+    triggered stop-loss/take-profit exit for `symbol`. Mirrors
+    _kill_switch_engaged's once-per-transition pattern so a stuck exit can't
+    fail silently forever, without spamming an alert every second it stays
+    open. Returns True (the new blocked state) for the caller to store.
+    """
+    if not was_blocked:
+        logger.warning(
+            f"[LIVE SL/TP] {symbol}: cannot close — exchange circuit breaker "
+            f"open ({wait:.0f}s remaining)"
+        )
+        if notifier:
+            try:
+                notifier.send_message(
+                    f"🛑 <b>Cannot close {symbol}</b>\n"
+                    f"Stop-loss/take-profit triggered but the exchange circuit "
+                    f"breaker is open ({wait:.0f}s) — the order could not be "
+                    f"placed. Position remains live on Kraken; the bot will "
+                    f"keep retrying automatically."
+                )
+            except Exception:
+                pass
+    return True
+
+
+def _sltp_circuit_cleared(notifier: Optional[TelegramNotifier], symbol: str) -> bool:
+    """Alert once when a previously-blocked exit for `symbol` is retried
+    without hitting the circuit breaker again. Returns False (the new
+    blocked state) for the caller to store.
+    """
+    logger.info(f"[LIVE SL/TP] {symbol}: exchange circuit breaker cleared — exit retries resumed")
+    if notifier:
+        try:
+            notifier.send_message(
+                f"✅ <b>{symbol} exit retries resumed</b>\n"
+                f"Exchange circuit breaker cleared."
+            )
+        except Exception:
+            pass
+    return False
 
 
 def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
