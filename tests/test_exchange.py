@@ -8,6 +8,9 @@ Covers:
 - get_ticker / get_balance: retry on NetworkError / RequestTimeout
 - cancel_order: retry (idempotent operation)
 - get_open_orders / get_trades: retry on transient errors
+- get_positions: retry on transient errors; raises (does not swallow) after
+  exhausting retries — startup reconciliation must not mistake "can't reach
+  the exchange" for "no open positions"
 - create_order: NO retry — raises immediately (non-idempotent)
 - connect: retry on NetworkError
 - fetch_ohlcv_between: delegates to fetch_ohlcv (inherits retry)
@@ -57,6 +60,7 @@ def _make_conn() -> ExchangeConnection:
     conn.exchange.cancel_order = AsyncMock(return_value={})
     conn.exchange.fetch_open_orders = AsyncMock(return_value=[])
     conn.exchange.fetch_trades = AsyncMock(return_value=[])
+    conn.exchange.fetch_positions = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
     # High threshold so existing retry tests are not affected by the circuit breaker
     conn._circuit = CircuitBreaker(threshold=1000, cooldown_seconds=60.0)
@@ -345,6 +349,43 @@ class TestGetBalance:
         )
         with pytest.raises(ccxt.NetworkError):
             await conn.get_balance(retries=2)
+
+
+# ── get_positions ─────────────────────────────────────────────────────────────────────
+
+class TestGetPositions:
+    async def test_returns_positions_on_success(self):
+        conn = _make_conn()
+        positions = [{'symbol': 'BTC/USD', 'contracts': 0.01}]
+        conn.exchange.fetch_positions = AsyncMock(return_value=positions)
+        result = await conn.get_positions(['BTC/USD'])
+        assert result == positions
+
+    async def test_retries_on_network_error(self):
+        conn = _make_conn()
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=[ccxt.NetworkError("blip"), []]
+        )
+        result = await conn.get_positions(['BTC/USD'], retries=3)
+        assert result == []
+        assert conn.exchange.fetch_positions.call_count == 2
+
+    async def test_raises_after_all_retries(self):
+        """Unlike fetch_ohlcv/fetch_order_book, get_positions must NOT swallow
+        a persistent failure into an empty list — callers (startup
+        reconciliation) rely on the raise to avoid trading blind."""
+        conn = _make_conn()
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        with pytest.raises(ccxt.NetworkError):
+            await conn.get_positions(['BTC/USD'], retries=2)
+
+    async def test_passes_symbols_through(self):
+        conn = _make_conn()
+        conn.exchange.fetch_positions = AsyncMock(return_value=[])
+        await conn.get_positions(['BTC/USD', 'ETH/USD'])
+        conn.exchange.fetch_positions.assert_called_once_with(['BTC/USD', 'ETH/USD'])
 
 
 # ── create_order — no retry ──────────────────────────────────────────────────────────────
@@ -784,6 +825,7 @@ def _make_conn_with_circuit(threshold: int = 3, cooldown: float = 60.0) -> Excha
     conn.exchange.cancel_order = AsyncMock(return_value={})
     conn.exchange.fetch_open_orders = AsyncMock(return_value=[])
     conn.exchange.fetch_trades = AsyncMock(return_value=[])
+    conn.exchange.fetch_positions = AsyncMock(return_value=[])
     conn.exchange.close = AsyncMock(return_value=None)
     conn._circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)
     conn._data_circuit = CircuitBreaker(threshold=threshold, cooldown_seconds=cooldown)

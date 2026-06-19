@@ -36,6 +36,19 @@ BASE_ALLOC = round(STARTING_EQUITY / len(KRAKEN_PAIRS), 2)     # per-coin base n
 # while halted; it just can't open fresh risk. 0 disables. Default 200 = -20% on a
 # $1k book: a generous leash that respects the brain's conviction but caps a blowup.
 MAX_DRAWDOWN = float(os.getenv("BRAIN_MAX_DRAWDOWN", "200"))
+# Sentiment veto on NEW shorts. Shorting into Extreme Fear is selling a capitulation
+# low — the brain did exactly that (3 correlated shorts on 2026-06-13, F&G ~15-23) and
+# gave back $99 when the relief rally squeezed it. Block opening a fresh short when
+# Fear & Greed <= this floor; closing/flipping out of shorts is ALWAYS allowed. The
+# brain still reasons over sentiment as before — this is a hard backstop, not advice.
+# 0 disables. Default 25 = the conventional "Extreme Fear" boundary.
+BRAIN_FNG_SHORT_FLOOR = float(os.getenv("BRAIN_FNG_SHORT_FLOOR", "25"))
+# Correlation cap. BTC/ETH/SOL move together, so they are one risk unit, not three
+# independent bets. Cap the TOTAL notional open on a single side so the book can't be
+# stacked one-directional (the 1.3x-gross concentration that turned one bad macro call
+# into a full-book drawdown). Over-cap opens are trimmed to the remaining headroom, or
+# skipped if none. 0 disables. Default = 1.0x starting equity.
+BRAIN_MAX_SIDE_NOTIONAL = float(os.getenv("BRAIN_MAX_SIDE_NOTIONAL", str(STARTING_EQUITY)))
 # DRY RUN / self-test: exercise the FULL pipeline (live data -> snapshot -> decide ->
 # paper account -> Telegram) with a transparent local heuristic instead of the API,
 # on a SEPARATE state file so it never pollutes the real brain ledger. Lets you verify
@@ -268,10 +281,10 @@ def maybe_drawdown_stop(state: dict, prices: dict, latest: dict, now) -> bool:
 
 
 def apply_decision(state: dict, coin: str, dec, price: float, ts: str,
-                   allow_open: bool = True) -> int:
+                   allow_open: bool = True, fng: float = None) -> int:
     """Reconcile the coin's position to the brain's target. Returns # actions taken.
     When allow_open is False (book halted) the brain may still close/flatten but cannot
-    open fresh risk."""
+    open fresh risk. `fng` is the current Fear & Greed score (for the short veto)."""
     target = {"long": 1, "short": -1, "flat": 0}.get(dec.action, 0)
     # Aggressive but bounded: conviction-scaled size up to 2.5x base per coin.
     size_usd = BASE_ALLOC * max(0.0, min(2.5, dec.size_mult)) if target != 0 else 0.0
@@ -289,6 +302,28 @@ def apply_decision(state: dict, coin: str, dec, price: float, ts: str,
         if not allow_open:
             print(f"{coin}: OPEN {dec.action.upper()} SKIPPED — book halted (drawdown stop)")
             return acted
+        # Guard 1 — sentiment veto: never open a FRESH short into Extreme Fear. The
+        # close above (a long->short flip) still ran, so this only blocks new short risk.
+        if target < 0 and BRAIN_FNG_SHORT_FLOOR > 0 and fng is not None \
+                and fng <= BRAIN_FNG_SHORT_FLOOR:
+            print(f"{coin}: OPEN SHORT SKIPPED — Fear&Greed {fng:.0f} <= "
+                  f"{BRAIN_FNG_SHORT_FLOOR:.0f} (Extreme Fear sentiment veto)")
+            return acted
+        # Guard 2 — correlation cap: BTC/ETH/SOL are one risk unit. Limit total notional
+        # already open on this side; trim the new size to fit, or skip if no headroom.
+        if BRAIN_MAX_SIDE_NOTIONAL > 0:
+            same_side = sum(p.get("size_usd", 0.0)
+                            for c, p in state["positions"].items()
+                            if c != coin and (p.get("side", 0) > 0) == (target > 0))
+            headroom = BRAIN_MAX_SIDE_NOTIONAL - same_side
+            if headroom <= 1.0:
+                print(f"{coin}: OPEN {dec.action.upper()} SKIPPED — side notional cap "
+                      f"${BRAIN_MAX_SIDE_NOTIONAL:.0f} reached (${same_side:.0f} already on this side)")
+                return acted
+            if size_usd > headroom:
+                print(f"{coin}: size trimmed ${size_usd:.0f}->${headroom:.0f} "
+                      f"(side notional cap ${BRAIN_MAX_SIDE_NOTIONAL:.0f})")
+                size_usd = headroom
         _open(state, coin, target, size_usd, price, ts, dec=dec)
         print(f"{coin}: OPEN {dec.action.upper()} @ {price:.4f} size=${size_usd:.0f} "
               f"conv={dec.conviction} ({dec.key_signal[:40]})")
@@ -479,12 +514,13 @@ def main():
 
     total = 0
     allow_open = not state.get("halted", False)
+    fng = macro.get("fear_greed")   # current Fear & Greed score for the short veto
     for coin in fresh:
         dec = result.decisions.get(coin)
         if dec is None:
             continue
         total += apply_decision(state, coin, dec, prices[coin], str(latest[coin]["t"]),
-                                allow_open=allow_open)
+                                allow_open=allow_open, fng=fng)
         state["last_bar_t"][coin] = latest[coin]["t"]
     # Positions may have changed (flips/closes) — refresh the MTM mark before saving.
     state["equity_mtm"] = round(mtm_equity(state, prices), 2)
