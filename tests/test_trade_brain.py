@@ -94,6 +94,68 @@ def test_available_false_without_key_or_client(monkeypatch):
     assert tb.TradeBrain(client=_FakeClient([])).available() is True
 
 
+# ── dynamic universe: decision tool scoped to the coins shown ─────────────────
+
+def _coin_schema(tool):
+    return tool["input_schema"]["properties"]["decisions"]["items"]["properties"]["coin"]
+
+
+def test_build_decision_tool_sets_enum_from_universe():
+    enum = _coin_schema(tb.build_decision_tool(["BTC", "ADA", "ETH", "BTC"]))["enum"]
+    assert enum == ["ADA", "BTC", "ETH"]                 # sorted + deduped
+
+
+def test_build_decision_tool_omits_enum_when_empty():
+    assert "enum" not in _coin_schema(tb.build_decision_tool(None))
+    assert "enum" not in _coin_schema(tb.build_decision_tool([]))
+
+
+def test_decide_scopes_tool_to_snapshot_universe():
+    client = _FakeClient([_dec("ADA", "long")])
+    tb.TradeBrain(client=client).decide({"ADA": {}, "BTC": {}}, datetime.now(timezone.utc))
+    assert _coin_schema(client.last_kwargs["tools"][0])["enum"] == ["ADA", "BTC"]
+
+
+def test_decide_handles_alt_coin_decision():
+    # an alt outside the old BTC/ETH/SOL set is parsed and acted on like any other.
+    client = _FakeClient([_dec("AVAX", "short", 1.2)])
+    res = tb.TradeBrain(client=client).decide({"AVAX": {}}, datetime.now(timezone.utc))
+    assert res.ok and res.decisions["AVAX"].action == "short"
+
+
+def test_brain_coins_env_expands_universe(monkeypatch):
+    monkeypatch.setenv("BRAIN_COINS", "BTC,ADA,DOGE")
+    try:
+        importlib.reload(bp)
+        assert set(bp.KRAKEN_PAIRS) == {"BTC", "ADA", "DOGE"}
+        assert bp.KRAKEN_PAIRS["DOGE"] == "XDGUSD"       # vetted Kraken code, not DOGEUSD
+        assert bp.KRAKEN_PAIRS["BTC"] == "XBTUSD"
+        assert bp.BASE_ALLOC == round(bp.STARTING_EQUITY / 3, 2)
+    finally:
+        monkeypatch.delenv("BRAIN_COINS", raising=False)
+        importlib.reload(bp)
+
+
+def test_brain_coins_unknown_base_falls_back(monkeypatch):
+    monkeypatch.setenv("BRAIN_COINS", "BTC,FOO")
+    try:
+        importlib.reload(bp)
+        assert bp.KRAKEN_PAIRS["FOO"] == "FOOUSD"        # graceful <BASE>USD fallback
+    finally:
+        monkeypatch.delenv("BRAIN_COINS", raising=False)
+        importlib.reload(bp)
+
+
+def test_brain_default_universe_is_expanded(monkeypatch):
+    monkeypatch.delenv("BRAIN_COINS", raising=False)
+    try:
+        importlib.reload(bp)
+        assert len(bp.KRAKEN_PAIRS) >= 8                 # no longer just the 3 majors
+        assert {"BTC", "ETH", "SOL"} <= set(bp.KRAKEN_PAIRS)
+    finally:
+        importlib.reload(bp)
+
+
 # ── chart vision (multimodal user content) ───────────────────────────────────
 
 def test_user_content_is_plain_string_without_charts():

@@ -42,9 +42,10 @@ EFFORT = os.getenv("BRAIN_EFFORT", "high")              # low | medium | high | 
 # Static strategy knowledge → cache_control so the daily call hits the prompt cache.
 SYSTEM_PROMPT = """\
 You are the decision core of a crypto PAPER trading account. Each day you decide, \
-for BTC, ETH and SOL independently, whether to hold a LONG, a SHORT, or stay FLAT \
-(in cash) over the coming days — and at what size. You trade 1x notional perps (no \
-leverage); you CAN profit in downtrends by shorting.
+for EACH coin you are shown independently (you will be given the exact list — it may \
+be just the majors or a wider basket of liquid alts), whether to hold a LONG, a SHORT, \
+or stay FLAT (in cash) over the coming days — and at what size. You trade 1x notional \
+perps (no leverage); you CAN profit in downtrends by shorting.
 
 YOU ARE BEING JUDGED HEAD-TO-HEAD against simple mechanical trend rules (long above \
 a moving average, short below) by a strict statistical proof bar. To beat them you \
@@ -61,8 +62,12 @@ expensive way:
   • DON'T FIGHT A CLEAN TREND. Above a rising SMA50/200 with positive momentum → bias \
     LONG. Below a falling SMA50/200 with negative momentum → bias SHORT or FLAT. \
     Conflicting signals (price above one MA, below another; flat momentum) → FLAT.
-  • SOL is the most volatile and the least reliable of the three; demand a cleaner \
-    setup there. BTC leads; if BTC is clearly trending, ETH/SOL usually follow.
+  • BTC LEADS; if BTC is clearly trending, ETH/SOL and the alts usually follow. The \
+    smaller/lower-cap the alt, the more volatile and less reliable it is — demand a \
+    cleaner setup there. CRUCIALLY, all these coins co-move with BTC, so a book stacked \
+    LONG (or SHORT) across many of them is NOT diversified — it is one big BTC-beta bet \
+    at combined size. Spread across more names only helps when the setups genuinely \
+    differ; otherwise concentrate on the cleanest one. The risk_budget block tracks this.
 
 READING THE EXTRA CONTEXT. Each coin now also carries the desk signals the rest of \
 the system computes, and a portfolio-wide `market` block. Use them to REFINE the \
@@ -153,36 +158,50 @@ KEEPING the current position when the picture hasn't materially changed — say 
 You MUST finish your turn by calling the submit_decisions tool — reasoning in text \
 without calling it is an incomplete answer."""
 
-DECISION_TOOL = {
-    "name": "submit_decisions",
-    "description": "Submit one trade decision per coin (BTC, ETH, SOL).",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "decisions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "coin": {"type": "string", "enum": ["BTC", "ETH", "SOL"]},
-                        "action": {"type": "string", "enum": ["long", "short", "flat"]},
-                        "conviction": {"type": "integer", "minimum": 1, "maximum": 10},
-                        "size_mult": {"type": "number", "minimum": 0.0, "maximum": 2.5},
-                        "key_signal": {"type": "string",
-                                       "description": "The single signal that drove this call."},
-                        "invalidation": {"type": "string",
-                                         "description": "What would flip this view."},
-                        "reasoning": {"type": "string",
-                                      "description": "Concise read — why long/short/flat."},
+def build_decision_tool(coins: Optional[List[str]] = None) -> Dict[str, Any]:
+    """The submit_decisions tool. The coin enum is set to the active universe so the
+    model can only emit coins we actually trade; coins=None/empty omits the enum (any
+    string accepted — back-compat for tests / unknown universes). The runner only acts
+    on coins it has a fresh bar for, so a stray coin is harmless either way."""
+    coin_prop: Dict[str, Any] = {"type": "string"}
+    coins = sorted({c for c in (coins or []) if c})
+    if coins:
+        coin_prop["enum"] = coins
+    return {
+        "name": "submit_decisions",
+        "description": "Submit one trade decision per coin you are shown.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "coin": coin_prop,
+                            "action": {"type": "string", "enum": ["long", "short", "flat"]},
+                            "conviction": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "size_mult": {"type": "number", "minimum": 0.0, "maximum": 2.5},
+                            "key_signal": {"type": "string",
+                                           "description": "The single signal that drove this call."},
+                            "invalidation": {"type": "string",
+                                             "description": "What would flip this view."},
+                            "reasoning": {"type": "string",
+                                          "description": "Concise read — why long/short/flat."},
+                        },
+                        "required": ["coin", "action", "conviction", "size_mult",
+                                     "key_signal", "invalidation", "reasoning"],
                     },
-                    "required": ["coin", "action", "conviction", "size_mult",
-                                 "key_signal", "invalidation", "reasoning"],
-                },
-            }
+                }
+            },
+            "required": ["decisions"],
         },
-        "required": ["decisions"],
-    },
-}
+    }
+
+
+# Module-level default (BTC/ETH/SOL) kept for back-compat; decide() builds a tool
+# scoped to the actual snapshot universe per call.
+DECISION_TOOL = build_decision_tool(["BTC", "ETH", "SOL"])
 
 
 # ── Portfolio overseer ───────────────────────────────────────────────────────
@@ -402,7 +421,7 @@ class TradeBrain:
                 max_tokens=MAX_TOKENS,
                 system=[{"type": "text", "text": SYSTEM_PROMPT,
                          "cache_control": {"type": "ephemeral"}}],
-                tools=[DECISION_TOOL],
+                tools=[build_decision_tool(list(snapshot.keys()) if snapshot else None)],
                 messages=[{"role": "user",
                            "content": _build_user_content(snapshot, now, macro, charts, memory)}],
             )
