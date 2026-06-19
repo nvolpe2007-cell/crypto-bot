@@ -70,6 +70,9 @@ def test_opens_on_entry_bar(tmp_path):
     assert KEY in state["positions"]
     pos = state["positions"][KEY]
     assert pos["target"] > pos["entry"] > pos["stop"]
+    # measure-first annotation tags are stamped on the entry (never gated)
+    assert isinstance(pos["td_signal"], str)
+    assert "entry_window" in pos and "conviction" in pos
 
 
 def test_closes_on_target(tmp_path):

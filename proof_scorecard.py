@@ -530,6 +530,12 @@ def _swing_attribution() -> None:
     # once trades opened after the session-tagging change accumulate.)
     if any(p.get('session_verdict') for p in closed):
         _show('session verdict', lambda p: p.get('session_verdict'))
+    # Did TD Sequential alignment predict P&L? Long-only swing is a trend follower,
+    # so the key question is whether longs taken after a recent TD sell-setup
+    # (uptrend exhaustion) underperform. Measure-first — never gated. (Only
+    # populated once trades opened after the TD-tagging change accumulate.)
+    if any(p.get('td_signal') for p in closed):
+        _show('TD signal', lambda p: p.get('td_signal'))
 
 
 def main():

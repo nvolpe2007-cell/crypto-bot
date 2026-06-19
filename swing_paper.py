@@ -29,6 +29,7 @@ from src.volume_profile import volume_profile, DEFAULT_BINS
 from src.event_calendar import blackout_reason
 from src.cot_report import cot_signal
 from src.session_filter import SessionEdge, window_of_hour
+from src.td_sequential import td_state
 
 # Session/time-of-day gate. Default OFF (measure-first): we tag every trade with
 # its session verdict so proof_scorecard can measure per-session edge BEFORE we
@@ -164,7 +165,9 @@ def _vp_context(window: list[dict], fill: float) -> dict:
 # ── attribution keys carried from an open position onto its closed record ─────
 _CARRY_KEYS = ("vp_zone", "vp_dist_poc_pct", "vp_in_value", "cot_bias",
                "entry_hour", "entry_atr_pct", "entry_session", "session_verdict",
-               "entry_window", "entry_day", "conviction")
+               "entry_window", "entry_day", "conviction", "td_signal",
+               "td_buy_setup", "td_sell_setup", "td_buy_countdown",
+               "td_sell_countdown")
 
 
 def _conviction(dec) -> float:
@@ -271,6 +274,10 @@ def _build_entry_candidate(key: str, base: str, tf: int, window: list[dict],
     stop, target = dec.stop_price + delta, dec.target_price + delta
 
     vp_ctx = _vp_context(window, fill)          # research annotation, never gated
+    # TD Sequential state at entry — ANNOTATION ONLY (never gates). Computed from
+    # the bars already in hand; proof_scorecard breaks P&L down "by TD signal" so
+    # the ledger can prove whether TD alignment adds edge before it's ever a gate.
+    td = td_state(window)
     entry_atr_pct = (round(dec.target_pct / strat.atr_target_mult * 100.0, 3)
                      if strat.atr_target_mult else 0.0)
     conviction = _conviction(dec)
@@ -284,7 +291,10 @@ def _build_entry_candidate(key: str, base: str, tf: int, window: list[dict],
         "session_verdict": sess_verdict,
         "entry_window": window_of_hour(entry_hour),
         "entry_day": entry_dt.strftime("%Y-%m-%d"),
-        "conviction": round(conviction, 6), **vp_ctx}
+        "conviction": round(conviction, 6),
+        "td_signal": td["signal"], "td_buy_setup": td["buy_setup"],
+        "td_sell_setup": td["sell_setup"], "td_buy_countdown": td["buy_countdown"],
+        "td_sell_countdown": td["sell_countdown"], **vp_ctx}
     return {"key": key, "base": base, "tf": tf, "entry_dt": entry_dt,
             "conviction": conviction, "position": position,
             "fill": fill, "signal_close": dec.price, "delta": delta,
