@@ -441,6 +441,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     recent_trades:  List[dict]              = []
     equity_curve:   List[dict]              = []
     iteration = 0
+    killed = False  # master kill switch state — see _kill_switch_engaged()
 
     # Seed OHLCV
     for sym in symbols:
@@ -513,6 +514,10 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             await asyncio.sleep(EVAL_INTERVAL)
             iteration += 1
 
+            # Master kill switch — halts NEW entries (exits below still run).
+            # Same flag the paper arms honor; file/env toggled, no restart needed.
+            killed = _kill_switch_engaged(notifier, killed)
+
             # Daily loss circuit breaker
             session_loss = session_start_pnl - trader.account.total_pnl
             if session_loss >= max_daily_loss:
@@ -582,7 +587,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 current_equity = trader.account.initial_capital + trader.account.total_pnl
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
-                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE:
+                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE and not killed:
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
 
@@ -702,6 +707,39 @@ async def start_live_session(exchange, symbols, timeframe, notifier, sentiment,
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool) -> bool:
+    """Check the master kill switch (src/kill_switch.py) and notify on transitions.
+
+    Mirrors the check paper_trading.py runs before every directional entry:
+    BOT_KILL_SWITCH=1 or the data/KILL_SWITCH flag file halts NEW entries only —
+    exits (SL/TP, signal-reversal close) keep running so real positions can
+    always be closed. Returns the current killed state.
+    """
+    from .kill_switch import is_killed
+    killed = is_killed()
+    if killed and not was_killed:
+        logger.warning("[LIVE] Master kill switch engaged — halting new entries (exits continue)")
+        if notifier:
+            try:
+                notifier.send_message(
+                    "🛑 <b>Master kill switch engaged</b>\n"
+                    "LIVE trading: new entries halted, exits continue."
+                )
+            except Exception:
+                pass
+    elif not killed and was_killed:
+        logger.info("[LIVE] Master kill switch released — resuming entries")
+        if notifier:
+            try:
+                notifier.send_message(
+                    "✅ <b>Master kill switch released</b>\n"
+                    "LIVE trading: entries resumed."
+                )
+            except Exception:
+                pass
+    return killed
+
 
 def _inject_live_price(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
     df = df.copy()

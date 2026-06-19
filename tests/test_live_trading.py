@@ -61,10 +61,12 @@ from src.live_trading import (
     LiveAccount,
     _inject_live_price,
     _quick_diagnose,
+    _kill_switch_engaged,
     run_live_trading_session,
     FEE_RATE,
 )
 from src.scientific_strategy import ScientificSignal
+import src.kill_switch as kill_switch
 from src.indicators import Signal
 from src.exchange import ExchangeConnection, CircuitBreakerOpen
 from src.backtester import Trade
@@ -753,3 +755,66 @@ class TestRunLiveTradingSessionReconcileAbort:
             notifier=None,
         ))
         assert trader.running is False
+
+
+# ── _kill_switch_engaged ────────────────────────────────────────────────────────
+#
+# The master kill switch (src/kill_switch.py) halts NEW entries across every
+# paper arm via BOT_KILL_SWITCH=1 or the data/KILL_SWITCH flag file. Before this
+# fix, run_live_trading_session never checked it — engaging the kill switch
+# would not have stopped the live trader from opening new real positions. These
+# tests guard that the live loop now honors the same flag.
+
+@pytest.fixture
+def kill_isolated(tmp_path, monkeypatch):
+    """Isolate the flag file and clear the env trigger so tests don't collide
+    with any real data/KILL_SWITCH or ambient env."""
+    monkeypatch.setattr(kill_switch, "KILL_FILE", str(tmp_path / "KILL_SWITCH"))
+    monkeypatch.delenv("BOT_KILL_SWITCH", raising=False)
+    return kill_switch
+
+
+class TestKillSwitchEngaged:
+    def test_not_killed_returns_false(self, kill_isolated):
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is False
+
+    def test_engaged_via_flag_file_returns_true(self, kill_isolated):
+        kill_isolated.engage("test")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_engaged_via_env_returns_true(self, kill_isolated, monkeypatch):
+        monkeypatch.setenv("BOT_KILL_SWITCH", "1")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_notifies_once_on_engage_transition(self, kill_isolated):
+        notifier = MagicMock()
+        kill_isolated.engage("test")
+        # First check: transition False -> True, should notify
+        killed = _kill_switch_engaged(notifier, was_killed=False)
+        assert killed is True
+        assert notifier.send_message.call_count == 1
+        assert "engaged" in notifier.send_message.call_args[0][0].lower()
+
+        # Second check: still killed, no new transition, no extra notification
+        killed = _kill_switch_engaged(notifier, was_killed=killed)
+        assert killed is True
+        assert notifier.send_message.call_count == 1
+
+    def test_notifies_once_on_release_transition(self, kill_isolated):
+        notifier = MagicMock()
+        # Transition True -> False should notify "released"
+        killed = _kill_switch_engaged(notifier, was_killed=True)
+        assert killed is False
+        assert notifier.send_message.call_count == 1
+        assert "released" in notifier.send_message.call_args[0][0].lower()
+
+    def test_no_notifier_does_not_raise(self, kill_isolated):
+        kill_isolated.engage("test")
+        assert _kill_switch_engaged(notifier=None, was_killed=False) is True
+
+    def test_notifier_exception_swallowed(self, kill_isolated):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        kill_isolated.engage("test")
+        # Must not raise even though send_message blows up
+        assert _kill_switch_engaged(notifier, was_killed=False) is True
