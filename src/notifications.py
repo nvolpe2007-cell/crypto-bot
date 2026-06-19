@@ -4,7 +4,9 @@ Telegram Notifications — plain-English trade alerts.
 
 import html
 import logging
+import queue
 import requests
+import threading
 from typing import Optional
 from dataclasses import dataclass
 
@@ -142,11 +144,23 @@ class TelegramNotifier:
     Send plain-English trading notifications to Telegram.
     """
 
-    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True):
+    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True,
+                 async_safe: bool = False):
         self.token    = bot_token
         self.chat_id  = chat_id
         self.enabled  = enabled
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
+        # async_safe=True moves the actual HTTP call onto a background worker
+        # thread (FIFO queue) instead of running it inline. The bot drives its
+        # whole trading loop from one asyncio event loop; requests.post() is
+        # synchronous, so an inline call would stall every other concurrent
+        # task (price polling, other arms, exit checks) for the round-trip.
+        # Off by default so tests / one-shot scripts keep today's behavior:
+        # a real return value for the call they just made, in order.
+        self._async_safe  = async_safe
+        self._queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_lock = threading.Lock()
         if enabled:
             logger.info(f"Telegram notifications enabled for chat {chat_id}")
 
@@ -154,6 +168,31 @@ class TelegramNotifier:
         if not self.enabled:
             logger.debug(f"Notification suppressed: {message[:50]}")
             return False
+        if self._async_safe:
+            self._ensure_worker()
+            self._queue.put((message, parse_mode))
+            return True
+        return self._send_now(message, parse_mode)
+
+    def _ensure_worker(self) -> None:
+        with self._worker_lock:
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop, daemon=True, name="telegram-notifier",
+                )
+                self._worker.start()
+
+    def _worker_loop(self) -> None:
+        # Single worker keeps messages in send order (e.g. trade-reasoning
+        # then trade-alert) without needing a lock around requests.post.
+        while True:
+            message, parse_mode = self._queue.get()
+            try:
+                self._send_now(message, parse_mode)
+            except Exception:
+                logger.exception("Telegram background send crashed")
+
+    def _send_now(self, message: str, parse_mode: str = "HTML") -> bool:
         try:
             response = requests.post(
                 f"{self.base_url}/sendMessage",
@@ -567,7 +606,10 @@ def create_notifier_from_env() -> TelegramNotifier:
         logger.warning("Telegram not configured — notifications disabled")
         return TelegramNotifier("", "", enabled=False)
 
-    return TelegramNotifier(token, chat_id, enabled)
+    # async_safe=True: this factory is what the live bot (run_all_bots.py /
+    # src/bot.py) uses to build its one shared notifier, which then sends
+    # alerts from inside the asyncio trading loop — see TelegramNotifier.__init__.
+    return TelegramNotifier(token, chat_id, enabled, async_safe=True)
 
 
 if __name__ == '__main__':
