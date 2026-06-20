@@ -56,6 +56,7 @@ from .entry_checklist import (
     build_short_checklist,
 )
 from .session_filter import SessionEdge
+from .vol_sizing import apply_vol_target
 from .task_supervisor import supervised, get_health as _get_subsystem_health
 
 logger = logging.getLogger(__name__)
@@ -1973,6 +1974,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
+                    # Realized-vol (inverse-vol) targeting — covers alts the IV
+                    # monitor (BTC/ETH only) sizes flat. Bounded, env-gated.
+                    size_usd = apply_vol_target(size_usd, getattr(sig, 'atr', None),
+                                                getattr(sig, 'close', None))
 
                     # When prob gate is off, checklist soft-score modulates size.
                     # Prob gate's tier sizing fully replaces this below if enabled.
@@ -2106,6 +2111,8 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         continue
                     if vol_monitor:
                         size_usd *= vol_monitor.get_size_multiplier(symbol)
+                    size_usd = apply_vol_target(size_usd, getattr(sig, 'atr', None),
+                                                getattr(sig, 'close', None))
                     if not prob_gate:
                         size_usd *= cl_result.score
 
