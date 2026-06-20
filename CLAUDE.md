@@ -163,6 +163,12 @@ counts as proof. An arm clearing the single bar but not the family bar reads `PR
 (single) — NOT family-wise robust`; only `PROVEN ✓` counts in the final verdict. k=1
 reproduces the original bar exactly. The weekly Telegram report (`scripts/weekly_report.py`)
 now surfaces both the per-arm verdicts (§7) and the session-edge table (§8).
+**Deflated Sharpe Ratio (Bailey & López de Prado, 2026-06-20):** each arm also reports a DSR =
+P(true Sharpe > `sr0`), where `sr0 = _expected_max_sharpe(...)` is the expected MAX per-trade
+Sharpe across the k arms tried (False Strategy Theorem), and the DSR widens the Sharpe's error
+band for skew/kurtosis. Bar `DSR>0.95`. The final VERDICT now requires an arm to clear **both**
+the family-wise clustered-t bar AND the DSR bar to count as robustly proven — the pre-registered
+n≥30 / expectancy>0 / t>2 bar is unchanged; DSR only tightens, never loosens.
 
 ## AI brain context (what it's fed — no code change)
 The Claude-Opus discretionary brain (`src/trade_brain.py`, runner `brain_paper.py`) is

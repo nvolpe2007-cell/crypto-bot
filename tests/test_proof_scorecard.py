@@ -92,6 +92,37 @@ def test_verdict_below_t_min_not_proven():
 
 # ── microstructure maker-only forward arm ─────────────────────────────────────
 
+# ── deflated Sharpe ratio (Bailey & López de Prado) ──────────────────────────
+
+def test_stats_reports_skew_and_kurt():
+    s = ps._stats([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])   # symmetric → skew≈0
+    assert abs(s['skew']) < 1e-9
+    assert 'kurt' in s
+    z = ps._stats([])
+    assert z['skew'] == 0.0 and z['kurt'] == 3.0       # normal defaults on empty
+
+
+def test_expected_max_sharpe_rises_with_trials_and_spread():
+    few = ps._expected_max_sharpe([0.1, 0.3])
+    many = ps._expected_max_sharpe([0.1, 0.3] * 8)      # more trials → higher bar
+    assert many > few > 0
+    assert ps._expected_max_sharpe([0.2]) == 0.0        # N<2 → no deflation
+    assert ps._expected_max_sharpe([0.2, 0.2, 0.2]) == 0.0  # zero variance → 0
+
+
+def test_deflated_sharpe_monotonic_and_bounded():
+    # higher per-trade Sharpe → higher DSR; below the benchmark → < 0.5
+    lo = ps._deflated_sharpe(0.05, 100, 0.0, 3.0, sr0=0.10)
+    hi = ps._deflated_sharpe(0.40, 100, 0.0, 3.0, sr0=0.10)
+    assert 0.0 <= lo < 0.5 < hi <= 1.0
+
+
+def test_deflated_sharpe_guards():
+    assert ps._deflated_sharpe(0.3, 1, 0.0, 3.0, 0.1) == 0.0     # n_eff<2 → 0
+    # a degenerate denom (huge skew/kurt) must not raise
+    assert 0.0 <= ps._deflated_sharpe(0.3, 50, -50.0, 500.0, 0.1) <= 1.0
+
+
 def test_microstructure_forward_missing_file_is_none(tmp_path, monkeypatch):
     monkeypatch.setattr(ps, 'DATA', tmp_path)
     assert ps._microstructure_forward() is None

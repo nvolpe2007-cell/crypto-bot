@@ -71,6 +71,46 @@ def _family_t_bar(k: int, alpha: float = 0.05) -> float:
     return max(T_MIN, z)
 
 
+# Deflated Sharpe Ratio acceptance bar (Bailey & López de Prado): the probability
+# the arm's Sharpe is real must exceed this. 0.95 ≈ "95% it isn't a fluke of
+# multiple testing + non-normal returns".
+DSR_MIN = 0.95
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def _expected_max_sharpe(sharpes: list[float]) -> float:
+    """Expected MAXIMUM per-trade Sharpe among N unskilled trials (López de Prado's
+    False Strategy Theorem) — the benchmark a real edge must beat. Rises with the
+    number of arms tried (N) and the spread of their Sharpes, so 'best of many'
+    has to clear a higher bar. N<2 or zero variance → 0 (no deflation)."""
+    N = len(sharpes)
+    if N < 2:
+        return 0.0
+    var = st.pvariance(sharpes)
+    if var <= 0:
+        return 0.0
+    sd = math.sqrt(var)
+    Z = st.NormalDist()
+    return sd * ((1.0 - _EULER_MASCHERONI) * Z.inv_cdf(1.0 - 1.0 / N)
+                 + _EULER_MASCHERONI * Z.inv_cdf(1.0 - 1.0 / (N * math.e)))
+
+
+def _deflated_sharpe(sharpe: float, n_eff: float, skew: float, kurt: float,
+                     sr0: float) -> float:
+    """Deflated Sharpe Ratio = P(true Sharpe > sr0), correcting BOTH for the number
+    of trials (via sr0 from _expected_max_sharpe) AND for non-normal returns
+    (skew/kurtosis widen the Sharpe's error band). `sharpe` is per-trade; `n_eff`
+    is the correlation-adjusted sample size. Returns a probability in [0,1]; an
+    edge is deflated-robust when it exceeds DSR_MIN."""
+    if n_eff < 2:
+        return 0.0
+    denom = 1.0 - skew * sharpe + ((kurt - 1.0) / 4.0) * sharpe * sharpe
+    if denom <= 0:
+        return 0.0
+    z = (sharpe - sr0) * math.sqrt(n_eff - 1.0) / math.sqrt(denom)
+    return st.NormalDist().cdf(z)
+
+
 def _design_effect_eff_n(nets: list[float], clusters: list) -> float:
     """Kish design effect → EFFECTIVE sample size for correlated trades.
 
@@ -114,7 +154,8 @@ def _stats(nets: list[float], clusters: list | None = None) -> dict:
     total = sum(nets)
     if n == 0:
         return dict(n=0, total=0.0, win_rate=0.0, expectancy=0.0,
-                    t_stat=0.0, t_clustered=0.0, eff_n=0.0, sharpe=0.0, max_dd=0.0)
+                    t_stat=0.0, t_clustered=0.0, eff_n=0.0, sharpe=0.0, max_dd=0.0,
+                    skew=0.0, kurt=3.0)
     wins = sum(1 for x in nets if x > 0)
     mean = total / n
     sd = st.pstdev(nets) if n < 2 else st.stdev(nets)
@@ -122,6 +163,17 @@ def _stats(nets: list[float], clusters: list | None = None) -> dict:
     eff_n = _design_effect_eff_n(nets, clusters) if clusters else float(n)
     t_clustered = (mean / (sd / math.sqrt(eff_n))) if (eff_n >= 2 and sd > 0) else 0.0
     sharpe = (mean / sd) if sd > 0 else 0.0          # per-trade Sharpe (not annualised)
+    # Skewness + (raw) kurtosis of per-trade returns, for the Deflated Sharpe Ratio.
+    # Population moments off the population std; normal defaults (skew 0, kurt 3)
+    # when there's too little spread to estimate them.
+    sd_pop = st.pstdev(nets)
+    if n >= 2 and sd_pop > 0:
+        m3 = sum((x - mean) ** 3 for x in nets) / n
+        m4 = sum((x - mean) ** 4 for x in nets) / n
+        skew = m3 / sd_pop ** 3
+        kurt = m4 / sd_pop ** 4
+    else:
+        skew, kurt = 0.0, 3.0
     # max drawdown on the cumulative equity curve
     cum = peak = dd = 0.0
     for x in nets:
@@ -130,7 +182,7 @@ def _stats(nets: list[float], clusters: list | None = None) -> dict:
         dd = min(dd, cum - peak)
     return dict(n=n, total=total, win_rate=wins / n, expectancy=mean,
                 t_stat=t_stat, t_clustered=t_clustered, eff_n=eff_n,
-                sharpe=sharpe, max_dd=dd)
+                sharpe=sharpe, max_dd=dd, skew=skew, kurt=kurt)
 
 
 def _borrow_owed(p: dict) -> float:
@@ -585,10 +637,17 @@ def main():
 
     k = len(arms)
     t_family = _family_t_bar(k)
+    # Deflated-Sharpe benchmark: expected max per-trade Sharpe across the arms we
+    # actually tried (n>=2). A real edge's Sharpe must beat THIS, not zero.
+    sr0 = _expected_max_sharpe([a['sharpe'] for a in arms if a['n'] >= 2])
+    dsr_of = lambda a: _deflated_sharpe(a['sharpe'], a.get('eff_n', a['n']),
+                                        a.get('skew', 0.0), a.get('kurt', 3.0), sr0)
     print('=' * 78)
     print(f'PROOF SCORECARD  (bar: executable & n>={N_MIN} & expectancy>0 & t>{T_MIN})')
     print(f'  family-wise bar (Šidák, {k} arms judged): clustered t must exceed '
           f'{t_family:.2f} to be PROVEN — guards against best-of-{k} selection bias')
+    print(f'  deflated-Sharpe bar: DSR>{DSR_MIN:.2f} vs expected-max-Sharpe sr0={sr0:.3f} '
+          f'(corrects for {k} trials + non-normal returns)')
     print('=' * 78)
     for a in arms:
         print(f"\n▌ {a['label']}   [{'EXECUTABLE' if a['executable'] else 'FANTASY'}]")
@@ -600,6 +659,9 @@ def main():
                   if abs(_en - a['n']) > 0.5 else "")
         print(f"   t-stat={a['t_stat']:5.2f}{_cline}  sharpe(per-trade)={a['sharpe']:5.2f}  "
               f"maxDD=${a['max_dd']:+.2f}")
+        _dsr = dsr_of(a)
+        print(f"   DSR={_dsr:.2f} {'✓' if _dsr > DSR_MIN else '✗'} (skew={a.get('skew',0.0):+.2f} "
+              f"kurt={a.get('kurt',3.0):.1f})")
         if 'corrected_total' in a:
             print(f"   borrow-corrected net=${a['corrected_total']:+8.2f}  "
                   f"(unpaid-carry illusion = ${a['total'] - a['corrected_total']:+.2f})")
@@ -607,11 +669,19 @@ def main():
 
     _swing_attribution()
 
-    # Only family-wise-robust arms ('PROVEN ✓') count; 'PROVEN (single)' does not.
+    # Robustly proven = clears the pre-registered family-wise bar ('PROVEN ✓') AND
+    # the Deflated Sharpe bar (multiple-testing + non-normality). DSR is reported
+    # for every arm above; it tightens the final tally without moving the
+    # pre-registered bar itself.
     proven = [a for a in arms if _verdict(a, t_family, k).startswith('PROVEN ✓')]
+    proven_dsr = [a for a in proven if dsr_of(a) > DSR_MIN]
     print('\n' + '=' * 78)
-    if proven:
-        print('VERDICT: ' + ', '.join(a['label'] for a in proven) + ' cleared the bar.')
+    if proven_dsr:
+        print('VERDICT: ' + ', '.join(a['label'] for a in proven_dsr)
+              + ' cleared the bar (family-wise t AND DSR).')
+    elif proven:
+        print('VERDICT: ' + ', '.join(a['label'] for a in proven)
+              + ' cleared t but NOT the deflated-Sharpe bar — not robust yet.')
     else:
         print('VERDICT: NO strategy has cleared the proof bar. Do not fund any of them yet.')
     print('=' * 78)
