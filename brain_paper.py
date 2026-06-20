@@ -180,6 +180,35 @@ def build_memory(state: dict, prices: dict, n_trades: int = 8,
     calibration = {k: {"trades": v["n"], "win_rate": round(v["wins"] / v["n"], 2),
                        "total_pnl": round(v["pnl"], 2)} for k, v in calib.items()}
 
+    # win-rate broken down by COIN and by ACTION (long/short) — surfaces "your shorts on
+    # X keep losing" so the brain can name a losing pattern and stop, not just feel it.
+    def _bucketed(keyfn) -> dict:
+        agg: dict = {}
+        for c in closed:
+            key = keyfn(c)
+            if key is None:
+                continue
+            b = agg.setdefault(key, {"n": 0, "wins": 0, "pnl": 0.0})
+            b["n"] += 1
+            b["wins"] += int((c.get("pnl", 0) or 0) > 0)
+            b["pnl"] += c.get("pnl", 0) or 0.0
+        return {k: {"trades": v["n"], "win_rate": round(v["wins"] / v["n"], 2),
+                    "total_pnl": round(v["pnl"], 2)} for k, v in agg.items()}
+
+    win_by_coin = _bucketed(lambda c: c.get("symbol"))
+    win_by_action = _bucketed(lambda c: "long" if c.get("side", 0) > 0 else "short")
+
+    # worst trades: the actual losers with their entry thesis, so a lesson can be NAMED.
+    worst = sorted(closed, key=lambda c: c.get("pnl", 0) or 0)[:3]
+    worst_trades = [
+        {"symbol": c.get("symbol"), "side": "long" if c.get("side", 0) > 0 else "short",
+         "entry_conviction": c.get("entry_conviction"),
+         "entry_signal": (c.get("entry_signal") or "")[:80],
+         "lesson": (c.get("entry_reasoning") or "")[:140],
+         "pnl_usd": c.get("pnl"), "exit_reason": c.get("reason")}
+        for c in worst if (c.get("pnl", 0) or 0) < 0
+    ]
+
     open_positions = {
         coin: {"side": "long" if p["side"] > 0 else "short", "entry": p.get("entry"),
                "unrealized_pct": round(p["side"] * (prices[coin] - p["entry"]) / p["entry"] * 100, 2)
@@ -202,6 +231,9 @@ def build_memory(state: dict, prices: dict, n_trades: int = 8,
         "recent_closed_trades": recent_trades,
         "recent_decision_rounds": recent_decisions,
         "conviction_calibration": calibration or "insufficient history",
+        "win_rate_by_coin": win_by_coin or "insufficient history",
+        "win_rate_by_action": win_by_action or "insufficient history",
+        "worst_trades": worst_trades,
     }
 
 
@@ -241,6 +273,7 @@ def _close(state: dict, coin: str, price: float, ts: str, reason: str) -> dict:
            "pnl_pct": round(ret * 100, 3), "reason": reason,
            "entry_conviction": pos.get("entry_conviction"),
            "entry_signal": pos.get("entry_signal", ""),
+           "entry_reasoning": pos.get("entry_reasoning", ""),
            "equity_after": round(state["equity"], 2)}
     state["closed"].append(rec)
     return rec

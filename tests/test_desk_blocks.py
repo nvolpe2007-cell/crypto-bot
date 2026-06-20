@@ -24,6 +24,38 @@ def test_risk_label_risk_on_off_mixed():
 
 # ── slow volume flow (poor-man's CVD) ────────────────────────────────────────
 
+def test_verdict_tag_maps_proof_verdicts():
+    assert db._verdict_tag("PROVEN ✓ exp=...") == "PROVEN"
+    assert db._verdict_tag("PROVEN (single) — NOT family-wise robust") == "PROVEN_single_not_robust"
+    assert db._verdict_tag("FANTASY (not executable...)") == "FANTASY"
+    assert db._verdict_tag("FAILED — negative expectancy") == "FAILED"
+    assert db._verdict_tag("NOT PROVEN — only 5 trades") == "NOT_PROVEN"
+
+
+def test_swing_attribution_from_state(tmp_path):
+    import json
+    state = {"closed": [
+        {"symbol": "BTC", "pnl": 2.0}, {"symbol": "BTC", "pnl": -1.0},
+        {"symbol": "ETH", "pnl": 3.0},
+    ]}
+    p = tmp_path / "swing.json"
+    p.write_text(json.dumps(state))
+    out = db.swing_attribution(p)
+    assert out["BTC"] == {"trades": 2, "win_rate": 0.5, "net_usd": 1.0}
+    assert out["ETH"]["win_rate"] == 1.0
+    assert "note" in out
+
+
+def test_swing_attribution_missing_file_is_empty(tmp_path):
+    assert db.swing_attribution(tmp_path / "nope.json") == {}
+
+
+def test_proof_and_session_blocks_failsafe():
+    # No live ledgers in the test env → both must return a dict and never raise.
+    assert isinstance(db.proof_status(), dict)
+    assert isinstance(db.session_edge(), dict)
+
+
 def test_buy_pressure_all_up_volume_is_positive():
     closes = [10, 11, 12, 13, 14]       # every day up
     vols = [100, 100, 100, 100, 100]
@@ -104,5 +136,10 @@ def test_build_desk_blocks_drops_empty_blocks(monkeypatch):
     monkeypatch.setattr(db, "BLOCK_CROSS_ASSET", False)
     monkeypatch.setattr(db, "BLOCK_FLOW", True)
     monkeypatch.setattr(db, "BLOCK_RISK", False)
+    # the file-backed blocks read the repo's own ledgers; disable them here so the
+    # test isolates the "enabled block with no data → dropped" behaviour.
+    monkeypatch.setattr(db, "BLOCK_PROOF", False)
+    monkeypatch.setattr(db, "BLOCK_SESSION", False)
+    monkeypatch.setattr(db, "BLOCK_SWING", False)
     # flow with no usable data → empty → dropped entirely
     assert db.build_desk_blocks({"BTC": [{"x": 1}]}, {}, {}) == {}
