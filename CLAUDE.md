@@ -94,16 +94,26 @@ set both 0 to restore the old borrow-free optimistic baseline. Without this the 
 charged only a flat entry cost and no carry, inflating the aggressive arm's microcap
 shorts. **Kraken arm (aggressive maker-only config):**
 `FUNDING_ARB_KRAKEN_COST_FRAC` (default 0.0054, maker-only),
-`FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 6),
+`FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (cost-payback gate, default **4** —
+tightened from 6 on 2026-06-19 for selectivity),
 `FUNDING_ARB_KRAKEN_MAX_APY` (cap, default 300),
 `FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 100; arm is
 `max_positions=1`), `FUNDING_ARB_KRAKEN_SYMBOLS` (base-symbol whitelist, default
 = MAJOR_SYMBOLS; restricts the arm to liquid Kraken-majors so it stops chasing
 microcaps), `FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES` (persistence
 gate, default 2; 0 disables), `FUNDING_ARB_KRAKEN_MAX_FLIPS` (serial-flipper
-blacklist, default 6). Funding-history tracker (`arbitrage/funding_history.py`,
-`data/funding_history.json`) tuned via `FUNDING_HISTORY_RETENTION_DAYS`/
-`_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`. See memory `funding_arb_kraken_bleed`.
+blacklist, default 6). **Deleveraging-regime veto (2026-06-19):**
+`FUNDING_ARB_REGIME_VETO_FRAC` (per-arm `regime_veto_frac`; the Kraken arm sets it
+via `FUNDING_ARB_KRAKEN_REGIME_VETO`, default **0.6**) pauses NEW entries for a tick
+when the share of observed liquid majors with NEGATIVE funding ≥ this (the carry
+complex inverting = the fear/deleveraging regime this arm bled in); exits continue.
+Fail-open below `FUNDING_ARB_REGIME_VETO_MIN_MAJORS` (default 5) distinct majors.
+The Kraken arm was **re-armed** 2026-06-19 (`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 25→40)
+as a MEASURED forward test, justified by this regime veto + tighter breakeven — the
+honest −$28 stays on the books; proof_scorecard judges whether the protections work.
+Funding-history tracker (`arbitrage/funding_history.py`, `data/funding_history.json`)
+tuned via `FUNDING_HISTORY_RETENTION_DAYS`/`_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`.
+See memory `funding_arb_kraken_bleed`.
 
 ## Session-filter env knobs (no code change)
 Time-of-day gate (`src/session_filter.py`): `SESSION_MIN_SAMPLES` (default 20 — below this a
@@ -122,9 +132,10 @@ or the flag file `data/KILL_SWITCH` (live-toggleable: `ssh … "touch
 /opt/crypto-bot/data/KILL_SWITCH"` to stop, `rm` to resume; no restart). Fails OPEN.
 **Per-arm funding loss cap** (`FundingArbPaperSim.max_drawdown_usd`): an arm halts new
 entries once its cumulative net ≤ -cap (alert once on engage + on resume). Defaults:
-`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 25 (lowered from 40 on 2026-06-13 to retire the
-arm: realized net ~-$28 trips this immediately → no new entries; negative EV +
-funding-arb dead in the fear regime; re-arm by raising it), `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
+`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` **40** (was lowered 40→25 on 2026-06-13 to retire the
+arm after a ~-$28 bleed; **re-armed back to 40 on 2026-06-19** now that the deleveraging
+regime veto + tighter breakeven address the regime-driven bleed — a measured forward
+test, the −$28 stays on the books), `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
 `FUNDING_ARB_MAX_DRAWDOWN` 0 (aggressive/fantasy baseline left uncapped); 0 disables.
 **Global funding cap** `FUNDING_ARB_GLOBAL_MAX_DRAWDOWN` (default 0/off): when the 3
 arms' combined net breaches it, the merge loop engages the master kill. The directional
