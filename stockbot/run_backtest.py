@@ -35,6 +35,10 @@ def main() -> int:
     ap.add_argument("--target-r", type=float, default=2.0,
                     help="R-multiple target; <=0 means ride to the close")
     ap.add_argument("--cost-bps", type=float, default=2.0, help="per-side spread+slippage")
+    ap.add_argument("--telegram", action="store_true",
+                    help="post the result to Telegram (needs STOCKBOT_TELEGRAM=1 + token/chat)")
+    ap.add_argument("--capital", type=float, default=None,
+                    help="notional $ to translate net %% into $ in the Telegram post")
     args = ap.parse_args()
 
     if args.synthetic:
@@ -66,6 +70,15 @@ def main() -> int:
     print("  • Costs modelled as spread+slippage only; real fills, halts, gaps differ.")
     print("  • Live US day-trading <$25k equity is capped by the PDT rule (3/5 days).")
     print("  • This is paper/sim. No broker is connected.")
+
+    if args.telegram:
+        from .notify import post, format_report, enabled
+        if not enabled():
+            print("\n[telegram] --telegram set but STOCKBOT_TELEGRAM is not enabled "
+                  "(export STOCKBOT_TELEGRAM=1 + TELEGRAM_BOT_TOKEN + chat id).")
+        else:
+            ok = post(format_report(sym, s, trades, capital=args.capital))
+            print(f"\n[telegram] {'posted stock P&L' if ok else 'post failed (check token/chat)'}")
     return 0
 
 
