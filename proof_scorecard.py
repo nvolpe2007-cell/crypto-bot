@@ -352,6 +352,31 @@ def _brain_forward() -> dict | None:
     return dict(label='AI brain discretionary (FORWARD, paper)', executable=True, **s)
 
 
+def _microstructure_forward() -> dict | None:
+    """Maker-only microstructure scalper forward record (the OFI+CVD+OBI gate on
+    real Kraken tick data, post-only fills). The 90-day re-test of the engine that
+    previously FAILED at taker cost on 2s-REST snapshots — judged on the SAME bar.
+    Clustered by ENTRY-MINUTE (scalper trades within a minute are highly correlated,
+    so they aren't independent bets). Executable: maker-only LONGS on Kraken spot are
+    US-retail-executable (short trades, if any, would not be)."""
+    path = DATA / 'micro_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _minute(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(float(p.get('entry_ts'))))
+            return dt.strftime('%Y-%m-%dT%H:%M')
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_minute(p) for p in closed])
+    return dict(label='Microstructure maker-only (FORWARD, Kraken tick)',
+                executable=True, **s)
+
+
 def _lev_perp_forward() -> dict | None:
     """Leveraged perp arm forward record (lev_perp_paper.py): opens a 3x perp in the
     trend direction and exits on a FIXED TAKE-PROFIT ('sell in profit'), with a
@@ -552,6 +577,7 @@ def main():
         _tsmom_ls_forward(),
         _brain_forward(),
         _regime_forward(),
+        _microstructure_forward(),
         _lev_perp_forward(),
         _pairs_forward(),
         _directional(),

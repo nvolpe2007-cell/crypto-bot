@@ -88,3 +88,22 @@ def test_verdict_clears_family_bar():
 def test_verdict_below_t_min_not_proven():
     v = ps._verdict(_arm(1.5), t_family=2.5, k=6)
     assert v.startswith('NOT PROVEN')
+
+
+# ── microstructure maker-only forward arm ─────────────────────────────────────
+
+def test_microstructure_forward_missing_file_is_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(ps, 'DATA', tmp_path)
+    assert ps._microstructure_forward() is None
+
+
+def test_microstructure_forward_reads_state(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(ps, 'DATA', tmp_path)
+    (tmp_path / 'micro_paper_state.json').write_text(json.dumps({"closed": [
+        {"entry_ts": 1718000000, "exit_ts": 1718000060, "pnl": 0.5},
+        {"entry_ts": 1718000400, "exit_ts": 1718000460, "pnl": -0.3},
+    ]}))
+    a = ps._microstructure_forward()
+    assert a is not None and a['n'] == 2 and a['executable'] is True
+    assert 'maker-only' in a['label']

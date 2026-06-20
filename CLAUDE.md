@@ -181,6 +181,24 @@ only train on the shelved negative-EV directional journal (empty OFI/lead-lag fe
 them would teach the losing scalper's patterns. Revisit only after retargeting ML to a strategy
 that actually trades + full-feature labeled data. See memory `trade_brain`.
 
+## Maker-only microstructure (OFI+CVD+OBI on Kraken) — 90-day re-test (foundation)
+Re-testing the microstructure scalper (FAILED before at t≈−8.82 with TAKER cost on 2s-REST +
+candle-CVD) under a legitimately different hypothesis: **real Kraken tick data + maker-only
+fills**. Foundation landed (core mechanisms, unit-tested; live-loop wiring is the next stage):
+- **Honest maker fill model** (`src/maker_fill.py`): a resting post-only limit fills ONLY when
+  the tape trades THROUGH it (taker sell ≤ our bid / taker buy ≥ our ask), else cancels on
+  timeout = **no trade**; adverse selection emerges naturally; maker fee, no spread-cross.
+  Knobs `MAKER_FEE_SPOT` (0.0025), `MAKER_FILL_TIMEOUT_SECS` (30).
+- **Tick CVD** (`src/cvd_tracker.TickCVDTracker`): real signed-volume CVD from `KrakenTradeFeed`
+  (currently only → VPIN), replacing the candle Kaufman proxy; emits the same `CVDState`.
+- **OBI** (`src/orderflow_ws.obi_from_book`): pure top-of-book imbalance helper for the gate.
+- **Proof arm** `proof_scorecard._microstructure_forward()` (reads `data/micro_paper_state.json`,
+  entry-minute clustered, executable=maker-only-longs-on-spot). **Do NOT expand to other
+  exchanges until this arm reads PROVEN ✓ over ≥90 days.** (The Bybit parallel client is that
+  post-proof "expand" step.) NEXT STAGE (needs on-VPS WS testing): fan `KrakenTradeFeed` out to
+  CVD, wire OBI from `KrakenBookFeed`, route the live micro path through the maker model, record
+  to the separate `data/micro_paper_state.json`.
+
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
 
