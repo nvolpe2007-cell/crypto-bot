@@ -31,6 +31,18 @@ python -m stockbot.run_backtest --csv SPY_5m.csv --symbol SPY --or-minutes 15 --
 python -m stockbot.run_backtest --yf SPY --interval 5m --period 60d
 ```
 
+## Post results to Telegram
+`stockbot` has its **own** Telegram poster (independent of the crypto bot — the crypto
+`CRYPTO_TELEGRAM_MUTE` does not affect it):
+```bash
+export STOCKBOT_TELEGRAM=1
+export TELEGRAM_BOT_TOKEN=...           # can be the same bot as crypto
+export STOCKBOT_TELEGRAM_CHAT_ID=...    # falls back to TELEGRAM_CHAT_ID
+python -m stockbot.run_backtest --yf SPY --interval 5m --period 60d --telegram --capital 10000
+```
+`--telegram` posts the P&L summary + verdict; `--capital` translates net % into $.
+For a recurring post, cron the command.
+
 ## What you get
 A scorecard per run: trade count, net-of-cost expectancy, win rate, **t-stat**,
 per-trade Sharpe, max drawdown, profit factor, and a verdict against the bar

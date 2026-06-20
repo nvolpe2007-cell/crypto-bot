@@ -225,7 +225,11 @@ change), so it can't alter any in-flight proof until deliberately enabled; wired
 sites in `paper_trading.py` via `regime_persist.update(sym, regime_detector.detect(...))`.
 
 ## Telegram
-Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
+Buy/sell/error + funding-arb alerts → chat ID `7553694317`. **Global mute:**
+`CRYPTO_TELEGRAM_MUTE=1` silences EVERY crypto alert at the single `send_message`
+chokepoint while the bot keeps trading normally (set it in the VPS `.env` + restart).
+The `stockbot/` project posts via its OWN independent notifier (`STOCKBOT_TELEGRAM=1`,
+`stockbot/notify.py`), so muting crypto does not affect stock posts and vice-versa.
 
 ## Status
 - Paper mode. Scalper idle in low volatility (by design). Funding arms active.
