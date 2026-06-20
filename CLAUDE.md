@@ -199,6 +199,16 @@ fills**. Foundation landed (core mechanisms, unit-tested; live-loop wiring is th
   CVD, wire OBI from `KrakenBookFeed`, route the live micro path through the maker model, record
   to the separate `data/micro_paper_state.json`.
 
+## Volatility-target sizing (no code change)
+`src/vol_sizing.py` adds realized-vol (inverse-vol) position sizing — the strongest-proven
+sizing edge (vol targeting; ~Sharpe 0.99→1.54 in research). Multiplier =
+clamp(`VOL_TARGET_ATR_PCT`/realized_atr_pct, `VOL_SIZE_FLOOR`, `VOL_SIZE_CAP`) (defaults
+0.004 / 0.5 / 1.5), applied on the DIRECTIONAL main-loop sizing beside the IV monitor
+(`CryptoVolMonitor` covers only BTC/ETH → alts previously sized flat; this covers all
+symbols from the ATR already computed). `VOL_TARGET_SIZING=0` disables. Deliberately NOT
+applied to the swing/funding/brain forward-tests — their pre-registered proofs assume
+uniform sizing, so changing it mid-flight would corrupt an in-progress 90-day proof.
+
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
 
