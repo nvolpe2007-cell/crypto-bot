@@ -48,6 +48,24 @@ A scorecard per run: trade count, net-of-cost expectancy, win rate, **t-stat**,
 per-trade Sharpe, max drawdown, profit factor, and a verdict against the bar
 **`n≥30 & expectancy>0 & t>2`**.
 
+## Live PAPER trading on Alpaca (optional)
+The same ORB edge, placing **paper** orders via Alpaca (no real money). Get **free
+paper keys** from the Alpaca dashboard (toggle to *Paper Trading* → *Generate API
+Keys*), then:
+```bash
+pip install alpaca-py
+export ALPACA_API_KEY=...  ALPACA_API_SECRET=...  ALPACA_PAPER=1
+export STOCKBOT_SYMBOLS=SPY,QQQ  STOCKBOT_NOTIONAL=2000  STOCKBOT_TARGET_R=2
+export STOCKBOT_TELEGRAM=1  TELEGRAM_BOT_TOKEN=...  STOCKBOT_TELEGRAM_CHAT_ID=...
+# run on a schedule during market hours (e.g. cron every 5 min, 9:30–16:00 ET):
+python -m stockbot.live_paper
+```
+Each run: after the opening range and before the cutoff, takes **at most one trade
+per symbol per day** on a breakout — a market entry with a **server-side bracket**
+(stop + target), so a missed run can't strand a position — flattens at the close,
+and posts the day's P&L to Telegram. **Fail-safe:** no keys / no `alpaca-py` → it
+no-ops (no orders). **Verify everything in your Alpaca paper dashboard.**
+
 ## The honesty bar (read before trusting anything)
 - A passing backtest is **IN-SAMPLE**. It is necessary, not sufficient. Before real
   money: **walk-forward / out-of-sample**, and a correction for **how many parameter
