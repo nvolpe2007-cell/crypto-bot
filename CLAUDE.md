@@ -215,6 +215,15 @@ symbols from the ATR already computed). `VOL_TARGET_SIZING=0` disables. Delibera
 applied to the swing/funding/brain forward-tests — their pre-registered proofs assume
 uniform sizing, so changing it mid-flight would corrupt an in-progress 90-day proof.
 
+## Regime persistence (whipsaw filter — opt-in, no code change)
+`src/regime_detector.PersistentRegime` wraps the raw `RegimeResult` stream: a NEW regime must
+hold for `REGIME_PERSIST_BARS` consecutive bars before the stable label flips (the Statistical
+Jump Model result — penalising switches is what makes regime detection beat buy-and-hold net of
+costs). **CRASH is exempt** (risk-off engages immediately). Per-symbol state; held label carries
+the current bar's metrics. **Default `REGIME_PERSIST_BARS=0` → passthrough** (zero behaviour
+change), so it can't alter any in-flight proof until deliberately enabled; wired at the 3 regime
+sites in `paper_trading.py` via `regime_persist.update(sym, regime_detector.detect(...))`.
+
 ## Telegram
 Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
 
