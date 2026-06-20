@@ -268,6 +268,21 @@ class KrakenPerpsExecutor(Executor):
                                amount, 0.0, is_leveraged=True, leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] close_long failed: {e}")
+            # The exception may be an ambiguous timeout where the order actually
+            # filled on the exchange before the response was lost. If we leave
+            # _open_size untouched, a caller that doesn't retry treats this as
+            # still-open forever even though it's flat — same ghost-position
+            # risk open_long/open_short already guard against.
+            net = self._reconcile_position(symbol)
+            if net is not None and net <= 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_long errored but exchange confirms {symbol} "
+                    f"is no longer long (net={net:.6f}); the close went through "
+                    f"despite the error. Updating local state."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, amount, 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_short(self, symbol, price, timestamp, reason=""):
@@ -283,6 +298,18 @@ class KrakenPerpsExecutor(Executor):
                                amount, 0.0, is_leveraged=True, leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] close_short failed: {e}")
+            # See close_long: confirm with the exchange in case the close
+            # actually went through despite the exception (ambiguous timeout).
+            net = self._reconcile_position(symbol)
+            if net is not None and net >= 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_short errored but exchange confirms {symbol} "
+                    f"is no longer short (net={net:.6f}); the close went through "
+                    f"despite the error. Updating local state."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, amount, 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
 
