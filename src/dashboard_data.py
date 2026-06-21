@@ -35,6 +35,9 @@ _DISPLAY_NAMES = {
     "swing_paper": "swing (4h majors)",
     "tsmom_ls": "tsmom L/S",
     "tsmom_paper": "tsmom_50",
+    "allocator": "allocator (meta)",
+    "regime_arm": "regime_arm",
+    "tsmom_fast": "tsmom_fast",
 }
 
 
