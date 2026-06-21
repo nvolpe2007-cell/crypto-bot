@@ -188,8 +188,19 @@ def collect_tournament(data_dir: str | None = None, top: int = 30) -> dict[str, 
     }
 
 
+def collect_readiness(data_dir: str | None = None) -> list[dict[str, Any]]:
+    """Per-arm 'when do we switch this on' view, precomputed by the allocator runner
+    into allocator_state.json (keeps this stdlib module dependency-free). Empty until
+    the allocator has run once."""
+    dd = _data_dir(data_dir)
+    d = _load_json(os.path.join(dd, "allocator_state.json"))
+    if d is None:
+        return []
+    return d.get("readiness") or []
+
+
 def snapshot(data_dir: str | None = None) -> dict[str, Any]:
-    """Full dashboard payload: arms + attribution + tournament + portfolio totals."""
+    """Full dashboard payload: arms + attribution + tournament + readiness + totals."""
     arms = collect_arms(data_dir)
     attrib = collect_attribution(data_dir)
     total_equity = round(sum(a["equity"] for a in arms), 2)
@@ -198,6 +209,7 @@ def snapshot(data_dir: str | None = None) -> dict[str, Any]:
         "arms": arms,
         "attribution": attrib,
         "tournament": collect_tournament(data_dir),
+        "readiness": collect_readiness(data_dir),
         "totals": {
             "equity": total_equity,
             "start": total_start,

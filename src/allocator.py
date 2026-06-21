@@ -99,7 +99,7 @@ def read_arm_record(data_dir: str, fname: str, gran: str) -> dict | None:
         return None
     closed = d.get("closed") or []
     closed = sorted(closed, key=lambda p: p.get("exit_ts") or "") if isinstance(closed, list) else []
-    nets, clusters = [], []
+    nets, clusters, entry_ts = [], [], []
     for p in closed:
         if not isinstance(p, dict):
             continue
@@ -111,9 +111,14 @@ def read_arm_record(data_dir: str, fname: str, gran: str) -> dict | None:
         except (TypeError, ValueError):
             continue
         clusters.append(_iso(p.get("entry_ts"), gran))
+        try:
+            entry_ts.append(int(float(p.get("entry_ts"))))
+        except (TypeError, ValueError):
+            pass
     equity = float(d.get("equity_mtm") if d.get("equity_mtm") is not None else d.get("equity") or 0.0)
     start = float(d.get("starting_equity") or 0.0)
-    return {"nets": nets, "clusters": clusters, "equity": equity, "start": start}
+    return {"nets": nets, "clusters": clusters, "equity": equity, "start": start,
+            "entry_ts": sorted(entry_ts)}
 
 
 def score_arms(data_dir: str, cfg: AllocConfig | None = None) -> list[dict]:
@@ -165,6 +170,58 @@ def target_weights(scored: list[dict], regime: str | None, cfg: AllocConfig) -> 
     if s > gross and s > 0:
         weights = {n: w * gross / s for n, w in weights.items()}
     return {n: round(w, 4) for n, w in weights.items() if w > 1e-4}
+
+
+N_MIN_TRADES = 30  # the proof-bar sample floor (matches proof_scorecard.N_MIN)
+
+
+def switch_readiness(data_dir: str, cfg: AllocConfig | None = None) -> list[dict]:
+    """Per-arm 'how close is this to being switched on, and when' — the human view
+    of the proof gate. For each arm: its trade count vs the n>=30 floor, whether its
+    edge is positive, its clustered-t vs the family bar, an ETA to n>=30 at its
+    observed trade pace, and a plain-language status. Sorted most-ready first.
+
+    The honest split this surfaces:
+      • positive edge, n<30  → TIME switches it on (ETA shown).
+      • negative edge        → time will NEVER switch it on; needs a better strategy.
+    """
+    cfg = cfg or AllocConfig()
+    scored = score_arms(data_dir, cfg)
+    fmap = {n: f for n, f, _g, _e, _fam in ARMS}
+    gmap = {n: g for n, _f, g, _e, _fam in ARMS}
+    out = []
+    for a in scored:
+        rec = read_arm_record(data_dir, fmap[a["name"]], gmap.get(a["name"], "week"))
+        ts = (rec or {}).get("entry_ts") or []
+        span_wk = (ts[-1] - ts[0]) / 604800.0 if len(ts) >= 2 else 0.0
+        cadence = round(a["n"] / span_wk, 2) if span_wk > 0.2 else 0.0
+        to_n = max(0, N_MIN_TRADES - a["n"])
+        positive = a["expectancy"] > 0
+        eta_days = None
+        if a["proven"]:
+            status = "PROVEN — eligible to fund"
+        elif a["n"] >= 3 and not positive:
+            status = "losing — needs a better edge, not more time"
+        elif a["n"] == 0:
+            status = "no closed trades yet"
+        elif positive and to_n == 0:
+            status = "edge holding — at the t-bar now"
+        elif positive and cadence > 0:
+            eta_days = int(round(to_n / cadence * 7))
+            status = f"on track — {to_n} more trades to prove it"
+        elif positive:
+            status = f"positive so far — {to_n} more trades to prove it"
+        else:
+            status = "building sample"
+        out.append({
+            "name": a["name"], "family": a["family"], "executable": a["executable"],
+            "n": a["n"], "need_more": to_n, "expectancy": a["expectancy"],
+            "t_clustered": a["t_clustered"], "t_bar": a["t_family"],
+            "positive": positive, "proven": a["proven"],
+            "cadence_wk": cadence, "eta_days": eta_days, "status": status,
+        })
+    out.sort(key=lambda r: (not r["proven"], not r["positive"], r["need_more"], -r["t_clustered"]))
+    return out
 
 
 @dataclass
