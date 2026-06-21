@@ -1,0 +1,21 @@
+[Unit]
+# Live web dashboard for the crypto-bot (read-only view of every paper arm +
+# the strategy tournament). Standalone — does NOT touch the crypto-bot service.
+Description=crypto-bot live dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-bot
+# Reads the same data/ the live bot writes; serves on loopback only (view via
+# SSH tunnel: ssh -L 8787:127.0.0.1:8787 crypto-bot-vps). Set DASHBOARD_HOST=0.0.0.0
+# in an override only if you intend LAN exposure (and firewall the port).
+Environment=DASHBOARD_DATA_DIR=/opt/crypto-bot/data
+Environment=DASHBOARD_HOST=127.0.0.1
+Environment=DASHBOARD_PORT=8787
+ExecStart=/usr/bin/python3 /opt/crypto-bot/scripts/dashboard_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
