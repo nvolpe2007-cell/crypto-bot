@@ -157,6 +157,25 @@ def test_snapshot_includes_tournament_key(data_dir):
     assert "tournament" in snap
 
 
+def test_collect_readiness_absent_is_empty(data_dir):
+    assert dd.collect_readiness(data_dir) == []
+
+
+def test_collect_readiness_reads_from_allocator_state(data_dir):
+    payload = {"starting_equity": 1000, "equity": 1000,
+               "readiness": [{"name": "pairs", "n": 3, "need_more": 27, "positive": True,
+                              "proven": False, "status": "on track"}]}
+    with open(os.path.join(data_dir, "allocator_state.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    rd = dd.collect_readiness(data_dir)
+    assert len(rd) == 1 and rd[0]["name"] == "pairs" and rd[0]["need_more"] == 27
+
+
+def test_snapshot_includes_readiness_key(data_dir):
+    _write_state(data_dir, "a", start=1000, equity=1000)
+    assert "readiness" in dd.snapshot(data_dir)
+
+
 def test_snapshot_totals(data_dir):
     _write_state(data_dir, "a", start=1000, equity=1100, positions={"BTC": {}})
     _write_state(data_dir, "b", start=1000, equity=950)

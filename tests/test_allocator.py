@@ -151,6 +151,45 @@ def test_allocator_state_roundtrip():
     assert b.equity == pytest.approx(a.equity)
 
 
+def test_read_arm_record_exposes_entry_ts(data_dir):
+    _write_arm(data_dir, "swing_paper_state.json", [1.0, 2.0], week0=1_700_000_000)
+    rec = AL.read_arm_record(data_dir, "swing_paper_state.json", "week")
+    assert rec["entry_ts"] == [1_700_000_000, 1_700_000_000 + 604800]
+
+
+def test_switch_readiness_negative_arm_flagged_needs_edge(data_dir):
+    _write_arm(data_dir, "swing_paper_state.json", [-1.0 - (i % 3) * 0.1 for i in range(10)])
+    rd = {r["name"]: r for r in AL.switch_readiness(data_dir)}
+    assert rd["swing"]["positive"] is False
+    assert "edge" in rd["swing"]["status"]
+    assert rd["swing"]["eta_days"] is None  # time won't help a losing arm
+
+
+def test_switch_readiness_positive_low_n_has_eta(data_dir):
+    # 5 positive trades, one per week → cadence ~1/wk, needs 25 more → ETA set
+    _write_arm(data_dir, "pairs_paper_state.json", [2.0, 2.1, 1.9, 2.0, 2.2])
+    rd = {r["name"]: r for r in AL.switch_readiness(data_dir)}
+    p = rd["pairs"]
+    assert p["positive"] is True
+    assert p["need_more"] == 25
+    assert p["eta_days"] is not None and p["eta_days"] > 0
+
+
+def test_switch_readiness_proven_arm_eligible(data_dir):
+    _write_arm(data_dir, "swing_paper_state.json", [1.0 + (i % 3) * 0.05 for i in range(35)])
+    rd = {r["name"]: r for r in AL.switch_readiness(data_dir)}
+    assert rd["swing"]["proven"] is True
+    assert "PROVEN" in rd["swing"]["status"]
+
+
+def test_switch_readiness_sorted_proven_then_positive_first(data_dir):
+    _write_arm(data_dir, "swing_paper_state.json", [-2.0] * 10)            # losing
+    _write_arm(data_dir, "pairs_paper_state.json", [2.0, 2.1, 1.9, 2.0])   # positive small-n
+    rd = AL.switch_readiness(data_dir)
+    names = [r["name"] for r in rd]
+    assert names.index("pairs") < names.index("swing")  # positive ranks above losing
+
+
 def test_to_state_has_dashboard_shape(data_dir):
     a = MetaAllocator(cfg=AllocConfig())
     a.update([_scored(proven=False)], "RANGING")
