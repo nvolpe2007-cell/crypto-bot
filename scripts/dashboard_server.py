@@ -66,6 +66,13 @@ _PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <table id="attrib"><thead><tr>
  <th>arm</th><th>fills</th><th>gross</th><th>fees</th><th>slippage</th><th>net</th>
 </tr></thead><tbody></tbody></table>
+<h2>Switch readiness — when does the allocator fund an arm?</h2>
+<div class="sub">An arm gets capital only when it has <b>≥30 closed trades</b> (enough to trust),
+ a <b>positive average</b>, and a t-stat over the family bar. "needs N more trades" = how
+ far from the 30-trade floor. Negative arms can't be fixed by waiting.</div>
+<table id="ready"><thead><tr>
+ <th>arm</th><th>trades (n)</th><th>need</th><th>avg/trade</th><th>t-stat</th><th>bar</th><th>status</th><th>ETA</th>
+</tr></thead><tbody></tbody></table>
 <h2 id="tourhdr">Strategy tournament</h2>
 <div class="sub" id="toursub"></div>
 <table id="tour"><thead><tr>
@@ -97,6 +104,23 @@ async function tick(){
   '<td class="neg">'+money(a.fees)+'</td><td class="neg">'+money(a.slippage)+'</td>'+
   '<td class="'+cls(a.net)+'">'+money(a.net)+'</td></tr>').join(''):
   '<tr><td colspan=6 class="muted">no executed fills logged yet</td></tr>';
+ // switch readiness
+ const rd=d.readiness||[];
+ document.querySelector('#ready tbody').innerHTML=rd.length?rd.map(r=>{
+  let cl=r.proven?'pos':r.positive?'':'neg';
+  let pill=r.proven?'<span class="pill promo">PROVEN</span>':
+    r.positive?'<span class="pill">'+r.status+'</span>':
+    '<span class="pill bad">'+r.status+'</span>';
+  let eta=r.eta_days!=null?('~'+(r.eta_days>=14?Math.round(r.eta_days/7)+' wk':r.eta_days+' d')):
+    (r.proven?'now':'—');
+  let lo=r.executable?'':' <span class="pill" style="background:#3d2a15;color:#e0a458">perp</span>';
+  return '<tr><td>'+r.name+lo+'</td><td>'+r.n+'</td>'+
+   '<td>'+(r.need_more>0?'+'+r.need_more:'✓')+'</td>'+
+   '<td class="'+cls(r.expectancy)+'">'+(r.expectancy>=0?'+':'')+r.expectancy.toFixed(2)+'</td>'+
+   '<td class="'+cls(r.t_clustered)+'">'+r.t_clustered.toFixed(2)+'</td>'+
+   '<td class="muted">'+r.t_bar.toFixed(2)+'</td>'+
+   '<td style="text-align:left">'+pill+'</td><td>'+eta+'</td></tr>';}).join(''):
+  '<tr><td colspan=8 class="muted">allocator has not run yet — run scripts/run_allocator.py</td></tr>';
  // tournament
  const tr=d.tournament||{},s=tr.summary||{};
  if(tr.candidates&&tr.candidates.length){

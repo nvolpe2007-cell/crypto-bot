@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.allocator import AllocConfig, MetaAllocator, score_arms  # noqa: E402
+from src.allocator import AllocConfig, MetaAllocator, score_arms, switch_readiness  # noqa: E402
 
 DATA_DIR = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -90,7 +90,9 @@ def main() -> None:
     if args.dry:
         print("\n[dry] not written.")
         return
-    _atomic_write(STATE, alloc.to_state())
+    state = alloc.to_state()
+    state["readiness"] = switch_readiness(DATA_DIR, cfg)  # human "when do we switch" view
+    _atomic_write(STATE, state)
     print(f"\nwrote {STATE}")
 
 
