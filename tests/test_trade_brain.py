@@ -453,3 +453,50 @@ def test_own_book_summary_uses_mtm_and_pnl(tmp_path):
     s = bo._own_book_summary(p, "AI Brain")
     assert s["equity_mtm"] == 944.71 and s["pnl"] == -55.29   # MTM preferred over realized
     assert s["open_positions"][0]["dir"] == "short"
+
+
+# ── curated knowledge base injected as a second cached system block ───────────
+
+def test_system_blocks_includes_knowledge_when_enabled(monkeypatch):
+    monkeypatch.setenv("BRAIN_KNOWLEDGE", "1")
+    blocks = tb._system_blocks()
+    assert len(blocks) == 2
+    assert all(b["cache_control"]["type"] == "ephemeral" for b in blocks)
+    assert "GRAVEYARD" in blocks[1]["text"] or "graveyard" in blocks[1]["text"].lower()
+
+
+def test_system_blocks_omits_knowledge_when_disabled(monkeypatch):
+    monkeypatch.setenv("BRAIN_KNOWLEDGE", "0")
+    blocks = tb._system_blocks()
+    assert len(blocks) == 1
+
+
+def test_decide_passes_two_system_blocks(monkeypatch):
+    monkeypatch.setenv("BRAIN_KNOWLEDGE", "1")
+    brain = tb.TradeBrain(client=_FakeClient([_dec("BTC", "long")]))
+    brain.decide({"BTC": {"price": 1.0}}, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert len(brain._client.last_kwargs["system"]) == 2
+
+
+# ── enriched memory loop (build_memory) ──────────────────────────────────────
+
+def test_build_memory_breaks_down_by_coin_action_and_worst():
+    state = {
+        "starting_equity": 1000, "equity": 1000, "equity_curve": [],
+        "positions": {},
+        "closed": [
+            {"symbol": "BTC", "side": 1, "pnl": 5.0, "entry_conviction": 8,
+             "entry_signal": "uptrend", "entry_reasoning": "above SMA50"},
+            {"symbol": "BTC", "side": -1, "pnl": -9.0, "entry_conviction": 7,
+             "entry_signal": "fade bounce", "entry_reasoning": "shorted a squeeze"},
+            {"symbol": "ETH", "side": 1, "pnl": 2.0, "entry_conviction": 6,
+             "entry_signal": "trend", "entry_reasoning": "momentum"},
+        ],
+    }
+    mem = bp.build_memory(state, {"BTC": 100.0, "ETH": 50.0})
+    assert mem["win_rate_by_coin"]["BTC"] == {"trades": 2, "win_rate": 0.5, "total_pnl": -4.0}
+    assert mem["win_rate_by_action"]["short"]["win_rate"] == 0.0
+    # worst trade surfaced with its losing thesis so the brain can name the lesson
+    assert mem["worst_trades"][0]["symbol"] == "BTC"
+    assert mem["worst_trades"][0]["pnl_usd"] == -9.0
+    assert "squeeze" in mem["worst_trades"][0]["lesson"]
