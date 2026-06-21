@@ -109,6 +109,57 @@ def test_apy_within_band_opens(tmp_path, monkeypatch):
     assert len(sim.open_positions) == 1
 
 
+# ── deleveraging-regime veto ──────────────────────────────────────────────────
+
+def _regime_sim(tmp_path, opps, monkeypatch, frac=0.6, min_majors=5):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "rv_state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=None,
+        regime_veto_frac=frac, regime_veto_min_majors=min_majors,
+        state_file=tmp_path / "rv_state.json", label="RV test")
+
+
+# A spread of majors mostly NEGATIVE (deleveraging) + one rich positive carry.
+_DELEVERAGING = [
+    _opp("ETHUSDT", 50.0),     # the rich positive carry that WOULD open
+    _opp("BTCUSDT", -10.0), _opp("SOLUSDT", -10.0), _opp("XRPUSDT", -10.0),
+    _opp("ADAUSDT", -10.0), _opp("DOGEUSDT", -10.0),
+]
+
+
+def test_deleveraging_regime_vetoes_new_entries(tmp_path, monkeypatch):
+    # 5/6 majors negative (83%) >= 0.6 threshold → veto; the rich ETH carry is paused.
+    sim = _regime_sim(tmp_path, _DELEVERAGING, monkeypatch)
+    assert sim._deleveraging_regime(_DELEVERAGING) is not None
+    sim._tick()
+    assert len(sim.open_positions) == 0
+
+
+def test_regime_veto_off_by_default_opens(tmp_path, monkeypatch):
+    # frac=0 (default) disables the veto → the rich carry opens as before.
+    sim = _regime_sim(tmp_path, _DELEVERAGING, monkeypatch, frac=0.0)
+    assert sim._deleveraging_regime(_DELEVERAGING) is None
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_regime_veto_failopen_on_thin_majors(tmp_path, monkeypatch):
+    # Only 2 majors observed (< min 5) → fail-open (no veto), entry opens.
+    opps = [_opp("ETHUSDT", 50.0), _opp("BTCUSDT", -10.0)]
+    sim = _regime_sim(tmp_path, opps, monkeypatch)
+    assert sim._deleveraging_regime(opps) is None
+    sim._tick()
+    assert len(sim.open_positions) == 1
+
+
+def test_regime_veto_clears_when_breadth_recovers(tmp_path, monkeypatch):
+    # Broadly POSITIVE majors → no veto even with frac on.
+    opps = [_opp("ETHUSDT", 50.0), _opp("BTCUSDT", 30.0), _opp("SOLUSDT", 30.0),
+            _opp("XRPUSDT", 30.0), _opp("ADAUSDT", 30.0), _opp("DOGEUSDT", 30.0)]
+    sim = _regime_sim(tmp_path, opps, monkeypatch)
+    assert sim._deleveraging_regime(opps) is None
+
+
 def _make_majors_sim(tmp_path, opps, monkeypatch):
     # Mirrors the deployed majors arm: Kraken Futures only (the executable venue)
     # at a realistic ~0.54% round-trip cost. See the realism fix in paper_trading.

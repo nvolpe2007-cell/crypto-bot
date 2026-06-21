@@ -845,3 +845,29 @@ class TestCreateNotifierFromEnv:
             os.environ.pop("TELEGRAM_ENABLED", None)
             notifier = create_notifier_from_env()
         assert not notifier.enabled
+
+
+# ── global crypto-Telegram mute (CRYPTO_TELEGRAM_MUTE) ────────────────────────
+
+class TestCryptoTelegramMute:
+    def test_mute_suppresses_even_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("CRYPTO_TELEGRAM_MUTE", "1")
+        n = TelegramNotifier("tok", "chat", enabled=True)
+        # must short-circuit BEFORE any HTTP call
+        with patch("requests.post", side_effect=AssertionError("should not POST when muted")):
+            assert n.send_message("hello") is False
+
+    def test_unmuted_still_sends(self, monkeypatch):
+        monkeypatch.delenv("CRYPTO_TELEGRAM_MUTE", raising=False)
+        n = TelegramNotifier("tok", "chat", enabled=True)
+        mock_resp = MagicMock(status_code=200)
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            assert n.send_message("hello") is True
+            assert mock_post.called
+
+    def test_mute_accepts_truthy_spellings(self, monkeypatch):
+        n = TelegramNotifier("tok", "chat", enabled=True)
+        for val in ("1", "true", "YES", "on"):
+            monkeypatch.setenv("CRYPTO_TELEGRAM_MUTE", val)
+            with patch("requests.post", side_effect=AssertionError("muted")):
+                assert n.send_message("x") is False

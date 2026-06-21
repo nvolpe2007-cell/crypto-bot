@@ -13,11 +13,12 @@ Regimes:
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -250,3 +251,56 @@ class RegimeDetector:
             return features.values
         except Exception:
             return None
+
+
+# ── Regime persistence (whipsaw filter) ──────────────────────────────────────
+# The strongest peer-reviewed regime result (Statistical Jump Model) is that the
+# thing which makes regime detection beat buy-and-hold NET OF COSTS is penalising
+# frequent switches — a bare classifier whipsaws and bleeds the cost wall. This
+# wraps the raw RegimeResult stream and only lets a NEW regime become "stable"
+# after it has been observed for REGIME_PERSIST_BARS consecutive bars; until then
+# the prior stable regime holds (its label, with the CURRENT bar's metrics). It
+# is OPT-IN: default 0 → passthrough (zero behaviour change), so it cannot alter
+# any in-flight forward-test/proof until deliberately enabled.
+REGIME_PERSIST_BARS = int(os.getenv("REGIME_PERSIST_BARS", "0"))
+
+
+class PersistentRegime:
+    """Per-symbol whipsaw filter over a RegimeResult stream.
+
+    update(key, result) returns the SMOOTHED RegimeResult: a new regime must hold
+    for `dwell` consecutive calls before it flips the stable label. dwell<=1 →
+    passthrough. CRASH is exempt — a risk-off regime engages IMMEDIATELY, never
+    delayed by the dwell (you don't postpone de-risking to avoid a whipsaw)."""
+
+    def __init__(self, dwell: int = REGIME_PERSIST_BARS):
+        self.dwell = dwell
+        self._state: Dict[str, dict] = {}
+
+    def update(self, key: str, result: Optional[RegimeResult]) -> Optional[RegimeResult]:
+        if result is None:
+            return None
+        if self.dwell <= 1:
+            return result                       # passthrough — no smoothing
+        st = self._state.get(key)
+        if st is None:                          # first observation seeds the stable regime
+            self._state[key] = {"stable": result, "cand": result.regime, "count": 0}
+            return result
+        if result.regime == "CRASH":            # risk-off: engage immediately
+            st["stable"], st["cand"], st["count"] = result, "CRASH", 0
+            return result
+        if result.regime == st["stable"].regime:  # confirms the stable regime
+            st["stable"], st["cand"], st["count"] = result, result.regime, 0
+            return result
+        # a different regime → accumulate confirmations for the candidate
+        if result.regime == st["cand"]:
+            st["count"] += 1
+        else:
+            st["cand"], st["count"] = result.regime, 1
+        if st["count"] >= self.dwell:           # confirmed → flip
+            st["stable"], st["count"] = result, 0
+            return result
+        # not yet confirmed → hold the prior stable LABEL but carry fresh metrics
+        held = st["stable"]
+        return RegimeResult(held.regime, result.confidence, result.adx, result.rsi,
+                            result.atr_pct, result.trend_slope, result.rsi_std)

@@ -4,6 +4,7 @@ Telegram Notifications — plain-English trade alerts.
 
 import html
 import logging
+import os
 import requests
 from typing import Optional
 from dataclasses import dataclass
@@ -151,6 +152,13 @@ class TelegramNotifier:
             logger.info(f"Telegram notifications enabled for chat {chat_id}")
 
     def send_message(self, message: str, parse_mode: str = "HTML") -> bool:
+        # Global crypto-Telegram mute: silences EVERY crypto alert (every send_*
+        # helper funnels through here) while the bot keeps trading normally. Set
+        # CRYPTO_TELEGRAM_MUTE=1 to go quiet without stopping the bot. Read per-call
+        # so it's a single, simple kill switch. (stockbot posts via its OWN
+        # independent notifier, so it is unaffected by this.)
+        if os.getenv("CRYPTO_TELEGRAM_MUTE", "").strip().lower() in ("1", "true", "yes", "on"):
+            return False
         if not self.enabled:
             logger.debug(f"Notification suppressed: {message[:50]}")
             return False
