@@ -164,8 +164,29 @@ def collect_attribution(data_dir: str | None = None) -> list[dict[str, Any]]:
     return out
 
 
+def collect_tournament(data_dir: str | None = None, top: int = 30) -> dict[str, Any]:
+    """Read the latest tournament leaderboard (data/tournament.json) if present.
+
+    Returns the multiple-testing summary + the top-N candidates by Sharpe. Empty
+    payload if the tournament hasn't run yet — the dashboard degrades gracefully.
+    """
+    dd = _data_dir(data_dir)
+    d = _load_json(os.path.join(dd, "tournament.json"))
+    if d is None:
+        return {"summary": {}, "candidates": [], "generated_at": None, "coins": []}
+    cands = d.get("candidates") or []
+    return {
+        "summary": d.get("summary") or {},
+        "candidates": cands[:top],
+        "n_total": len(cands),
+        "generated_at": d.get("generated_at"),
+        "coins": d.get("coins") or [],
+        "n_bars": d.get("n_bars"),
+    }
+
+
 def snapshot(data_dir: str | None = None) -> dict[str, Any]:
-    """Full dashboard payload: arms + attribution + portfolio totals."""
+    """Full dashboard payload: arms + attribution + tournament + portfolio totals."""
     arms = collect_arms(data_dir)
     attrib = collect_attribution(data_dir)
     total_equity = round(sum(a["equity"] for a in arms), 2)
@@ -173,6 +194,7 @@ def snapshot(data_dir: str | None = None) -> dict[str, Any]:
     return {
         "arms": arms,
         "attribution": attrib,
+        "tournament": collect_tournament(data_dir),
         "totals": {
             "equity": total_equity,
             "start": total_start,

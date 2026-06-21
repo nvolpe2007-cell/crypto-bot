@@ -66,6 +66,11 @@ _PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <table id="attrib"><thead><tr>
  <th>arm</th><th>fills</th><th>gross</th><th>fees</th><th>slippage</th><th>net</th>
 </tr></thead><tbody></tbody></table>
+<h2 id="tourhdr">Strategy tournament</h2>
+<div class="sub" id="toursub"></div>
+<table id="tour"><thead><tr>
+ <th>strategy</th><th>family</th><th>sharpe</th><th>t</th><th>ret%</th><th>maxDD%</th><th>trades</th><th>verdict</th>
+</tr></thead><tbody></tbody></table>
 <script>
 const REFRESH=%REFRESH%*1000;
 const money=x=>(x<0?'-$':'$')+Math.abs(x).toFixed(2);
@@ -92,6 +97,30 @@ async function tick(){
   '<td class="neg">'+money(a.fees)+'</td><td class="neg">'+money(a.slippage)+'</td>'+
   '<td class="'+cls(a.net)+'">'+money(a.net)+'</td></tr>').join(''):
   '<tr><td colspan=6 class="muted">no executed fills logged yet</td></tr>';
+ // tournament
+ const tr=d.tournament||{},s=tr.summary||{};
+ if(tr.candidates&&tr.candidates.length){
+  const age=tr.generated_at?Math.round((Date.now()/1000-tr.generated_at)/3600)+'h ago':'';
+  document.getElementById('toursub').innerHTML=
+   s.n_candidates+' candidates · Šidák |t| bar <b>'+s.family_t_bar+'</b> · '+
+   '<b>'+s.n_robust+'</b> robust · <b class="'+(s.n_passes_family>0?'pos':'muted')+'">'+
+   s.n_passes_family+'</b> clear family-bar ('+s.n_long_only_executable+' long-only executable) · '+
+   (tr.coins||[]).join(' ')+' '+(tr.n_bars||'')+'d · '+age;
+  document.querySelector('#tour tbody').innerHTML=tr.candidates.map(r=>{
+   let v='<span class="pill idle">in-sample</span>';
+   if(r.passes_family)v='<span class="pill promo">CLEARS FAMILY-BAR</span>';
+   else if(r.robust)v='<span class="pill">robust</span>';
+   const lo=r.long_only_ok?' <span class="pill" style="background:#1b2838">LO</span>':'';
+   return '<tr><td>'+r.name+lo+'</td><td>'+r.family+'</td>'+
+    '<td class="'+cls(r.sharpe)+'">'+r.sharpe.toFixed(2)+'</td>'+
+    '<td>'+r.t_stat.toFixed(1)+'</td>'+
+    '<td class="'+cls(r.ret_pct)+'">'+r.ret_pct.toFixed(1)+'</td>'+
+    '<td class="neg">'+r.mdd_pct.toFixed(1)+'</td><td>'+r.trades+'</td>'+
+    '<td style="text-align:left">'+v+'</td></tr>';}).join('');
+ }else{
+  document.getElementById('toursub').innerHTML='<span class="muted">tournament not run yet — '+
+   'run <code>python scripts/run_tournament.py</code></span>';
+ }
 }
 function card(k,v){return '<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>'}
 tick();setInterval(tick,REFRESH);

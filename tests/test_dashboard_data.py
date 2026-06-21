@@ -132,6 +132,31 @@ def test_collect_attribution_no_db_returns_empty(data_dir):
     assert dd.collect_attribution(data_dir) == []
 
 
+def test_collect_tournament_absent_is_graceful(data_dir):
+    t = dd.collect_tournament(data_dir)
+    assert t["candidates"] == [] and t["summary"] == {}
+
+
+def test_collect_tournament_reads_and_caps_top(data_dir):
+    cands = [{"name": f"s{i}", "sharpe": 1.0 - i * 0.01} for i in range(50)]
+    payload = {"generated_at": 123, "coins": ["BTC/USD"], "n_bars": 730,
+               "summary": {"n_candidates": 50, "family_t_bar": 3.4, "n_robust": 2,
+                           "n_passes_family": 0, "n_long_only_executable": 0},
+               "candidates": cands}
+    with open(os.path.join(data_dir, "tournament.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    t = dd.collect_tournament(data_dir, top=10)
+    assert len(t["candidates"]) == 10
+    assert t["n_total"] == 50
+    assert t["summary"]["family_t_bar"] == 3.4
+
+
+def test_snapshot_includes_tournament_key(data_dir):
+    _write_state(data_dir, "a", start=1000, equity=1000)
+    snap = dd.snapshot(data_dir)
+    assert "tournament" in snap
+
+
 def test_snapshot_totals(data_dir):
     _write_state(data_dir, "a", start=1000, equity=1100, positions={"BTC": {}})
     _write_state(data_dir, "b", start=1000, equity=950)
