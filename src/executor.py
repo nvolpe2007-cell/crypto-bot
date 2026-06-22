@@ -258,7 +258,19 @@ class KrakenPerpsExecutor(Executor):
     def close_long(self, symbol, price, timestamp, reason=""):
         amount = abs(self._open_size.get(symbol, 0.0))
         if amount <= 0:
-            return OrderResult(False, None, 0, 0, 0, error="no long position")
+            # _open_size is in-process only and resets on every restart. Before
+            # giving up, verify against the exchange so a real position left
+            # over from a previous run still gets closed (same ghost-position
+            # guard used to recover open_long/open_short after a timeout).
+            net = self._reconcile_position(symbol)
+            if net is not None and net > 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_long: local state showed no position but "
+                    f"exchange has {net:.6f} {symbol}; closing the real position."
+                )
+                amount = net
+            else:
+                return OrderResult(False, None, 0, 0, 0, error="no long position")
         try:
             order = self._market_order("sell", symbol, amount, reduce_only=True)
             filled_price = float(order.get("average") or order.get("price") or price)
@@ -288,7 +300,17 @@ class KrakenPerpsExecutor(Executor):
     def close_short(self, symbol, price, timestamp, reason=""):
         amount = abs(self._open_size.get(symbol, 0.0))
         if amount <= 0:
-            return OrderResult(False, None, 0, 0, 0, error="no short position")
+            # See close_long: local _open_size doesn't survive a restart, so
+            # confirm with the exchange before declaring there's nothing to close.
+            net = self._reconcile_position(symbol)
+            if net is not None and net < 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_short: local state showed no position but "
+                    f"exchange has {net:.6f} {symbol}; closing the real position."
+                )
+                amount = abs(net)
+            else:
+                return OrderResult(False, None, 0, 0, 0, error="no short position")
         try:
             order = self._market_order("buy", symbol, amount, reduce_only=True)
             filled_price = float(order.get("average") or order.get("price") or price)
