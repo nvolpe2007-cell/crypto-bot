@@ -332,6 +332,7 @@ class ExchangeConnection:
         return await self._retry(
             self.exchange.fetch_balance,
             retries=retries, label='get_balance',
+            circuit=self._data_circuit,
         )
 
     async def get_positions(self, symbols: Optional[List[str]] = None,
@@ -636,6 +637,7 @@ class KrakenFuturesConnection:
         return await self._retry(
             self.exchange.fetch_balance,
             retries=retries, label='futures.get_balance',
+            circuit=self._data_circuit,
         )
 
     async def create_order(self, symbol: str, order_type: str, side: str,
