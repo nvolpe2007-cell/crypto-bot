@@ -1,0 +1,8 @@
+# stockbot — minimal deps. Core backtest needs only pandas + numpy.
+pandas>=2.0
+numpy>=1.24
+# Optional: only for `fetch_yfinance` (intraday data pull; needs network).
+# yfinance>=0.2
+# Optional: only for the Alpaca PAPER live runner (stockbot.live_paper). Lazy-
+# imported, so the backtest works without it.
+# alpaca-py>=0.20

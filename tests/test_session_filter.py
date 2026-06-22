@@ -4,7 +4,9 @@ Verifies the verdict logic (fail-open on warm-up, UNFAVORABLE only on a real
 losing sample, FAVORABLE on positive realised expectancy), the session
 bucketing, and the from_state / record-loading constructors.
 """
-from src.session_filter import SessionEdge, session_of_hour, _wilson_lower_bound, SESSIONS
+from src.session_filter import (
+    SessionEdge, session_of_hour, window_of_hour, _wilson_lower_bound, SESSIONS,
+)
 
 
 def _recs(hour, n, pnl, won):
@@ -24,6 +26,20 @@ class TestSessionBucketing:
         assert session_of_hour(24) == "Asia"     # 24 % 24 == 0
         assert session_of_hour(None) is None
         assert session_of_hour("nope") is None
+
+
+class TestWindowOfHour:
+    def test_night_is_asia_day_is_eu_us(self):
+        assert window_of_hour(0) == "night"
+        assert window_of_hour(7) == "night"      # Asia → night
+        assert window_of_hour(8) == "day"        # EU → day
+        assert window_of_hour(15) == "day"
+        assert window_of_hour(16) == "day"       # US → day
+        assert window_of_hour(23) == "day"
+
+    def test_bad_input_is_none(self):
+        assert window_of_hour(None) is None
+        assert window_of_hour("x") is None
 
 
 class TestVerdicts:

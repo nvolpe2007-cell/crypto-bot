@@ -104,6 +104,15 @@ DESK BLOCKS (composable context in `market.desk_blocks`, any subset may be prese
     BTC/ETH/SOL co-move, so an all_long or all_short book is really ONE bet at gross \
     size. If you are already concentrated, do NOT pile more onto the same correlated \
     direction; prefer trimming or diversifying the read. Respect this before sizing up.
+  • proof_status: the WHOLE system's honest scorecard — which strategy arms have actually \
+    cleared the strict proof bar (executable & n>=30 & expectancy>0 & family-wise t) and which \
+    have not. If `proven` is "none", NO directional edge is established here — carry humility, \
+    prefer FLAT/small, and do not act as if any setup is a sure thing. This is epistemic \
+    grounding, not a trade trigger.
+  • session_edge: the bot's own realised win-rate/expectancy by UTC session (Asia/EU/US), with \
+    a FAVORABLE/NEUTRAL/UNFAVORABLE verdict. A weak timing tiebreaker — never a trigger.
+  • swing_attribution: per-symbol net P&L / win-rate from the live 4h-majors swing forward test \
+    — which names have actually worked. Use to lean toward proven names, not to chase.
 These blocks REFINE and RISK-CHECK the decision; they are not new reasons to trade.
 
 HOW TO SIZE — BE AGGRESSIVE WHEN YOU ARE RIGHT, FLAT WHEN YOU ARE NOT. Sizing is \
@@ -146,7 +155,9 @@ win?). USE IT like a professional reviewing their journal:
     abandon a sound process over 2-3 trades, and do not get cocky after 2-3 wins. Only
     update your behaviour when the record is big enough to mean something.
   • CALIBRATE CONVICTION. If your "conviction 8" calls have only won ~50%, your scale is
-    inflated — pull conviction (and size) down until the record earns it back.
+    inflated — pull conviction (and size) down until the record earns it back. The memory now
+    also breaks your record down by COIN and by ACTION (long/short) and lists your WORST trades
+    with the thesis that lost — if a coin or a side keeps losing, name that record and stop.
   • RESPECT DRAWDOWN. If the book is underwater, get smaller and more selective, not
     bigger trying to win it back. Revenge-sizing is how accounts die.
   • If memory is sparse (few/no closed trades), say so and lean on the principles above —
@@ -157,6 +168,25 @@ concrete: name the signal that decided it and what would flip your view. Prefer 
 KEEPING the current position when the picture hasn't materially changed — say so. \
 You MUST finish your turn by calling the submit_decisions tool — reasoning in text \
 without calling it is an incomplete answer."""
+
+def _system_blocks() -> List[Dict[str, Any]]:
+    """System content for decide(): the static strategy prompt, plus the durable
+    curated knowledge base as a SECOND cached block (BRAIN_KNOWLEDGE=1, default on).
+    Both carry cache_control so the daily call hits the prompt cache. Fail-safe — if
+    the knowledge module can't be imported, the brain still runs on the base prompt."""
+    blocks: List[Dict[str, Any]] = [
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+    ]
+    try:
+        from .brain_knowledge import brain_knowledge
+        kb = brain_knowledge()
+    except Exception:
+        kb = ""
+    if kb and kb.strip():
+        blocks.append({"type": "text", "text": kb,
+                       "cache_control": {"type": "ephemeral"}})
+    return blocks
+
 
 def build_decision_tool(coins: Optional[List[str]] = None) -> Dict[str, Any]:
     """The submit_decisions tool. The coin enum is set to the active universe so the
@@ -419,8 +449,7 @@ class TradeBrain:
             kwargs = dict(
                 model=self.model,
                 max_tokens=MAX_TOKENS,
-                system=[{"type": "text", "text": SYSTEM_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
+                system=_system_blocks(),
                 tools=[build_decision_tool(list(snapshot.keys()) if snapshot else None)],
                 messages=[{"role": "user",
                            "content": _build_user_content(snapshot, now, macro, charts, memory)}],

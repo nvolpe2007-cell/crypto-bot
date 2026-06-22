@@ -119,6 +119,20 @@ ROUND_TRIP_COST_FRAC = float(os.getenv('FUNDING_ARB_COST_FRAC', '0.0022'))  # 0.
 # MAX_HOLD. At 0.22% cost this implies an effective floor of ~24% APY after costs.
 MAX_BREAKEVEN_CYCLES = float(os.getenv('FUNDING_ARB_MAX_BREAKEVEN_CYCLES', '10'))
 
+# ── Deleveraging-regime veto ─────────────────────────────────────────────────
+# Funding arb dies in the deleveraging/fear regime: when positioning unwinds,
+# funding across the complex goes broadly NEGATIVE (perps trade at a discount,
+# shorts pay longs) and the cash-and-carry inverts. That is exactly the regime
+# the executable Kraken arm bled in (memory funding_arb_kraken_bleed). This veto
+# reads funding BREADTH across the liquid majors from the scanner's own feed: when
+# the share of observed majors with NEGATIVE funding >= REGIME_VETO_FRAC, NEW
+# entries are paused for that tick (exits always continue). It is portfolio-level
+# and complements the per-symbol persistence gate. 0 disables (default — the
+# per-arm config opts in). Fail-open: needs >= REGIME_VETO_MIN_MAJORS distinct
+# majors observed, else no veto (don't act on thin data).
+REGIME_VETO_FRAC = float(os.getenv('FUNDING_ARB_REGIME_VETO_FRAC', '0'))
+REGIME_VETO_MIN_MAJORS = int(os.getenv('FUNDING_ARB_REGIME_VETO_MIN_MAJORS', '5'))
+
 # ── Conviction-weighted sizing ───────────────────────────────────────────────
 # Instead of a flat size per position, scale capital by opportunity quality:
 # the further an opportunity's |APY| sits above the cost-gate floor (~24% at
@@ -266,6 +280,8 @@ class FundingArbPaperSim:
         flip_cooldown_hours: float = 0.0,
         max_drawdown_usd: float = 0.0,
         exit_confirm_hours: float = EXIT_CONFIRM_HOURS,
+        regime_veto_frac: float = REGIME_VETO_FRAC,
+        regime_veto_min_majors: int = REGIME_VETO_MIN_MAJORS,
     ):
         self.scanner = scanner
         self.notifier = notifier
@@ -335,6 +351,11 @@ class FundingArbPaperSim:
         # 0 disables. Exits continue; existing positions wind down normally.
         self.max_drawdown_usd = max_drawdown_usd
         self._halt_reason: Optional[str] = None   # last announced halt reason
+        # Deleveraging-regime veto (see REGIME_VETO_FRAC). Transient per-tick gate
+        # on NEW entries when majors funding breadth turns broadly negative.
+        self.regime_veto_frac = regime_veto_frac
+        self.regime_veto_min_majors = regime_veto_min_majors
+        self._regime_veto_reason: Optional[str] = None   # last announced veto reason
 
         self._load_state()
 
@@ -441,6 +462,49 @@ class FundingArbPaperSim:
             self._halt_reason = None
         return reason
 
+    def _deleveraging_regime(self, opps) -> Optional[str]:
+        """Funding-breadth regime read from the scanner feed. When the share of
+        observed liquid MAJORS with NEGATIVE funding >= regime_veto_frac, the
+        carry complex is inverting (deleveraging/fear) and this arm has
+        historically bled — return a reason to veto NEW entries, else None.
+        Fail-open: with fewer than regime_veto_min_majors distinct majors
+        observed, return None (don't act on thin data). 0 frac disables."""
+        if self.regime_veto_frac <= 0:
+            return None
+        by_base: Dict[str, float] = {}
+        for o in opps:
+            try:
+                base = _base_symbol(o['symbol'])
+            except (TypeError, KeyError):
+                continue
+            if base in MAJOR_SYMBOLS:
+                try:
+                    by_base[base] = float(o['apy'])
+                except (TypeError, ValueError, KeyError):
+                    continue
+        n = len(by_base)
+        if n < self.regime_veto_min_majors:
+            return None
+        neg = sum(1 for v in by_base.values() if v < 0)
+        share = neg / n
+        if share >= self.regime_veto_frac:
+            return (f"deleveraging regime: {neg}/{n} majors ({share*100:.0f}%) "
+                    f"funding negative >= {self.regime_veto_frac*100:.0f}% threshold")
+        return None
+
+    def _announce_regime_veto(self, reason: Optional[str]) -> None:
+        """Log/alert once on engage and once on clear so the stream isn't spammed
+        every tick (the veto itself is recomputed fresh each tick)."""
+        if reason and reason != self._regime_veto_reason:
+            logger.warning(f"[{self.label}] REGIME VETO — {reason} (new entries paused)")
+            self._notify(f"⏸️ <b>{self.label} — deleveraging regime</b>\n{reason}\n"
+                         f"(exits continue; resumes when majors funding breadth recovers)")
+            self._regime_veto_reason = reason
+        elif reason is None and self._regime_veto_reason is not None:
+            logger.info(f"[{self.label}] regime veto cleared — entries may resume")
+            self._notify(f"▶️ <b>{self.label} — regime veto cleared</b>")
+            self._regime_veto_reason = None
+
     def _tick(self):
         """Process one cycle: accrue funding, manage exits, look for entries."""
         opps = self.scanner.get_state()  # list[dict]
@@ -515,10 +579,14 @@ class FundingArbPaperSim:
                 except Exception:
                     pass
 
-        # 2. Look for new entries — unless halted (master kill / per-arm loss cap).
-        #    The exit + accrual pass above always runs; halting blocks only NEW
-        #    exposure, so open positions still wind down on their own logic.
-        if self._entry_halt_reason() is None and len(self.open_positions) < self.max_positions:
+        # 2. Look for new entries — unless halted (master kill / per-arm loss cap)
+        #    or vetoed (deleveraging regime). The exit + accrual pass above always
+        #    runs; halting/veto block only NEW exposure, so open positions still
+        #    wind down on their own logic.
+        halt = self._entry_halt_reason()
+        veto = self._deleveraging_regime(opps)
+        self._announce_regime_veto(veto)
+        if halt is None and veto is None and len(self.open_positions) < self.max_positions:
             for opp in opps:
                 if len(self.open_positions) >= self.max_positions:
                     break
