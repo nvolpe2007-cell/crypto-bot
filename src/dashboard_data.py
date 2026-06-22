@@ -38,6 +38,7 @@ _DISPLAY_NAMES = {
     "allocator": "allocator (meta)",
     "regime_arm": "regime_arm",
     "tsmom_fast": "tsmom_fast",
+    "flash_arb": "flash-arb (paper)",
 }
 
 
