@@ -248,6 +248,32 @@ class TestReconcilePositions:
         asyncio.run(trader.reconcile_positions())
         assert "BTC/USD" not in trader.positions
 
+    def test_falls_back_to_ticker_when_entry_and_mark_price_missing(self):
+        """entryPrice/markPrice can be absent on some position responses —
+        the position must still be tracked, not silently dropped."""
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC/USD", "contracts": 0.001}
+        ])
+        trader.exchange.get_ticker = AsyncMock(return_value={"last": 51_000.0})
+        asyncio.run(trader.reconcile_positions())
+        assert "BTC/USD" in trader.positions
+        assert trader.positions["BTC/USD"].entry_price == 51_000.0
+
+    def test_raises_when_price_and_ticker_fallback_both_unavailable(self):
+        """If we truly cannot determine a price for an untracked exchange
+        position, silently dropping it would leave it untracked while still
+        open on Kraken — the next signal loop would then open a SECOND
+        position on top of it. Must raise and abort startup instead."""
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC/USD", "contracts": 0.001}
+        ])
+        trader.exchange.get_ticker = AsyncMock(side_effect=RuntimeError("no ticker"))
+        with pytest.raises(RuntimeError):
+            asyncio.run(trader.reconcile_positions())
+        assert "BTC/USD" not in trader.positions
+
     def test_ignores_unknown_symbol(self):
         trader = _make_trader()
         trader.exchange.get_positions = AsyncMock(return_value=[
