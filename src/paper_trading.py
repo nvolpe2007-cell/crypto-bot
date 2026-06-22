@@ -32,7 +32,7 @@ from .backtester import Trade
 from .notifications import TelegramNotifier
 from .market_sentiment import SentimentMonitor
 from .kraken_ws import KrakenPublicWS
-from .regime_detector import RegimeDetector
+from .regime_detector import RegimeDetector, PersistentRegime
 from .portfolio_optimizer import PortfolioOptimizer
 from .crypto_vol import CryptoVolMonitor
 from .order_flow import OrderFlowImbalance
@@ -470,6 +470,10 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
     # ── Subsystems ─────────────────────────────────────────────────────────────
     strategy        = MicrostructureStrategy()
     regime_detector = RegimeDetector()
+    # Whipsaw filter over the regime stream (opt-in: REGIME_PERSIST_BARS, default 0
+    # → passthrough). Smooths trend↔range flips that bleed the cost wall; CRASH is
+    # exempt (engages immediately). See regime_detector.PersistentRegime.
+    regime_persist  = PersistentRegime()
     ofi_calc        = OrderFlowImbalance(exchange, symbols)
     lead_lag        = LeadLagDetector(lead_symbol='BTC/USD')
     journal         = TradeJournal()
@@ -1383,7 +1387,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                     logger.info(f"[CACHE] {sym} seeded with {len(ohlcv_cache[sym])} bars")
                     # Compute initial regime so trades evaluated before the first WS
                     # candle event don't all get logged as regime=UNKNOWN.
-                    result = regime_detector.detect(ohlcv_cache[sym])
+                    result = regime_persist.update(sym, regime_detector.detect(ohlcv_cache[sym]))
                     if result:
                         regime_cache[sym] = result.to_dict()
                         logger.info(f"[REGIME] {sym} seeded: {result.regime} "
@@ -1436,7 +1440,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
                             # Refresh regime on new candle data
-                            result = regime_detector.detect(ohlcv_cache[sym])
+                            result = regime_persist.update(sym, regime_detector.detect(ohlcv_cache[sym]))
                             if result:
                                 regime_cache[sym] = result.to_dict()
                                 logger.debug(f"[REGIME] {sym}: {result.regime} conf={result.confidence:.2f} adx={result.adx:.1f}")
@@ -1494,7 +1498,7 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
-                            result = regime_detector.detect(ohlcv_cache[sym])
+                            result = regime_persist.update(sym, regime_detector.detect(ohlcv_cache[sym]))
                             if result:
                                 regime_cache[sym] = result.to_dict()
                     except CircuitBreakerOpen as e:

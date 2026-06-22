@@ -5,10 +5,13 @@ The learner reads this to avoid repeating losing setups.
 
 import csv
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict, fields
+
+logger = logging.getLogger(__name__)
 
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'trade_journal.json')
 CSV_FILE     = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'trade_journal.csv')
@@ -155,6 +158,26 @@ class TradeJournal:
             self.records = [TradeRecord(**{**self._DEFAULTS, **r}) for r in raw]
         except Exception:
             self.records = []
+
+    def reload(self):
+        """Re-read JOURNAL_FILE from disk.
+
+        A long-running process (e.g. bot.py's StrategyAdvisor) typically holds
+        its own TradeJournal instance, separate from the one the trading loop
+        (paper_trading.py / live_trading.py) writes through — each calls
+        TradeJournal() independently, so they don't share the in-memory
+        `records` list. Without reloading, a reader-only instance stays frozen
+        at whatever was on disk when it was constructed and never observes
+        trades closed afterwards. Unlike `_load()` (used only at construction,
+        where `records` starts empty anyway), a failed reload leaves the
+        existing in-memory records untouched rather than discarding them.
+        """
+        try:
+            with open(JOURNAL_FILE) as f:
+                raw = json.load(f)
+            self.records = [TradeRecord(**{**self._DEFAULTS, **r}) for r in raw]
+        except Exception as e:
+            logger.debug(f"TradeJournal.reload failed, keeping in-memory records: {e}")
 
     def save(self):
         # Atomic write: a crash mid-write would otherwise truncate the journal

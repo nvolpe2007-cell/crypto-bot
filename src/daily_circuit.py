@@ -50,14 +50,24 @@ class DailyCircuitBreaker:
             with open(STATE_FILE, "r") as f:
                 d = json.load(f)
             return CircuitState(**d)
-        except Exception:
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            # File exists but is unreadable/corrupt — most likely a crash mid-write
+            # before the atomic-replace fix below. Starting fresh (0 losses) is the
+            # existing fallback, but this case is NOT a normal "first run" and should
+            # be loud: silently losing today's loss count is exactly the failure mode
+            # this circuit breaker exists to prevent.
+            logger.warning(f"[CIRCUIT] state file unreadable, starting fresh day: {e}")
             return None
 
     def _save(self):
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            with open(STATE_FILE, "w") as f:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(asdict(self.state), f, indent=2)
+            os.replace(tmp, STATE_FILE)
         except Exception as e:
             logger.warning(f"[CIRCUIT] save failed: {e}")
 

@@ -227,7 +227,7 @@ class DEXArbitrageBot:
             key=lambda x: x.net_profit_usd,
             reverse=True
         )
-        return sorted_opps[-limit:]
+        return sorted_opps[:limit]
 
 
 async def main():
