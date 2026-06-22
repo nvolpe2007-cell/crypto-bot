@@ -9,7 +9,8 @@ Safety guarantees:
   - Startup reconciliation: syncs bot state with actual Kraken open positions
   - Order fill verification: position only recorded after confirmed fill
   - Fee tracking: actual fees pulled from order response
-  - Daily loss circuit breaker: stops trading if loss exceeds MAX_DAILY_LOSS
+  - Daily loss circuit breaker: halts NEW entries if realized loss exceeds
+    MAX_DAILY_LOSS, without abandoning SL/TP protection on any open position
   - Min confidence: 70 (higher bar than paper's 60)
 """
 
@@ -469,6 +470,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     equity_curve:   List[dict]              = []
     iteration = 0
     killed = False  # master kill switch state — see _kill_switch_engaged()
+    daily_loss_halted = False  # daily-loss breaker state — see _daily_loss_halted()
 
     # Seed OHLCV
     for sym in symbols:
@@ -545,18 +547,16 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             # Same flag the paper arms honor; file/env toggled, no restart needed.
             killed = _kill_switch_engaged(notifier, killed)
 
-            # Daily loss circuit breaker
+            # Daily loss circuit breaker — halts NEW entries only (same
+            # halt-not-kill pattern as the master kill switch above). Must NOT
+            # set trader.running=False here: that flag also gates the
+            # background _sltp_watcher/_candle_refresher/_ofi_fetcher tasks,
+            # so flipping it would abandon any still-open real-money position
+            # with no further stop-loss/take-profit protection.
             session_loss = session_start_pnl - trader.account.total_pnl
-            if session_loss >= max_daily_loss:
-                logger.warning(f"[LIVE RISK] Daily loss limit ${max_daily_loss:.2f} hit — stopping")
-                if notifier:
-                    notifier.send_message(
-                        f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
-                        f"Lost ${session_loss:.2f} today (limit: ${max_daily_loss:.2f})\n"
-                        f"Bot stopped — restart manually when ready"
-                    )
-                trader.running = False
-                break
+            daily_loss_halted = _daily_loss_halted(
+                notifier, session_loss, max_daily_loss, daily_loss_halted
+            )
 
             ws_prices = public_ws.get_prices() if public_ws else {}
 
@@ -614,7 +614,8 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 current_equity = trader.account.initial_capital + trader.account.total_pnl
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
-                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE and not killed:
+                if (sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE
+                        and not killed and not daily_loss_halted):
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
 
@@ -779,6 +780,38 @@ def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool)
             except Exception:
                 pass
     return killed
+
+
+def _daily_loss_halted(notifier: Optional[TelegramNotifier], session_loss: float,
+                       max_daily_loss: float, was_halted: bool) -> bool:
+    """Daily loss circuit breaker — halts NEW entries only, once realized
+    `session_loss` breaches `max_daily_loss`. Mirrors _kill_switch_engaged's
+    halt-not-kill pattern: it never touches trader.running, so the SL/TP
+    watcher keeps protecting any position that was still open when the
+    breaker tripped instead of abandoning it. One-way latch for the rest of
+    the session — a later winning exit pulling session_loss back under the
+    cap does not re-arm entries; per the alert text, that needs a manual
+    restart.
+    """
+    if was_halted:
+        return True
+    if session_loss < max_daily_loss:
+        return False
+    logger.warning(
+        f"[LIVE RISK] Daily loss limit ${max_daily_loss:.2f} hit "
+        f"(lost ${session_loss:.2f}) — halting new entries (exits continue)"
+    )
+    if notifier:
+        try:
+            notifier.send_message(
+                f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
+                f"Lost ${session_loss:.2f} today (limit: ${max_daily_loss:.2f})\n"
+                f"New entries halted — any open position remains protected by "
+                f"its stop-loss/take-profit. Restart the bot manually to resume entries."
+            )
+        except Exception:
+            pass
+    return True
 
 
 def _sltp_circuit_alert(notifier: Optional[TelegramNotifier], symbol: str,

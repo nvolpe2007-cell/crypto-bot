@@ -63,6 +63,7 @@ from src.live_trading import (
     _quick_diagnose,
     _update_chandelier_stop,
     _kill_switch_engaged,
+    _daily_loss_halted,
     _sltp_circuit_alert,
     _sltp_circuit_cleared,
     run_live_trading_session,
@@ -890,6 +891,56 @@ class TestKillSwitchEngaged:
         kill_isolated.engage("test")
         # Must not raise even though send_message blows up
         assert _kill_switch_engaged(notifier, was_killed=False) is True
+
+
+# ── _daily_loss_halted ───────────────────────────────────────────────────────────
+#
+# Before this fix, breaching the daily loss cap set trader.running=False, which
+# also stops the background _sltp_watcher (and every other background task) —
+# they all loop on `while trader.running:`. That abandoned any position still
+# open at the moment of breach with zero further stop-loss/take-profit
+# protection until a human intervened. This helper instead halts NEW entries
+# only, mirroring _kill_switch_engaged's halt-not-kill pattern, and never
+# touches trader.running.
+
+class TestDailyLossHalted:
+    def test_under_threshold_returns_false(self):
+        assert _daily_loss_halted(None, session_loss=10.0, max_daily_loss=15.0, was_halted=False) is False
+
+    def test_at_threshold_engages(self):
+        assert _daily_loss_halted(None, session_loss=15.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_over_threshold_engages(self):
+        assert _daily_loss_halted(None, session_loss=42.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_stays_latched_even_if_loss_recovers(self):
+        """A later winning exit pulling session_loss back under the cap must
+        not silently re-arm entries — that needs a manual restart."""
+        assert _daily_loss_halted(None, session_loss=0.0, max_daily_loss=15.0, was_halted=True) is True
+
+    def test_notifies_once_on_breach(self):
+        notifier = MagicMock()
+        halted = _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False)
+        assert halted is True
+        assert notifier.send_message.call_count == 1
+        msg = notifier.send_message.call_args[0][0]
+        assert "DAILY LOSS LIMIT" in msg
+        assert "20.00" in msg
+
+    def test_does_not_renotify_while_still_halted(self):
+        notifier = MagicMock()
+        halted = _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False)
+        halted = _daily_loss_halted(notifier, session_loss=25.0, max_daily_loss=15.0, was_halted=halted)
+        assert halted is True
+        assert notifier.send_message.call_count == 1
+
+    def test_no_notifier_does_not_raise(self):
+        assert _daily_loss_halted(None, session_loss=20.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_notifier_exception_swallowed(self):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        assert _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False) is True
 
 
 # ── _sltp_circuit_alert / _sltp_circuit_cleared ─────────────────────────────────
