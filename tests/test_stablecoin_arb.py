@@ -6,6 +6,9 @@ Covers:
   at peg, real depeg detection above threshold, correct field values
 - get_best_opportunity: empty list, best by profit_usd, max_age_seconds staleness filter
 - Memory safety: opportunities deque stays bounded at maxlen=500
+- Per-leg fetch failure: a broken/malformed leg must be omitted, never defaulted
+  to a fake peg price of 1.0 (that can manufacture a false "profit" out of the
+  other two real, possibly off-peg, legs)
 """
 
 import sys
@@ -18,6 +21,45 @@ from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from arbitrage.stablecoin_arb import StablecoinArbBot, TriangleOpportunity
+
+
+# ── tiny aiohttp.ClientSession stand-in (keyed by a substring of the URL) ─────
+
+class _MockResponse:
+    def __init__(self, data=None, status=200, raise_on_enter=None):
+        self.status = status
+        self._data = data
+        self._raise_on_enter = raise_on_enter
+
+    async def __aenter__(self):
+        if self._raise_on_enter is not None:
+            raise self._raise_on_enter
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def json(self):
+        return self._data
+
+
+class _KeyedSession:
+    """Routes session.get(url) to per-leg behavior keyed by a URL substring.
+
+    `behaviors` maps a keyword (e.g. a pair/product/symbol code) to either a
+    response dict (status 200) or an Exception instance to raise on entry —
+    simulating one leg's request failing while the others succeed.
+    """
+    def __init__(self, behaviors: dict):
+        self._behaviors = behaviors
+
+    def get(self, url, **kwargs):
+        for kw, behavior in self._behaviors.items():
+            if kw in url:
+                if isinstance(behavior, BaseException):
+                    return _MockResponse(raise_on_enter=behavior)
+                return _MockResponse(data=behavior)
+        raise AssertionError(f"Unexpected URL in test: {url}")
 
 _TRIANGLE = ["USDC", "USDT", "DAI", "USDC"]
 
@@ -160,6 +202,90 @@ class TestScanExchange:
         })
         await bot.scan_exchange("coinbase")
         assert bot.opportunities[0].exchange == "coinbase"
+
+
+# ── per-leg fetch failure must omit, never fake a peg price ──────────────────
+
+class TestLegFetchFailureOmitsNotFakes:
+    """Regression coverage for the peg-default bug: a leg that fails to fetch
+    (network error or malformed response) used to silently become 1.0 ("Default
+    to peg"), which could fabricate a profitable triangle out of two real,
+    off-peg legs plus one fake-peg leg. It must now be omitted instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_kraken_network_error_on_one_leg_is_omitted(self):
+        bot = _make_bot()
+        bot.session = _KeyedSession({
+            "USDCUSDT": {"result": {"USDCUSDT": {"c": ["1.004", "5"]}}},
+            "USDTDAI":  ConnectionError("simulated network failure"),
+            "DAIUSDC":  {"result": {"DAIUSDC": {"c": ["1.002", "5"]}}},
+        })
+        prices = await bot._get_kraken_prices()
+        assert "USDT_DAI" not in prices
+        assert prices["USDC_USDT"] == pytest.approx(1.004)
+        assert prices["DAI_USDC"] == pytest.approx(1.002)
+
+    @pytest.mark.asyncio
+    async def test_kraken_malformed_response_on_one_leg_is_omitted(self):
+        """Status 200 but missing the expected "c" field — also omitted, not faked."""
+        bot = _make_bot()
+        bot.session = _KeyedSession({
+            "USDCUSDT": {"result": {"USDCUSDT": {"c": ["1.004", "5"]}}},
+            "USDTDAI":  {"result": {"USDTDAI": {}}},  # malformed: no "c" key
+            "DAIUSDC":  {"result": {"DAIUSDC": {"c": ["1.002", "5"]}}},
+        })
+        prices = await bot._get_kraken_prices()
+        assert "USDT_DAI" not in prices
+
+    @pytest.mark.asyncio
+    async def test_coinbase_network_error_on_one_leg_is_omitted(self):
+        bot = _make_bot()
+        bot.session = _KeyedSession({
+            "USDC-USDT": {"ticker": {"price": "1.004"}},
+            "USDT-DAI":  TimeoutError("simulated timeout"),
+            "DAI-USDC":  {"ticker": {"price": "1.002"}},
+        })
+        prices = await bot._get_coinbase_prices()
+        assert "USDT_DAI" not in prices
+
+    @pytest.mark.asyncio
+    async def test_binance_network_error_on_one_leg_is_omitted(self):
+        bot = _make_bot()
+        bot.session = _KeyedSession({
+            "symbol=USDCUSDT": {"price": "1.004"},
+            "symbol=USDTDAI":  ConnectionError("simulated network failure"),
+            "symbol=DAIUSDC":  {"price": "1.002"},
+        })
+        prices = await bot._get_binance_prices()
+        assert "USDT_DAI" not in prices
+
+    @pytest.mark.asyncio
+    async def test_get_triangle_prices_returns_none_on_incomplete_triangle(self):
+        """get_triangle_prices must reject a triangle missing any leg, not pass
+        a partial dict through for scan_exchange to silently compute on."""
+        bot = _make_bot()
+        bot.session = _KeyedSession({
+            "USDCUSDT": {"result": {"USDCUSDT": {"c": ["1.004", "5"]}}},
+            "USDTDAI":  ConnectionError("simulated network failure"),
+            "DAIUSDC":  {"result": {"DAIUSDC": {"c": ["1.002", "5"]}}},
+        })
+        prices = await bot.get_triangle_prices("kraken")
+        assert prices is None
+
+    @pytest.mark.asyncio
+    async def test_scan_exchange_records_no_false_profit_when_one_leg_fails(self):
+        """End-to-end regression: two real off-peg legs (1.004, 1.002) plus a
+        failed third leg used to default to 1.0 and compute a fake ~0.6% gross
+        "profit" purely from the fetch failure. It must now record nothing."""
+        bot = _make_bot(fee_pct=0.0, min_profit_pct=0.0)  # most permissive settings
+        bot.session = _KeyedSession({
+            "USDCUSDT": {"result": {"USDCUSDT": {"c": ["1.004", "5"]}}},
+            "USDTDAI":  ConnectionError("simulated network failure"),
+            "DAIUSDC":  {"result": {"DAIUSDC": {"c": ["1.002", "5"]}}},
+        })
+        await bot.scan_exchange("kraken")
+        assert len(bot.opportunities) == 0
 
 
 # ── get_best_opportunity ──────────────────────────────────────────────────────
