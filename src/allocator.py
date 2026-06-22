@@ -47,6 +47,7 @@ ARMS: list[tuple[str, str, str, bool, str]] = [
     ("lev_perp",    "lev_perp_state.json",    "week",   False, "leverage"),
     ("pairs",       "pairs_paper_state.json", "week",   False, "neutral"),
     ("micro",       "micro_paper_state.json", "minute", True,  "scalp"),
+    ("flash_arb",   "flash_arb_state.json",   "week",   False, "arbitrage"),
 ]
 
 # Regime → per-family preference multiplier (applied among proven arms only) and a

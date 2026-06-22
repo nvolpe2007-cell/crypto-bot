@@ -367,6 +367,69 @@ class TestTradeJournalPersistence:
         assert j2.records[0].direction == "short"
 
 
+# ── TradeJournal.reload ───────────────────────────────────────────────────────
+
+class TestTradeJournalReload:
+    """reload() lets a long-lived reader (e.g. StrategyAdvisor) pick up trades
+    written to disk by a separate TradeJournal instance (the trading loop's)."""
+
+    def test_reload_picks_up_records_written_by_another_instance(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "journal.json")
+        monkeypatch.setattr(_tj_module, "JOURNAL_FILE", path)
+
+        writer = TradeJournal()
+        reader = TradeJournal()
+        assert reader.records == []
+
+        writer.add(_minimal_record(trade_id="r1", pnl=5.0, won=True))
+        reader.reload()
+        assert len(reader.records) == 1
+        assert reader.records[0].trade_id == "r1"
+
+    def test_reload_again_picks_up_subsequent_writes(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "journal.json")
+        monkeypatch.setattr(_tj_module, "JOURNAL_FILE", path)
+
+        writer = TradeJournal()
+        reader = TradeJournal()
+
+        writer.add(_minimal_record(trade_id="r1"))
+        reader.reload()
+        assert len(reader.records) == 1
+
+        writer.add(_minimal_record(trade_id="r2"))
+        reader.reload()
+        assert len(reader.records) == 2
+        assert [r.trade_id for r in reader.records] == ["r1", "r2"]
+
+    def test_reload_on_missing_file_keeps_existing_records(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "journal.json")
+        monkeypatch.setattr(_tj_module, "JOURNAL_FILE", path)
+
+        j = TradeJournal()
+        j.add(_minimal_record(trade_id="kept"))
+        assert os.path.exists(path)
+
+        os.remove(path)
+        j.reload()
+        assert len(j.records) == 1
+        assert j.records[0].trade_id == "kept"
+
+    def test_reload_on_corrupted_file_keeps_existing_records(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "journal.json")
+        monkeypatch.setattr(_tj_module, "JOURNAL_FILE", path)
+
+        j = TradeJournal()
+        j.add(_minimal_record(trade_id="kept"))
+
+        with open(path, "w") as f:
+            f.write("{not valid json")
+
+        j.reload()
+        assert len(j.records) == 1
+        assert j.records[0].trade_id == "kept"
+
+
 # ── TradeJournal._DEFAULTS backward-compat ───────────────────────────────────
 
 class TestTradeJournalDefaults:
