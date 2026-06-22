@@ -9,6 +9,9 @@ Covers:
   track _open_size, extract filled_price/fee from ccxt response
 - KrakenPerpsExecutor.close_long / close_short: use reduce_only=True, read accumulated
   _open_size, set size back to 0 on success
+- KrakenPerpsExecutor.close_long / close_short: when local _open_size is empty (e.g.
+  right after a process restart), reconcile against the exchange before declaring
+  "no position" — a real leftover position is still closed
 - KrakenPerpsExecutor: zero-amount guard (price=0 → error OrderResult)
 - KrakenPerpsExecutor: no-position guard on close (returns error, does not call exchange)
 - KrakenPerpsExecutor: exchange exception → error OrderResult, does not propagate
@@ -392,11 +395,39 @@ class TestKrakenPerpsExecutorCloseLong:
 
     def test_close_long_no_position_returns_error(self):
         client = _mock_ccxt()
+        client.fetch_positions.return_value = []
         ex = KrakenPerpsExecutor(client)
-        # _open_size not set → defaults to 0 → amount=0 → error
+        # _open_size not set → defaults to 0 → reconcile confirms flat → error
         result = ex.close_long("BTC/USD", 51_000.0, NOW)
         assert result.success is False
         assert "no long" in (result.error or "").lower()
+        client.create_order.assert_not_called()
+
+    def test_close_long_recovers_real_position_after_restart(self):
+        """_open_size is in-process only and is empty right after a restart.
+        If the exchange still shows a real long, close_long must still close it."""
+        client = _mock_ccxt(filled=0.002)
+        client.fetch_positions.return_value = [
+            {"symbol": "BTC/USD:USD", "side": "long", "contracts": 0.002}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        # no pre-seeded _open_size — simulates a fresh process
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is True
+        client.create_order.assert_called_once()
+        _, kwargs = client.create_order.call_args
+        assert kwargs["amount"] == pytest.approx(0.002)
+        assert kwargs.get("params", {}).get("reduceOnly") is True
+
+    def test_close_long_does_not_recover_when_exchange_shows_short(self):
+        """A short found during reconciliation is not a long to close."""
+        client = _mock_ccxt()
+        client.fetch_positions.return_value = [
+            {"symbol": "BTC/USD:USD", "side": "short", "contracts": 0.001}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
         client.create_order.assert_not_called()
 
     def test_close_long_exchange_exception_returns_error(self):
@@ -436,10 +467,34 @@ class TestKrakenPerpsExecutorCloseShort:
 
     def test_close_short_no_position_returns_error(self):
         client = _mock_ccxt()
+        client.fetch_positions.return_value = []
         ex = KrakenPerpsExecutor(client)
         result = ex.close_short("ETH/USD", 2_900.0, NOW)
         assert result.success is False
         assert "no short" in (result.error or "").lower()
+        client.create_order.assert_not_called()
+
+    def test_close_short_recovers_real_position_after_restart(self):
+        client = _mock_ccxt(filled=0.001)
+        client.fetch_positions.return_value = [
+            {"symbol": "ETH/USD:USD", "side": "short", "contracts": 0.001}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        # no pre-seeded _open_size — simulates a fresh process
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is True
+        _, kwargs = client.create_order.call_args
+        assert kwargs["amount"] == pytest.approx(0.001)
+        assert kwargs.get("params", {}).get("reduceOnly") is True
+
+    def test_close_short_does_not_recover_when_exchange_shows_long(self):
+        client = _mock_ccxt()
+        client.fetch_positions.return_value = [
+            {"symbol": "ETH/USD:USD", "side": "long", "contracts": 0.002}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is False
         client.create_order.assert_not_called()
 
     def test_close_short_success_result(self):
