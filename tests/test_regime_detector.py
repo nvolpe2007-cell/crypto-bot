@@ -540,3 +540,59 @@ class TestEdgeCases:
         result = RegimeDetector().detect(df)
         assert result is not None
         json.dumps(result.to_dict())   # must not raise
+
+
+# ── PersistentRegime (whipsaw filter) ─────────────────────────────────────────
+
+from src.regime_detector import PersistentRegime
+
+
+def _rr(regime, adx=25.0):
+    """Minimal RegimeResult with the given label."""
+    return RegimeResult(regime, 0.8, adx, 50.0, 0.5, 0.1, 5.0)
+
+
+def test_persist_passthrough_when_disabled():
+    pr = PersistentRegime(dwell=0)               # default off → no smoothing
+    for label in ("TRENDING_UP", "RANGING", "TRENDING_UP"):
+        assert pr.update("BTC", _rr(label)).regime == label
+
+
+def test_persist_holds_until_confirmed_then_flips():
+    pr = PersistentRegime(dwell=3)
+    assert pr.update("BTC", _rr("TRENDING_UP")).regime == "TRENDING_UP"   # seed
+    # range tries to take over but isn't confirmed for 3 bars yet
+    assert pr.update("BTC", _rr("RANGING")).regime == "TRENDING_UP"
+    assert pr.update("BTC", _rr("RANGING")).regime == "TRENDING_UP"
+    assert pr.update("BTC", _rr("RANGING")).regime == "RANGING"           # 3rd → flip
+
+
+def test_persist_candidate_reset_breaks_the_streak():
+    pr = PersistentRegime(dwell=3)
+    pr.update("BTC", _rr("TRENDING_UP"))
+    pr.update("BTC", _rr("RANGING"))             # count=1
+    pr.update("BTC", _rr("VOLATILE"))            # different cand → resets to 1
+    assert pr.update("BTC", _rr("RANGING")).regime == "TRENDING_UP"       # not yet 3
+
+
+def test_persist_crash_bypasses_dwell():
+    pr = PersistentRegime(dwell=5)
+    pr.update("BTC", _rr("TRENDING_UP"))
+    assert pr.update("BTC", _rr("CRASH")).regime == "CRASH"               # immediate
+
+
+def test_persist_held_label_carries_fresh_metrics():
+    pr = PersistentRegime(dwell=3)
+    pr.update("BTC", _rr("TRENDING_UP", adx=20.0))
+    out = pr.update("BTC", _rr("RANGING", adx=42.0))
+    assert out.regime == "TRENDING_UP"           # smoothed label
+    assert out.adx == 42.0                        # but current metrics
+
+
+def test_persist_is_per_symbol():
+    pr = PersistentRegime(dwell=2)
+    pr.update("BTC", _rr("TRENDING_UP"))
+    pr.update("ETH", _rr("RANGING"))
+    # each symbol keeps its own stable regime
+    assert pr.update("BTC", _rr("TRENDING_UP")).regime == "TRENDING_UP"
+    assert pr.update("ETH", _rr("RANGING")).regime == "RANGING"

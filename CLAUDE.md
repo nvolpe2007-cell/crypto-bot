@@ -94,16 +94,26 @@ set both 0 to restore the old borrow-free optimistic baseline. Without this the 
 charged only a flat entry cost and no carry, inflating the aggressive arm's microcap
 shorts. **Kraken arm (aggressive maker-only config):**
 `FUNDING_ARB_KRAKEN_COST_FRAC` (default 0.0054, maker-only),
-`FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (persistence gate, default 6),
+`FUNDING_ARB_KRAKEN_MAX_BREAKEVEN_CYCLES` (cost-payback gate, default **4** —
+tightened from 6 on 2026-06-19 for selectivity),
 `FUNDING_ARB_KRAKEN_MAX_APY` (cap, default 300),
 `FUNDING_ARB_KRAKEN_ALLOC` (all-in size per trade, default 100; arm is
 `max_positions=1`), `FUNDING_ARB_KRAKEN_SYMBOLS` (base-symbol whitelist, default
 = MAJOR_SYMBOLS; restricts the arm to liquid Kraken-majors so it stops chasing
 microcaps), `FUNDING_ARB_KRAKEN_MIN_PERSISTENCE_CYCLES` (persistence
 gate, default 2; 0 disables), `FUNDING_ARB_KRAKEN_MAX_FLIPS` (serial-flipper
-blacklist, default 6). Funding-history tracker (`arbitrage/funding_history.py`,
-`data/funding_history.json`) tuned via `FUNDING_HISTORY_RETENTION_DAYS`/
-`_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`. See memory `funding_arb_kraken_bleed`.
+blacklist, default 6). **Deleveraging-regime veto (2026-06-19):**
+`FUNDING_ARB_REGIME_VETO_FRAC` (per-arm `regime_veto_frac`; the Kraken arm sets it
+via `FUNDING_ARB_KRAKEN_REGIME_VETO`, default **0.6**) pauses NEW entries for a tick
+when the share of observed liquid majors with NEGATIVE funding ≥ this (the carry
+complex inverting = the fear/deleveraging regime this arm bled in); exits continue.
+Fail-open below `FUNDING_ARB_REGIME_VETO_MIN_MAJORS` (default 5) distinct majors.
+The Kraken arm was **re-armed** 2026-06-19 (`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 25→40)
+as a MEASURED forward test, justified by this regime veto + tighter breakeven — the
+honest −$28 stays on the books; proof_scorecard judges whether the protections work.
+Funding-history tracker (`arbitrage/funding_history.py`, `data/funding_history.json`)
+tuned via `FUNDING_HISTORY_RETENTION_DAYS`/`_SAMPLE_MIN`/`_MAX_GAP_HOURS`/`_SAVE_SEC`.
+See memory `funding_arb_kraken_bleed`.
 
 ## Session-filter env knobs (no code change)
 Time-of-day gate (`src/session_filter.py`): `SESSION_MIN_SAMPLES` (default 20 — below this a
@@ -122,14 +132,28 @@ or the flag file `data/KILL_SWITCH` (live-toggleable: `ssh … "touch
 /opt/crypto-bot/data/KILL_SWITCH"` to stop, `rm` to resume; no restart). Fails OPEN.
 **Per-arm funding loss cap** (`FundingArbPaperSim.max_drawdown_usd`): an arm halts new
 entries once its cumulative net ≤ -cap (alert once on engage + on resume). Defaults:
-`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` 25 (lowered from 40 on 2026-06-13 to retire the
-arm: realized net ~-$28 trips this immediately → no new entries; negative EV +
-funding-arb dead in the fear regime; re-arm by raising it), `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
+`FUNDING_ARB_KRAKEN_MAX_DRAWDOWN` **40** (was lowered 40→25 on 2026-06-13 to retire the
+arm after a ~-$28 bleed; **re-armed back to 40 on 2026-06-19** now that the deleveraging
+regime veto + tighter breakeven address the regime-driven bleed — a measured forward
+test, the −$28 stays on the books), `FUNDING_ARB_MAJORS_MAX_DRAWDOWN` 25,
 `FUNDING_ARB_MAX_DRAWDOWN` 0 (aggressive/fantasy baseline left uncapped); 0 disables.
 **Global funding cap** `FUNDING_ARB_GLOBAL_MAX_DRAWDOWN` (default 0/off): when the 3
 arms' combined net breaches it, the merge loop engages the master kill. The directional
 arm also honors the kill (funnel `skip:killed`). See memory `attribution_ledger` /
 `risk_controls`.
+
+## Swing cadence env knobs (no code change)
+`swing_paper.py` now CAPS new entries toward "a few good trades, day and night" — it never
+forces a trade (flat sessions take 0). `SWING_MAX_TRADES_DAY` (default 3) per day-window
+(EU+US, 8-23 UTC), `SWING_MAX_TRADES_NIGHT` (default 3) per night-window (Asia, 0-7 UTC),
+`SWING_MAX_OPEN_POSITIONS` (default 7; 7×$62.50≈$440 of the $500 paper bankroll). When more
+setups qualify on one bar-close than the budget allows, conviction ranking (`_conviction`:
+20-bar ROC + distance above EMA50) keeps the strongest. The locked 4h-majors entry edge
+(`src/swing_strategy.py`) is untouched. **Universe stays the proven 6 majors** — the
+2026-06-08 sweep found broadening bled, so `deploy/swing_cron.txt` keeps
+`SWING_SYMBOLS=BTC,ETH,SOL,LTC,BCH,XRP`; a wider set must forward-prove on a SEPARATE
+ledger first (`SWING_STATE_FILE` override + the commented measure-first cron line). See
+memory `swing-frequency-1h-band`.
 
 ## Proof bar (proof_scorecard.py)
 Pre-registered bar unchanged (executable & n≥30 & expectancy>0 & correlation-adjusted t>2)
@@ -139,9 +163,73 @@ counts as proof. An arm clearing the single bar but not the family bar reads `PR
 (single) — NOT family-wise robust`; only `PROVEN ✓` counts in the final verdict. k=1
 reproduces the original bar exactly. The weekly Telegram report (`scripts/weekly_report.py`)
 now surfaces both the per-arm verdicts (§7) and the session-edge table (§8).
+**Deflated Sharpe Ratio (Bailey & López de Prado, 2026-06-20):** each arm also reports a DSR =
+P(true Sharpe > `sr0`), where `sr0 = _expected_max_sharpe(...)` is the expected MAX per-trade
+Sharpe across the k arms tried (False Strategy Theorem), and the DSR widens the Sharpe's error
+band for skew/kurtosis. Bar `DSR>0.95`. The final VERDICT now requires an arm to clear **both**
+the family-wise clustered-t bar AND the DSR bar to count as robustly proven — the pre-registered
+n≥30 / expectancy>0 / t>2 bar is unchanged; DSR only tightens, never loosens.
+
+## AI brain context (what it's fed — no code change)
+The Claude-Opus discretionary brain (`src/trade_brain.py`, runner `brain_paper.py`) is
+prompt/context-based — it "learns" from what we feed it each run, not gradient training. It is
+fed only **curated repo truth + its own record**, scoped to six understanding-targets (cost,
+this system's unproven epistemic state, regime+persistence, correlation/BTC-beta, self-
+calibration, the graveyard). Surfaces: (1) a durable **curated knowledge base**
+(`src/brain_knowledge.py`) injected as a 2nd cached system block (`BRAIN_KNOWLEDGE=1`); (2)
+**measure-first desk blocks** (`src/desk_blocks.py`): `proof_status` (system-wide proof verdicts
+→ epistemic humility), `session_edge`, `swing_attribution` — toggles `BRAIN_BLOCK_PROOF`/
+`_SESSION`/`_SWING` (default 1), each fail-safe→absent; (3) an enriched **memory** loop
+(`build_memory`: win-rate by coin & action + worst-trade post-mortems with the losing thesis).
+All REFINE/RISK-CHECK only — never new triggers; the brain's risk controls (drawdown stop,
+F&G short-veto, correlation cap) are untouched. **ML models NOT trained:** XGBoost/calibrator
+only train on the shelved negative-EV directional journal (empty OFI/lead-lag features); training
+them would teach the losing scalper's patterns. Revisit only after retargeting ML to a strategy
+that actually trades + full-feature labeled data. See memory `trade_brain`.
+
+## Maker-only microstructure (OFI+CVD+OBI on Kraken) — 90-day re-test (foundation)
+Re-testing the microstructure scalper (FAILED before at t≈−8.82 with TAKER cost on 2s-REST +
+candle-CVD) under a legitimately different hypothesis: **real Kraken tick data + maker-only
+fills**. Foundation landed (core mechanisms, unit-tested; live-loop wiring is the next stage):
+- **Honest maker fill model** (`src/maker_fill.py`): a resting post-only limit fills ONLY when
+  the tape trades THROUGH it (taker sell ≤ our bid / taker buy ≥ our ask), else cancels on
+  timeout = **no trade**; adverse selection emerges naturally; maker fee, no spread-cross.
+  Knobs `MAKER_FEE_SPOT` (0.0025), `MAKER_FILL_TIMEOUT_SECS` (30).
+- **Tick CVD** (`src/cvd_tracker.TickCVDTracker`): real signed-volume CVD from `KrakenTradeFeed`
+  (currently only → VPIN), replacing the candle Kaufman proxy; emits the same `CVDState`.
+- **OBI** (`src/orderflow_ws.obi_from_book`): pure top-of-book imbalance helper for the gate.
+- **Proof arm** `proof_scorecard._microstructure_forward()` (reads `data/micro_paper_state.json`,
+  entry-minute clustered, executable=maker-only-longs-on-spot). **Do NOT expand to other
+  exchanges until this arm reads PROVEN ✓ over ≥90 days.** (The Bybit parallel client is that
+  post-proof "expand" step.) NEXT STAGE (needs on-VPS WS testing): fan `KrakenTradeFeed` out to
+  CVD, wire OBI from `KrakenBookFeed`, route the live micro path through the maker model, record
+  to the separate `data/micro_paper_state.json`.
+
+## Volatility-target sizing (no code change)
+`src/vol_sizing.py` adds realized-vol (inverse-vol) position sizing — the strongest-proven
+sizing edge (vol targeting; ~Sharpe 0.99→1.54 in research). Multiplier =
+clamp(`VOL_TARGET_ATR_PCT`/realized_atr_pct, `VOL_SIZE_FLOOR`, `VOL_SIZE_CAP`) (defaults
+0.004 / 0.5 / 1.5), applied on the DIRECTIONAL main-loop sizing beside the IV monitor
+(`CryptoVolMonitor` covers only BTC/ETH → alts previously sized flat; this covers all
+symbols from the ATR already computed). `VOL_TARGET_SIZING=0` disables. Deliberately NOT
+applied to the swing/funding/brain forward-tests — their pre-registered proofs assume
+uniform sizing, so changing it mid-flight would corrupt an in-progress 90-day proof.
+
+## Regime persistence (whipsaw filter — opt-in, no code change)
+`src/regime_detector.PersistentRegime` wraps the raw `RegimeResult` stream: a NEW regime must
+hold for `REGIME_PERSIST_BARS` consecutive bars before the stable label flips (the Statistical
+Jump Model result — penalising switches is what makes regime detection beat buy-and-hold net of
+costs). **CRASH is exempt** (risk-off engages immediately). Per-symbol state; held label carries
+the current bar's metrics. **Default `REGIME_PERSIST_BARS=0` → passthrough** (zero behaviour
+change), so it can't alter any in-flight proof until deliberately enabled; wired at the 3 regime
+sites in `paper_trading.py` via `regime_persist.update(sym, regime_detector.detect(...))`.
 
 ## Telegram
-Buy/sell/error + funding-arb alerts → chat ID `7553694317`.
+Buy/sell/error + funding-arb alerts → chat ID `7553694317`. **Global mute:**
+`CRYPTO_TELEGRAM_MUTE=1` silences EVERY crypto alert at the single `send_message`
+chokepoint while the bot keeps trading normally (set it in the VPS `.env` + restart).
+The `stockbot/` project posts via its OWN independent notifier (`STOCKBOT_TELEGRAM=1`,
+`stockbot/notify.py`), so muting crypto does not affect stock posts and vice-versa.
 
 ## Status
 - Paper mode. Scalper idle in low volatility (by design). Funding arms active.

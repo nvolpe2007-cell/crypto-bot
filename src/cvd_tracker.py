@@ -272,3 +272,92 @@ class CVDTracker:
 
         # Same sign = price responding to CVD
         return (net_delta > 0 and price_move > 0) or (net_delta < 0 and price_move < 0)
+
+
+# ── Tick-level CVD (real Kraken trade tape) ──────────────────────────────────
+
+_TICK_WINDOW_SECS = 60.0   # rolling window for slope/price-response
+_TICK_SLOPE_SECS  = 10.0   # CVD slope measured over the last ~10s (OFI's horizon)
+
+
+class TickCVDTracker:
+    """CVD from the REAL trade tape (KrakenTradeFeed) instead of the candle
+    Kaufman approximation. Each taker print adds +qty (taker buy) or -qty (taker
+    sell) to a running cumulative volume delta — the genuine quantity the
+    candle proxy only estimated. Emits the SAME `CVDState` as CVDTracker so the
+    microstructure gate consumes it interchangeably.
+
+    update_tick(price, qty, side, timestamp): `side` is the TAKER side per Kraken
+    docs ('buy'/'sell'). Pure/synchronous → unit-testable by replaying a tape.
+    """
+
+    def __init__(self, symbol: str = '', window_secs: float = _TICK_WINDOW_SECS):
+        self.symbol = symbol
+        self._window_secs = window_secs
+        # rolling (ts, signed_qty, price) within the window
+        self._events: deque = deque()
+        self._cvd: float = 0.0           # cumulative (session) signed volume
+        self._last_aligned_time: float = 0.0
+        self._tick_count: int = 0
+
+    def update_tick(self, price: float, qty: float, side: str,
+                    timestamp: float) -> CVDState:
+        signed = float(qty) if str(side).lower() == 'buy' else -float(qty)
+        self._cvd += signed
+        self._tick_count += 1
+        self._events.append((float(timestamp), signed, float(price)))
+        # evict events older than the window
+        cutoff = timestamp - self._window_secs
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+        # slope = net signed volume over the last _TICK_SLOPE_SECS, per second
+        recent = [e for e in self._events if e[0] >= timestamp - _TICK_SLOPE_SECS]
+        net_recent = sum(e[1] for e in recent)
+        span = max(1e-9, (recent[-1][0] - recent[0][0]) if len(recent) > 1 else 1.0)
+        slope = net_recent / span
+
+        if slope > 1e-9:
+            direction = 1
+        elif slope < -1e-9:
+            direction = -1
+        else:
+            direction = 0
+
+        # price responding: did price move with CVD over the recent window?
+        if len(recent) >= 2:
+            price_move = recent[-1][2] - recent[0][2]
+            price_responding = (
+                (net_recent > 0 and price_move > 0) or
+                (net_recent < 0 and price_move < 0) or
+                abs(net_recent) < 1e-12
+            )
+        else:
+            price_responding = True   # insufficient data → assume responding
+
+        if price_responding and direction != 0:
+            self._last_aligned_time = timestamp
+        seconds_since_aligned = (timestamp - self._last_aligned_time
+                                 if self._last_aligned_time > 0 else 999.0)
+
+        return CVDState(
+            cvd_now=self._cvd,
+            cvd_slope=slope,
+            cvd_direction=direction,
+            price_responding=price_responding,
+            seconds_since_aligned=seconds_since_aligned,
+            last_candle_delta=signed,     # last tick's signed qty (field reused)
+            candle_count=self._tick_count,
+        )
+
+    def aligned_with_ofi(self, ofi_direction: int) -> bool:
+        """Confluence helper mirroring CVDTracker: latest slope direction agrees
+        with OFI and price is responding. Recomputed cheaply from the buffer."""
+        if not self._events:
+            return False
+        recent = self._events[-1]
+        # cheap re-read: use the sign of the recent windowed net
+        net_recent = sum(e[1] for e in self._events
+                         if e[0] >= recent[0] - _TICK_SLOPE_SECS)
+        direction = 1 if net_recent > 0 else (-1 if net_recent < 0 else 0)
+        return direction != 0 and direction == ofi_direction

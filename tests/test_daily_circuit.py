@@ -229,6 +229,41 @@ class TestPersistence:
         assert cb.state.losses == 0
         assert cb.state.wins == 0
 
+    def test_save_is_atomic_no_leftover_tmp_file(self, state_file):
+        """save() must write via a .tmp file + os.replace, never leaving the
+        .tmp behind and never leaving STATE_FILE partially written."""
+        with _patch_now(_DATE_A):
+            cb = DailyCircuitBreaker(max_losses=3)
+            cb.record_outcome(won=False, pnl=-1.0, symbol="BTC/USD")
+        assert os.path.exists(state_file)
+        assert not os.path.exists(state_file + ".tmp")
+        with open(state_file) as f:
+            d = json.load(f)  # must be valid, complete JSON
+        assert d["losses"] == 1
+
+    def test_corrupted_file_logs_warning_and_starts_fresh(self, state_file, caplog):
+        """A truncated/corrupt state file (e.g. from a crash mid-write before the
+        atomic-save fix) must not silently look identical to a missing file —
+        it should be logged loudly, even though the safe fallback is still to
+        start the day fresh rather than wedge the bot halted forever."""
+        with open(state_file, "w") as f:
+            f.write('{"date_utc": "2024-06-01", "losses": 2,')  # truncated JSON
+
+        with _patch_now(_DATE_A):
+            cb = DailyCircuitBreaker(max_losses=2)
+
+        assert cb.state.losses == 0
+        assert cb.state.wins == 0
+        assert any("unreadable" in r.message for r in caplog.records)
+
+    def test_missing_file_does_not_log_warning(self, state_file, caplog):
+        """Genuinely missing file (first-ever run) is the normal case and
+        should NOT trigger the corruption warning."""
+        assert not os.path.exists(state_file)
+        with _patch_now(_DATE_A):
+            DailyCircuitBreaker(max_losses=2)
+        assert not any("unreadable" in r.message for r in caplog.records)
+
 
 # ── status() ─────────────────────────────────────────────────────────────────
 

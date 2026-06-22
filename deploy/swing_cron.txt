@@ -8,4 +8,22 @@
 # 1h all -$0.93/trade, daily majors -$1.04/trade, alts negative. So the 1h/daily
 # bands and the alt universe were reverted to protect the one clean proof track.
 # Do NOT re-broaden without forward evidence. See memory swing-frequency-1h-band.
+#
+# CADENCE GOVERNORS (2026-06-12, swing_paper.py): the runner now CAPS new entries
+# at SWING_MAX_TRADES_DAY (default 3) per day-window (EU+US, 8-23 UTC) and
+# SWING_MAX_TRADES_NIGHT (default 3) per night-window (Asia, 0-7 UTC), with a
+# SWING_MAX_OPEN_POSITIONS cap (default 7) and conviction ranking so a binding
+# budget keeps the BEST setups. These only CAP/RANK — they never force a trade,
+# so the proven edge above is untouched. Defaults are active without env vars.
 15 * * * * cd /opt/crypto-bot && SWING_INTERVALS=240 SWING_SYMBOLS=BTC,ETH,SOL,LTC,BCH,XRP /usr/bin/python3 swing_paper.py >> logs/swing_paper.log 2>&1
+
+# ── OPTIONAL: wider-universe MEASURE-FIRST track (NOT installed by default) ────
+# The owner wants ~2-3 trades per window; the proven 6 majors at 4h may not
+# supply that many quality setups. Adding liquid large-caps multiplies INDEPENDENT
+# setups at the same per-trade edge — BUT the 2026-06-08 sweep warns broadening
+# bled, so the extra names must EARN trust on the forward clock FIRST. To collect
+# that evidence WITHOUT polluting the canonical 6-major proof track, run the wider
+# set into a SEPARATE state file and judge it per-symbol in proof_scorecard
+# ("by symbol") before promoting any name into the canonical line above. Enable
+# knowingly by uncommenting:
+# 15 * * * * cd /opt/crypto-bot && SWING_INTERVALS=240 SWING_SYMBOLS=ADA,DOT,LINK,AVAX SWING_STATE_FILE=data/swing_paper_wide_state.json /usr/bin/python3 swing_paper.py >> logs/swing_paper_wide.log 2>&1
