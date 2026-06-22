@@ -39,18 +39,19 @@ class LeadLagFireEvent:
     fire_direction: int     # 1=buy, -1=sell
     fire_price:     float   # BTC price at fire time (for reference)
     lead_ofi_norm:  float   # OFI value that triggered the fire
+    lag_price_at_fire: Optional[float] = None   # lag instrument price, captured lazily on first check_lag_entry() call
 
 
 class LeadLagV2:
     """
-    BTC-OFI-triggered lead-lag detector with 2-second window and repricing guard.
+    BTC-OFI-triggered lead-lag detector with a configurable window and repricing guard.
 
     Lead instrument: BTC/USD
     Lag instruments: ETH/USD, SOL/USD (any non-BTC symbol)
 
     The detector fires when BTC shows strong OFI AND price has confirmed the
     direction. The fire event is then available for lag instrument entry checks
-    for exactly 2 seconds, provided the lag hasn't already repriced.
+    for the duration of `window_seconds`, provided the lag hasn't already repriced.
     """
 
     def __init__(self,
@@ -149,9 +150,14 @@ class LeadLagV2:
 
         Returns True if ALL of:
           1. A lead fire event is active (not expired)
-          2. We're still within the 2-second window
-          3. The lag instrument has NOT moved more than 3 bps from fire price
+          2. We're still within the signal window
+          3. The lag instrument has NOT moved more than `reprice_bps` from its
+             price at the time of the first check_lag_entry() call after fire
              (the opportunity has not already been taken by faster participants)
+
+        The lag's reference price is captured lazily on the first call after a
+        fire (callers don't have to track it themselves); every later call in
+        the same window is checked against that captured baseline.
 
         Args:
             lag_price: current mid price of the lag instrument (e.g., ETH)
@@ -170,16 +176,12 @@ class LeadLagV2:
             self._fire = None
             return False
 
-        # Calculate how much the lag has already moved since lead fired
-        if self._fire.fire_price > 0 and lag_price > 0:
-            # We need a reference price for the lag at fire time
-            # Since we don't store lag price at fire time, we use current lag price
-            # This is approximate but acceptable — the key guard is the OFI and window
-            self.lag_move_bps = 0.0   # cannot compute without lag_price at fire time
-        else:
+        if self._fire.lag_price_at_fire is None:
+            self._fire.lag_price_at_fire = lag_price
             self.lag_move_bps = 0.0
+            return True
 
-        return True
+        return self.check_lag_entry_with_fire_price(lag_price, self._fire.lag_price_at_fire)
 
     def check_lag_entry_with_fire_price(self, lag_current_price: float,
                                          lag_price_at_fire: float) -> bool:

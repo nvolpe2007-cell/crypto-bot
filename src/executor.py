@@ -258,7 +258,19 @@ class KrakenPerpsExecutor(Executor):
     def close_long(self, symbol, price, timestamp, reason=""):
         amount = abs(self._open_size.get(symbol, 0.0))
         if amount <= 0:
-            return OrderResult(False, None, 0, 0, 0, error="no long position")
+            # _open_size is in-process only and resets on every restart. Before
+            # giving up, verify against the exchange so a real position left
+            # over from a previous run still gets closed (same ghost-position
+            # guard used to recover open_long/open_short after a timeout).
+            net = self._reconcile_position(symbol)
+            if net is not None and net > 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_long: local state showed no position but "
+                    f"exchange has {net:.6f} {symbol}; closing the real position."
+                )
+                amount = net
+            else:
+                return OrderResult(False, None, 0, 0, 0, error="no long position")
         try:
             order = self._market_order("sell", symbol, amount, reduce_only=True)
             filled_price = float(order.get("average") or order.get("price") or price)
@@ -268,12 +280,37 @@ class KrakenPerpsExecutor(Executor):
                                amount, 0.0, is_leveraged=True, leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] close_long failed: {e}")
+            # The exception may be an ambiguous timeout where the order actually
+            # filled on the exchange before the response was lost. If we leave
+            # _open_size untouched, a caller that doesn't retry treats this as
+            # still-open forever even though it's flat — same ghost-position
+            # risk open_long/open_short already guard against.
+            net = self._reconcile_position(symbol)
+            if net is not None and net <= 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_long errored but exchange confirms {symbol} "
+                    f"is no longer long (net={net:.6f}); the close went through "
+                    f"despite the error. Updating local state."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, amount, 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
     def close_short(self, symbol, price, timestamp, reason=""):
         amount = abs(self._open_size.get(symbol, 0.0))
         if amount <= 0:
-            return OrderResult(False, None, 0, 0, 0, error="no short position")
+            # See close_long: local _open_size doesn't survive a restart, so
+            # confirm with the exchange before declaring there's nothing to close.
+            net = self._reconcile_position(symbol)
+            if net is not None and net < 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_short: local state showed no position but "
+                    f"exchange has {net:.6f} {symbol}; closing the real position."
+                )
+                amount = abs(net)
+            else:
+                return OrderResult(False, None, 0, 0, 0, error="no short position")
         try:
             order = self._market_order("buy", symbol, amount, reduce_only=True)
             filled_price = float(order.get("average") or order.get("price") or price)
@@ -283,6 +320,18 @@ class KrakenPerpsExecutor(Executor):
                                amount, 0.0, is_leveraged=True, leverage=self.leverage)
         except Exception as e:
             logger.error(f"[PERPS-LIVE] close_short failed: {e}")
+            # See close_long: confirm with the exchange in case the close
+            # actually went through despite the exception (ambiguous timeout).
+            net = self._reconcile_position(symbol)
+            if net is not None and net >= 0:
+                logger.warning(
+                    f"[PERPS-LIVE] close_short errored but exchange confirms {symbol} "
+                    f"is no longer short (net={net:.6f}); the close went through "
+                    f"despite the error. Updating local state."
+                )
+                self._open_size[symbol] = net
+                return OrderResult(True, None, price, amount, 0.0,
+                                   is_leveraged=True, leverage=self.leverage)
             return OrderResult(False, None, 0, 0, 0, error=str(e))
 
 

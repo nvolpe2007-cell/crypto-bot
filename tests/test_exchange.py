@@ -462,6 +462,75 @@ class TestCreateOrder:
         assert 'price' not in kwargs
 
 
+# ── create_order circuit-breaker integration ──────────────────────────────────────────────
+#
+# create_order is never retried (non-idempotent), but it must still count
+# transient failures against self._order_circuit — otherwise a persistently
+# failing order endpoint gets hammered once per caller attempt forever (e.g.
+# a stop-loss watcher retrying every second) instead of tripping the same
+# cooldown protection every other order-management call gets.
+
+class TestCreateOrderCircuitBreaker:
+    async def test_success_records_success_and_resets_breaker(self):
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=2, cooldown_seconds=60.0)
+        conn._order_circuit.record_failure()  # pre-existing failure
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'ok'})
+        await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 0
+
+    async def test_network_error_counts_toward_order_circuit(self):
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=5, cooldown_seconds=60.0)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 1
+        # Still no retry — exactly one call to the underlying exchange.
+        assert conn.exchange.create_order.call_count == 1
+
+    async def test_timeout_counts_toward_order_circuit(self):
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=5, cooldown_seconds=60.0)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.RequestTimeout("t/o"))
+        with pytest.raises(ccxt.RequestTimeout):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 1
+
+    async def test_repeated_transient_failures_open_order_circuit(self):
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=2, cooldown_seconds=60.0)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        for _ in range(2):
+            with pytest.raises(ccxt.NetworkError):
+                await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.is_open
+
+    async def test_open_order_circuit_blocks_further_attempts(self):
+        """Once the order circuit is open, create_order must raise
+        CircuitBreakerOpen WITHOUT even calling the underlying exchange —
+        protects a flaky order endpoint from being hammered every tick."""
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn._order_circuit.record_failure()  # trip it directly
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'should-not-be-called'})
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        conn.exchange.create_order.assert_not_called()
+
+    async def test_non_transient_error_does_not_trip_order_circuit(self):
+        """Permanent rejections (insufficient funds, bad params, auth) must
+        propagate without touching the circuit — same philosophy as _retry's
+        non-retryable-error handling elsewhere in this file."""
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=2, cooldown_seconds=60.0)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.AuthenticationError("bad key"))
+        with pytest.raises(ccxt.AuthenticationError):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 0
+        assert not conn._order_circuit.is_open
+
+
 # ── cancel_order ─────────────────────────────────────────────────────────────────────────
 
 class TestCancelOrder:
@@ -1036,6 +1105,40 @@ class TestFuturesCircuitBreaker:
         fn_ok = AsyncMock(return_value={'last': 50000.0})
         await conn._retry(fn_ok, retries=1, label='ok')
         assert conn._circuit.failure_count == 0
+
+
+# ── KrakenFuturesConnection.create_order circuit-breaker integration ───────────────────────
+
+class TestFuturesCreateOrderCircuitBreaker:
+    async def test_success_resets_order_circuit(self):
+        conn = _make_futures_conn(threshold=2)
+        conn._order_circuit.record_failure()
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'ok'})
+        await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 0
+
+    async def test_network_error_counts_toward_order_circuit(self):
+        conn = _make_futures_conn(threshold=5)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        with pytest.raises(ccxt.NetworkError):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 1
+        assert conn.exchange.create_order.call_count == 1  # still no retry
+
+    async def test_open_order_circuit_blocks_further_attempts(self):
+        conn = _make_futures_conn(threshold=1)
+        conn._order_circuit.record_failure()
+        conn.exchange.create_order = AsyncMock(return_value={'id': 'should-not-be-called'})
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        conn.exchange.create_order.assert_not_called()
+
+    async def test_non_transient_error_does_not_trip_order_circuit(self):
+        conn = _make_futures_conn(threshold=2)
+        conn.exchange.create_order = AsyncMock(side_effect=ccxt.AuthenticationError("bad key"))
+        with pytest.raises(ccxt.AuthenticationError):
+            await conn.create_order('BTC/USD', 'market', 'buy', 0.001)
+        assert conn._order_circuit.failure_count == 0
 
 
 # ── Rate-limit-specific backoff ──────────────────────────────────────────────────────────────

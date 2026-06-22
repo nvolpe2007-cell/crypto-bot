@@ -63,6 +63,8 @@ from src.live_trading import (
     _quick_diagnose,
     _update_chandelier_stop,
     _kill_switch_engaged,
+    _sltp_circuit_alert,
+    _sltp_circuit_cleared,
     run_live_trading_session,
     FEE_RATE,
     ATR_TRAIL_MULT,
@@ -888,3 +890,62 @@ class TestKillSwitchEngaged:
         kill_isolated.engage("test")
         # Must not raise even though send_message blows up
         assert _kill_switch_engaged(notifier, was_killed=False) is True
+
+
+# ── _sltp_circuit_alert / _sltp_circuit_cleared ─────────────────────────────────
+#
+# Before this fix, the SL/TP watcher's per-symbol try/except caught
+# CircuitBreakerOpen with the same blanket `except Exception: logger.debug(...)`
+# used for routine fetch failures — meaning a triggered stop-loss that could
+# not execute (because the exchange order circuit tripped) failed completely
+# silently, with no Telegram alert and no log above debug level, while a real
+# position sat past its stop. These helpers alert once on the transition into
+# / out of that blocked state, mirroring _kill_switch_engaged's pattern.
+
+class TestSltpCircuitAlert:
+    def test_returns_true_blocked_state(self):
+        assert _sltp_circuit_alert(None, "BTC/USD", 30.0, was_blocked=False) is True
+
+    def test_notifies_once_on_first_block(self):
+        notifier = MagicMock()
+        blocked = _sltp_circuit_alert(notifier, "BTC/USD", 30.0, was_blocked=False)
+        assert blocked is True
+        assert notifier.send_message.call_count == 1
+        msg = notifier.send_message.call_args[0][0]
+        assert "BTC/USD" in msg
+        assert "circuit breaker" in msg.lower()
+
+    def test_does_not_renotify_while_still_blocked(self):
+        notifier = MagicMock()
+        _sltp_circuit_alert(notifier, "BTC/USD", 30.0, was_blocked=False)
+        _sltp_circuit_alert(notifier, "BTC/USD", 25.0, was_blocked=True)
+        assert notifier.send_message.call_count == 1
+
+    def test_no_notifier_does_not_raise(self):
+        assert _sltp_circuit_alert(None, "ETH/USD", 10.0, was_blocked=False) is True
+
+    def test_notifier_exception_swallowed(self):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        assert _sltp_circuit_alert(notifier, "BTC/USD", 30.0, was_blocked=False) is True
+
+
+class TestSltpCircuitCleared:
+    def test_returns_false_blocked_state(self):
+        assert _sltp_circuit_cleared(None, "BTC/USD") is False
+
+    def test_notifies_on_clear(self):
+        notifier = MagicMock()
+        cleared = _sltp_circuit_cleared(notifier, "BTC/USD")
+        assert cleared is False
+        notifier.send_message.assert_called_once()
+        msg = notifier.send_message.call_args[0][0]
+        assert "BTC/USD" in msg
+
+    def test_no_notifier_does_not_raise(self):
+        assert _sltp_circuit_cleared(None, "ETH/USD") is False
+
+    def test_notifier_exception_swallowed(self):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        assert _sltp_circuit_cleared(notifier, "BTC/USD") is False
