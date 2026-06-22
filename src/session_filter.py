@@ -54,6 +54,16 @@ def session_of_hour(hour: Optional[int]) -> Optional[str]:
     return "Asia" if h < 8 else ("EU" if h < 16 else "US")
 
 
+def window_of_hour(hour: Optional[int]) -> Optional[str]:
+    """Collapse the session bucket into the owner's day/night split:
+    "night" = Asia (0-7 UTC), "day" = EU+US (8-23 UTC). Used by the swing
+    runner's per-window trade budget. None on bad input."""
+    s = session_of_hour(hour)
+    if s is None:
+        return None
+    return "night" if s == "Asia" else "day"
+
+
 def _wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
     """Lower bound of the 95% Wilson score interval for a win-rate. Penalises
     small samples — a 3/4 streak does not certify a high win-rate."""

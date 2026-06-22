@@ -45,6 +45,27 @@ _WHALE_HISTORY   = 100    # trade history for avg size calculation
 _STALE_SECS      = 90     # data older than this is considered stale
 
 
+def obi_from_book(bids, asks, levels: int = _BOOK_LEVELS):
+    """Order-Book Imbalance from a top-of-book snapshot in the REST/WS shape
+    `[[price, qty], ...]` that KrakenBookFeed.get_top() returns.
+
+    Returns bid_vol / (bid_vol + ask_vol) over the top `levels` on each side
+    (>0.55 = bid-heavy/bullish lean, <0.40 = ask-heavy/bearish). Pure and
+    side-effect free so it's unit-testable and reusable by the microstructure
+    gate off the live KrakenBookFeed — None if the book is empty/degenerate."""
+    if not bids or not asks:
+        return None
+    try:
+        bid_vol = sum(float(q) for _, q in list(bids)[:levels])
+        ask_vol = sum(float(q) for _, q in list(asks)[:levels])
+    except (TypeError, ValueError):
+        return None
+    total = bid_vol + ask_vol
+    if total < 1e-12:
+        return None
+    return bid_vol / total
+
+
 @dataclass
 class WhalePrint:
     side:       str     # "buy" or "sell"

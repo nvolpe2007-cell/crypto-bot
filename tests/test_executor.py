@@ -9,9 +9,15 @@ Covers:
   track _open_size, extract filled_price/fee from ccxt response
 - KrakenPerpsExecutor.close_long / close_short: use reduce_only=True, read accumulated
   _open_size, set size back to 0 on success
+- KrakenPerpsExecutor.close_long / close_short: when local _open_size is empty (e.g.
+  right after a process restart), reconcile against the exchange before declaring
+  "no position" — a real leftover position is still closed
 - KrakenPerpsExecutor: zero-amount guard (price=0 → error OrderResult)
 - KrakenPerpsExecutor: no-position guard on close (returns error, does not call exchange)
 - KrakenPerpsExecutor: exchange exception → error OrderResult, does not propagate
+- KrakenPerpsExecutor: open_long/open_short/close_long/close_short all reconcile against
+  the exchange on an ambiguous order-call exception (ghost-position guard) — recovers
+  local state when the order actually filled despite the error, stays failed otherwise
 - KrakenPerpsExecutor._perp_symbol: BTC/USD → BTC/USD:USD; already-qualified passthrough
 - KrakenPerpsExecutor._amount_from_usd: size_usd / price; price=0 guard
 - KrakenSpotExecutor: supports_shorts returns False
@@ -392,16 +398,45 @@ class TestKrakenPerpsExecutorCloseLong:
 
     def test_close_long_no_position_returns_error(self):
         client = _mock_ccxt()
+        client.fetch_positions.return_value = []
         ex = KrakenPerpsExecutor(client)
-        # _open_size not set → defaults to 0 → amount=0 → error
+        # _open_size not set → defaults to 0 → reconcile confirms flat → error
         result = ex.close_long("BTC/USD", 51_000.0, NOW)
         assert result.success is False
         assert "no long" in (result.error or "").lower()
         client.create_order.assert_not_called()
 
+    def test_close_long_recovers_real_position_after_restart(self):
+        """_open_size is in-process only and is empty right after a restart.
+        If the exchange still shows a real long, close_long must still close it."""
+        client = _mock_ccxt(filled=0.002)
+        client.fetch_positions.return_value = [
+            {"symbol": "BTC/USD:USD", "side": "long", "contracts": 0.002}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        # no pre-seeded _open_size — simulates a fresh process
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is True
+        client.create_order.assert_called_once()
+        _, kwargs = client.create_order.call_args
+        assert kwargs["amount"] == pytest.approx(0.002)
+        assert kwargs.get("params", {}).get("reduceOnly") is True
+
+    def test_close_long_does_not_recover_when_exchange_shows_short(self):
+        """A short found during reconciliation is not a long to close."""
+        client = _mock_ccxt()
+        client.fetch_positions.return_value = [
+            {"symbol": "BTC/USD:USD", "side": "short", "contracts": 0.001}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
+        client.create_order.assert_not_called()
+
     def test_close_long_exchange_exception_returns_error(self):
         client = MagicMock()
         client.create_order.side_effect = Exception("disconnected")
+        client.fetch_positions.side_effect = Exception("disconnected")
         ex = KrakenPerpsExecutor(client)
         ex._open_size["BTC/USD"] = 0.001
         result = ex.close_long("BTC/USD", 51_000.0, NOW)
@@ -436,10 +471,34 @@ class TestKrakenPerpsExecutorCloseShort:
 
     def test_close_short_no_position_returns_error(self):
         client = _mock_ccxt()
+        client.fetch_positions.return_value = []
         ex = KrakenPerpsExecutor(client)
         result = ex.close_short("ETH/USD", 2_900.0, NOW)
         assert result.success is False
         assert "no short" in (result.error or "").lower()
+        client.create_order.assert_not_called()
+
+    def test_close_short_recovers_real_position_after_restart(self):
+        client = _mock_ccxt(filled=0.001)
+        client.fetch_positions.return_value = [
+            {"symbol": "ETH/USD:USD", "side": "short", "contracts": 0.001}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        # no pre-seeded _open_size — simulates a fresh process
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is True
+        _, kwargs = client.create_order.call_args
+        assert kwargs["amount"] == pytest.approx(0.001)
+        assert kwargs.get("params", {}).get("reduceOnly") is True
+
+    def test_close_short_does_not_recover_when_exchange_shows_long(self):
+        client = _mock_ccxt()
+        client.fetch_positions.return_value = [
+            {"symbol": "ETH/USD:USD", "side": "long", "contracts": 0.002}
+        ]
+        ex = KrakenPerpsExecutor(client)
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is False
         client.create_order.assert_not_called()
 
     def test_close_short_success_result(self):
@@ -461,6 +520,7 @@ class TestKrakenPerpsExecutorCloseShort:
     def test_close_short_exchange_exception_returns_error(self):
         client = MagicMock()
         client.create_order.side_effect = RuntimeError("timeout")
+        client.fetch_positions.side_effect = RuntimeError("timeout")
         ex = KrakenPerpsExecutor(client)
         ex._open_size["SOL/USD"] = -0.01
         result = ex.close_short("SOL/USD", 150.0, NOW)
@@ -695,3 +755,64 @@ class TestKrakenPerpsExecutorReconciliation:
         ex = KrakenPerpsExecutor(client)
         result = ex.open_short("BTC/USD", 50_000.0, 50.0, NOW)
         assert result.success is False
+
+    # ── close_long ghost-position recovery ───────────────────────────────────
+    # An ambiguous timeout on the close order itself is the mirror case of the
+    # open-side recovery above: the exchange may have already filled the close
+    # before the response was lost. Without reconciling, _open_size stays at
+    # its pre-close value forever, even though the exchange is actually flat.
+
+    def test_close_long_recovers_when_exchange_confirms_flat_after_timeout(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.return_value = []
+        ex = KrakenPerpsExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is True
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.0)
+
+    def test_close_long_still_fails_when_exchange_still_shows_long(self):
+        # Genuine failure: the close order never reached the exchange.
+        client = MagicMock()
+        client.create_order.side_effect = Exception("rejected")
+        client.fetch_positions.return_value = self._long_positions(contracts=0.002)
+        ex = KrakenPerpsExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.002)
+
+    def test_close_long_still_fails_when_reconciliation_itself_fails(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.side_effect = Exception("also timed out")
+        ex = KrakenPerpsExecutor(client)
+        ex._open_size["BTC/USD"] = 0.002
+        result = ex.close_long("BTC/USD", 51_000.0, NOW)
+        assert result.success is False
+        assert ex._open_size["BTC/USD"] == pytest.approx(0.002)
+
+    # ── close_short ghost-position recovery ──────────────────────────────────
+
+    def test_close_short_recovers_when_exchange_confirms_flat_after_timeout(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("RequestTimeout")
+        client.fetch_positions.return_value = []
+        ex = KrakenPerpsExecutor(client)
+        ex._open_size["ETH/USD"] = -0.001
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is True
+        assert ex._open_size["ETH/USD"] == pytest.approx(0.0)
+
+    def test_close_short_still_fails_when_exchange_still_shows_short(self):
+        client = MagicMock()
+        client.create_order.side_effect = Exception("rejected")
+        client.fetch_positions.return_value = self._short_positions(
+            symbol="ETH/USD:USD", contracts=0.001
+        )
+        ex = KrakenPerpsExecutor(client)
+        ex._open_size["ETH/USD"] = -0.001
+        result = ex.close_short("ETH/USD", 2_900.0, NOW)
+        assert result.success is False
+        assert ex._open_size["ETH/USD"] == pytest.approx(-0.001)
