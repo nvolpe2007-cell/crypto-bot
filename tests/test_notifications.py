@@ -25,6 +25,8 @@ create_notifier_from_env:
 """
 
 import os
+import threading
+import time
 import pytest
 from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
@@ -581,6 +583,74 @@ class TestSendMessage:
         assert result is False
 
 
+# ── TelegramNotifier.send_message (async_safe=True) ───────────────────────────
+# The live bot drives its whole trading loop from one asyncio event loop.
+# async_safe=True moves the HTTP call onto a background thread so a slow
+# Telegram round-trip can't stall price polling / exit checks / other arms.
+
+class TestSendMessageAsyncSafe:
+    def _make(self, enabled=True) -> TelegramNotifier:
+        return TelegramNotifier("tok", "chat", enabled=enabled, async_safe=True)
+
+    def test_default_constructor_is_still_blocking(self):
+        """Sanity check: existing callers that don't pass async_safe see no change."""
+        notifier = TelegramNotifier("tok", "chat", enabled=True)
+        assert notifier._async_safe is False
+
+    def test_returns_true_immediately_without_blocking_on_slow_http(self):
+        notifier = self._make()
+        release = threading.Event()
+
+        def slow_post(*args, **kwargs):
+            release.wait(timeout=2)
+            r = MagicMock()
+            r.raise_for_status = MagicMock()
+            return r
+
+        with patch("requests.post", side_effect=slow_post):
+            start = time.monotonic()
+            result = notifier.send_message("hello")
+            elapsed = time.monotonic() - start
+        release.set()  # let the background thread finish before the patch exits
+        time.sleep(0.05)
+        assert result is True
+        assert elapsed < 0.5, "send_message blocked on the HTTP call instead of queueing it"
+
+    def test_message_is_eventually_delivered_in_order(self):
+        notifier = self._make()
+        sent = []
+
+        def capture(url, json=None, timeout=None):
+            sent.append(json["text"])
+            r = MagicMock()
+            r.raise_for_status = MagicMock()
+            return r
+
+        with patch("requests.post", side_effect=capture):
+            notifier.send_message("first")
+            notifier.send_message("second")
+            for _ in range(50):
+                if len(sent) >= 2:
+                    break
+                time.sleep(0.02)
+        assert sent == ["first", "second"]
+
+    def test_disabled_does_not_queue_or_call_http(self):
+        notifier = self._make(enabled=False)
+        with patch("requests.post") as mock_post:
+            result = notifier.send_message("no-op")
+            time.sleep(0.05)
+        assert result is False
+        mock_post.assert_not_called()
+
+    def test_http_failure_in_background_thread_does_not_raise(self):
+        notifier = self._make()
+        with patch("requests.post", side_effect=Exception("network down")):
+            result = notifier.send_message("hello")  # must not raise
+            time.sleep(0.05)
+        assert result is True  # queued successfully; delivery failure is logged, not surfaced
+
+
 # ── send_trade_alert ──────────────────────────────────────────────────────────
 
 class TestSendTradeAlert:
@@ -845,6 +915,18 @@ class TestCreateNotifierFromEnv:
             os.environ.pop("TELEGRAM_ENABLED", None)
             notifier = create_notifier_from_env()
         assert not notifier.enabled
+
+    def test_configured_notifier_is_async_safe(self):
+        """The bot's shared notifier sends from inside the asyncio trading loop —
+        it must use the non-blocking (async_safe) path, not the default sync one."""
+        env = {
+            "TELEGRAM_BOT_TOKEN": "real_token",
+            "TELEGRAM_CHAT_ID": "123456",
+            "TELEGRAM_ENABLED": "true",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            notifier = create_notifier_from_env()
+        assert notifier._async_safe is True
 
 
 # ── global crypto-Telegram mute (CRYPTO_TELEGRAM_MUTE) ────────────────────────
