@@ -22,7 +22,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, call, patch
 import ccxt.async_support as ccxt
 
-from src.exchange import KrakenFuturesConnection, CircuitBreaker
+from src.exchange import KrakenFuturesConnection, CircuitBreaker, CircuitBreakerOpen
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────
@@ -439,6 +439,32 @@ class TestFuturesGetBalance:
         with pytest.raises(ccxt.AuthenticationError):
             await conn.get_balance(retries=3)
         assert conn.exchange.fetch_balance.call_count == 1
+
+    async def test_uses_data_circuit_not_generic(self):
+        """Mirrors spot ExchangeConnection: get_balance must share _data_circuit
+        with fetch_ohlcv/get_ticker so a market-data outage short-circuits it
+        too, instead of falling through to the generic self._circuit.
+        """
+        conn = _make_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_balance = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        conn._data_circuit.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.get_balance()
+        conn.exchange.fetch_balance.assert_not_called()
+
+    async def test_failure_does_not_trip_generic_circuit(self):
+        conn = _make_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_balance = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        with pytest.raises(ccxt.NetworkError):
+            await conn.get_balance(retries=1)
+        assert conn._data_circuit.is_open
+        assert not conn._circuit.is_open
 
 
 # ── create_order — no retry ──────────────────────────────────────────────────────────────

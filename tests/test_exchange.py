@@ -350,6 +350,35 @@ class TestGetBalance:
         with pytest.raises(ccxt.NetworkError):
             await conn.get_balance(retries=2)
 
+    async def test_uses_data_circuit_not_generic(self):
+        """get_balance is a read-only market-data-style call: it must share
+        _data_circuit with fetch_ohlcv/get_ticker/get_positions (per the
+        cascade-prevention design in _retry's docstring), not fall through to
+        the generic self._circuit by omission.
+        """
+        conn = _make_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_balance = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        # Trip the data circuit directly (simulating a prior OHLCV/ticker outage)
+        conn._data_circuit.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.get_balance()
+        # The already-open data circuit short-circuits before any network call
+        conn.exchange.fetch_balance.assert_not_called()
+
+    async def test_failure_does_not_trip_generic_circuit(self):
+        conn = _make_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_balance = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        with pytest.raises(ccxt.NetworkError):
+            await conn.get_balance(retries=1)
+        assert conn._data_circuit.is_open
+        assert not conn._circuit.is_open
+
 
 # ── get_positions ─────────────────────────────────────────────────────────────────────
 
