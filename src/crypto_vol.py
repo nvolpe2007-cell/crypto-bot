@@ -13,9 +13,10 @@ Data refreshed every 15 minutes (Deribit rate limits generously).
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -26,6 +27,31 @@ _DERIBIT_OPTIONS = "https://www.deribit.com/api/v2/public/get_book_summary_by_cu
 _DERIBIT_INDEX   = "https://www.deribit.com/api/v2/public/get_index_price"
 _REFRESH_SECS    = 900   # 15 minutes
 _IV_HISTORY_LEN  = 96    # keep 24h of 15-min samples for percentile
+
+_MONTHS = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+           'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+_EXPIRY_RE = re.compile(r'^(\d{1,2})([A-Z]{3})(\d{2})$')
+
+
+def _parse_expiry(expiry_str: str) -> Optional[date]:
+    """Parse Deribit's 'DDMonYY' expiry token (e.g. '29APR26') into a real date.
+
+    A plain string sort of these tokens orders by day-of-month first, not by
+    year/month — e.g. '5JAN27' < '29APR26' alphabetically despite being later.
+    Returns None for an unparseable token so the caller can sort it last
+    (treat as far-future rather than risk it being picked as the near expiry).
+    """
+    m = _EXPIRY_RE.match(expiry_str)
+    if not m:
+        return None
+    day, mon, yy = m.groups()
+    month = _MONTHS.get(mon)
+    if month is None:
+        return None
+    try:
+        return date(2000 + int(yy), month, int(day))
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -156,7 +182,8 @@ class CryptoVolMonitor:
                 if len(by_expiry) < 2:
                     return
 
-                expiry_keys = sorted(by_expiry.keys())
+                expiry_keys = sorted(by_expiry.keys(),
+                                     key=lambda k: _parse_expiry(k) or date.max)
                 near_iv = self._atm_iv(by_expiry[expiry_keys[0]], spot)
                 far_iv  = self._atm_iv(by_expiry[expiry_keys[1]], spot)
 

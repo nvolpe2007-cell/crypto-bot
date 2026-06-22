@@ -372,6 +372,15 @@ class StrategyAdvisor:
 
         while True:
             try:
+                # bot.py constructs its own TradeJournal() for the advisor,
+                # separate from the instance the trading loop writes through
+                # (run_paper_trading_session / LiveTrader each hold their own).
+                # Without reloading, the advisor's `records` stays frozen at
+                # whatever was on disk at process start and never sees trades
+                # closed during this run — silently reporting "no trades
+                # today" forever.
+                self.journal.reload()
+
                 now = datetime.now(timezone.utc)
 
                 # End-of-day report at trading close

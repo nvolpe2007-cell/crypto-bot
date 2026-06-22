@@ -145,7 +145,8 @@ class Checklist:
     """Runs an ordered list of Check objects against a CheckContext.
 
     `soft_threshold` is the minimum weighted score required when no hard
-    veto fires. Defaults to 0.6 — i.e. setups must clear 60% of soft weight.
+    veto fires. Defaults to 0.4 — i.e. setups must clear 40% of soft weight
+    (lowered from 0.6 by the AGGRESSIVE-mode tuning in 13c8175).
     """
 
     def __init__(self, checks: List[Check], *, soft_threshold: float = 0.4):

@@ -103,15 +103,18 @@ class StablecoinArbBot:
             fee_mul = 1.0 - self.fee_pct  # multiplier applied after each leg
 
             # Step 1: USDC → USDT (deduct taker fee)
-            usdc_usdt = prices.get("USDC_USDT", 1.0)
+            # Direct indexing (not .get(..., 1.0)): get_triangle_prices already
+            # guarantees all three legs are present with real fetched prices,
+            # never a fabricated peg fallback for a leg that failed to fetch.
+            usdc_usdt = prices["USDC_USDT"]
             amount = amount * usdc_usdt * fee_mul
 
             # Step 2: USDT → DAI (deduct taker fee)
-            usdt_dai = prices.get("USDT_DAI", 1.0)
+            usdt_dai = prices["USDT_DAI"]
             amount = amount * usdt_dai * fee_mul
 
             # Step 3: DAI → USDC (deduct taker fee)
-            dai_usdc = prices.get("DAI_USDC", 1.0)
+            dai_usdc = prices["DAI_USDC"]
             amount = amount * dai_usdc * fee_mul
 
             end_amount = amount
@@ -138,18 +141,29 @@ class StablecoinArbBot:
         except Exception as e:
             logger.debug(f"Error scanning {exchange}: {e}")
 
+    _REQUIRED_LEGS = ("USDC_USDT", "USDT_DAI", "DAI_USDC")
+
     async def get_triangle_prices(self, exchange: str) -> Optional[Dict[str, float]]:
         """Get prices for all three pairs on an exchange"""
         try:
             if exchange == "kraken":
-                return await self._get_kraken_prices()
+                prices = await self._get_kraken_prices()
             elif exchange == "coinbase":
-                return await self._get_coinbase_prices()
+                prices = await self._get_coinbase_prices()
             elif exchange == "binance":
-                return await self._get_binance_prices()
+                prices = await self._get_binance_prices()
+            else:
+                return None
         except Exception:
-            pass
-        return None
+            return None
+        # A leg that failed to fetch (or returned a malformed response) is left
+        # out of the dict by the per-leg fetchers below rather than defaulted to
+        # 1.0 — defaulting a broken leg to "peg" can manufacture a fake triangle
+        # profit out of the other two real, possibly off-peg, legs. Reject any
+        # incomplete triangle instead of letting scan_exchange compute on it.
+        if not all(leg in prices for leg in self._REQUIRED_LEGS):
+            return None
+        return prices
 
     async def _get_kraken_prices(self) -> Dict[str, float]:
         """Fetch stablecoin prices from Kraken API"""
@@ -170,10 +184,10 @@ class StablecoinArbBot:
                         data = await resp.json()
                         result = data.get("result", {})
                         ticker = result.get(pair, result.get(list(result.keys())[0], {}))
-                        last_price = float(ticker.get("c", [1.0])[0])
+                        last_price = float(ticker["c"][0])
                         prices[key] = last_price
             except Exception:
-                prices[key] = 1.0  # Default to peg
+                pass  # leg fetch failed — omit it rather than fabricate a peg price
 
         return prices
 
@@ -194,10 +208,10 @@ class StablecoinArbBot:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        price = float(data.get("ticker", {}).get("price", "1.0"))
+                        price = float(data["ticker"]["price"])
                         prices[key] = price
             except Exception:
-                prices[key] = 1.0
+                pass  # leg fetch failed — omit it rather than fabricate a peg price
 
         return prices
 
@@ -218,10 +232,10 @@ class StablecoinArbBot:
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        price = float(data.get("price", "1.0"))
+                        price = float(data["price"])
                         prices[key] = price
             except Exception:
-                prices[key] = 1.0
+                pass  # leg fetch failed — omit it rather than fabricate a peg price
 
         return prices
 
