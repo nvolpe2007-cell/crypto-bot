@@ -693,12 +693,19 @@ class KrakenFuturesConnection:
     async def get_open_positions(self, retries: int = 3) -> List:
         """Get all open perp positions with retry. Returns [] on permanent failure.
         CircuitBreakerOpen propagates unchanged.
+
+        This is a read-only market-data-style call (like spot's get_positions),
+        so it shares _data_circuit with fetch_ohlcv/get_ticker/get_balance —
+        not _order_circuit. Otherwise a run of order-placement failures would
+        also block position reads (masking reconciliation during an outage),
+        and a run of position-read failures would block new order placement
+        for an unrelated reason.
         """
         try:
             return await self._retry(
                 self.exchange.fetch_positions,
                 retries=retries, label='futures.get_open_positions',
-                circuit=self._order_circuit,
+                circuit=self._data_circuit,
             )
         except CircuitBreakerOpen:
             raise

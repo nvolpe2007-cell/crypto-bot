@@ -1141,6 +1141,78 @@ class TestFuturesCreateOrderCircuitBreaker:
         assert conn._order_circuit.failure_count == 0
 
 
+# ── KrakenFuturesConnection.get_open_positions ──────────────────────────────────────────────
+
+class TestFuturesGetOpenPositions:
+    async def test_returns_positions_on_success(self):
+        conn = _make_futures_conn()
+        positions = [{'symbol': 'BTC/USD:USD', 'contracts': 0.01}]
+        conn.exchange.fetch_positions = AsyncMock(return_value=positions)
+        result = await conn.get_open_positions()
+        assert result == positions
+
+    async def test_retries_on_network_error(self):
+        conn = _make_futures_conn()
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=[ccxt.NetworkError("blip"), []]
+        )
+        result = await conn.get_open_positions(retries=3)
+        assert result == []
+        assert conn.exchange.fetch_positions.call_count == 2
+
+    async def test_returns_empty_list_after_all_retries_exhausted(self):
+        """Unlike spot get_positions (startup reconciliation), this swallows
+        a persistent failure into [] — matching its own docstring contract."""
+        conn = _make_futures_conn()
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        result = await conn.get_open_positions(retries=2)
+        assert result == []
+
+    async def test_uses_data_circuit_not_order_circuit(self):
+        """get_open_positions is a read-only market-data-style call: it must
+        share _data_circuit with fetch_ohlcv/get_ticker/get_balance (per the
+        cascade-prevention design in _retry's docstring), not _order_circuit —
+        otherwise a run of order-placement failures would also block position
+        reads needed for reconciliation, and vice versa.
+        """
+        conn = _make_futures_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        # Trip the data circuit directly (simulating a prior OHLCV/ticker outage)
+        conn._data_circuit.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.get_open_positions()
+        # The already-open data circuit short-circuits before any network call
+        conn.exchange.fetch_positions.assert_not_called()
+
+    async def test_failure_does_not_trip_order_circuit(self):
+        conn = _make_futures_conn()
+        conn._data_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_positions = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        await conn.get_open_positions(retries=1)
+        assert conn._data_circuit.is_open
+        assert not conn._order_circuit.is_open
+
+    async def test_order_circuit_failures_do_not_block_position_reads(self):
+        """A run of order-placement failures (e.g. create_order rejections)
+        trips _order_circuit but must not prevent reading positions — exactly
+        the cascade get_open_positions previously fell into by sharing the
+        order circuit.
+        """
+        conn = _make_futures_conn(threshold=1)
+        conn._order_circuit.record_failure()
+        assert conn._order_circuit.is_open
+        conn.exchange.fetch_positions = AsyncMock(return_value=[])
+        result = await conn.get_open_positions()
+        assert result == []
+
+
 # ── Rate-limit-specific backoff ──────────────────────────────────────────────────────────────
 
 class TestRateLimitBackoff:
