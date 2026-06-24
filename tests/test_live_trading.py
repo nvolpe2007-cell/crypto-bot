@@ -548,6 +548,27 @@ class TestCloseLong:
         assert trade.pnl == pytest.approx(-(entry_fee + exit_fee))
         assert trade.fees == pytest.approx(entry_fee + exit_fee)
 
+    def test_pnl_pct_is_net_of_fees_not_gross_price_delta(self):
+        """Regression: pnl_pct must be computed over (size_usd + entry_fee) cost basis,
+        like pnl itself — not the raw (exit-entry)/entry price delta. With heavy fees a
+        trade can show a positive price move yet still be a net loser; pnl_pct must
+        agree with pnl's sign, not silently report a gross 'gain' on a losing trade.
+        """
+        trader = _make_trader()
+        entry_fee = 5.0  # heavy fee relative to a $100 position
+        self._setup_position(trader, entry_price=50_000.0, size=0.002, size_usd=100.0,
+                             entry_fee=entry_fee)
+        exit_fee = 0.26
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 51_000.0,  # +2% price move
+            "fee": {"cost": exit_fee},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade.pnl < 0  # fees overwhelm the 2% gain
+        cost_basis = 100.0 + entry_fee
+        assert trade.pnl_pct == pytest.approx(trade.pnl / cost_basis * 100)
+        assert trade.pnl_pct < 0  # must agree in sign with pnl, not report a gross +2%
+
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
 
