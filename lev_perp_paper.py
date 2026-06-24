@@ -282,6 +282,10 @@ def _notify(state: dict, prices: dict[str, float], acted: int) -> None:
         sys.path.insert(0, str(Path(__file__).parent))
         from src.notifications import create_notifier_from_env
         notifier = create_notifier_from_env()
+        # One-shot cron script, not the long-running bot — force a synchronous
+        # send so the call completes before the process exits (default
+        # async_safe queue's worker thread would get killed first).
+        notifier._async_safe = False
         if notifier.send_message("\n".join(lines)):
             state["last_notify_ts"] = now.isoformat()
     except Exception as e:

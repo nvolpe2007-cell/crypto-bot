@@ -185,7 +185,12 @@ def _alert(html: str) -> None:
         import sys
         sys.path.insert(0, str(Path(__file__).parent))
         from src.notifications import create_notifier_from_env
-        create_notifier_from_env().send_message(html)
+        notifier = create_notifier_from_env()
+        # This is a one-shot cron script, not the long-running bot process — force
+        # a synchronous send so the HTTP call completes before the process exits
+        # (the default async_safe queue's worker thread would get killed first).
+        notifier._async_safe = False
+        notifier.send_message(html)
     except Exception as e:
         print(f"[pairs_paper] telegram alert skipped: {e}")
 
