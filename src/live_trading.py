@@ -258,8 +258,9 @@ class LiveTrader:
 
         # Use the actual entry fee charged at open (not a re-estimate) so realized
         # PnL matches the real account balance change.
-        pnl     = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
-        pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
+        pnl        = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
+        cost_basis = pos.size_usd + pos.entry_fee
+        pnl_pct    = pnl / cost_basis * 100 if cost_basis else 0.0
 
         trade = Trade(
             entry_time=pos.entry_time,
