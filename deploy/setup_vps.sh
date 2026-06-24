@@ -50,6 +50,15 @@ install_cron() {  # $1 = cron file, $2 = unique grep token, $3 = label
 }
 install_cron deploy/swing_cron.txt swing_paper.py swing
 install_cron deploy/tsmom_cron.txt tsmom_paper.py tsmom
+# Arbitrage PAPER arms (single-tick crons). All paper-only, start UNPROVEN; the
+# allocator weights them ~0 until proof_scorecard clears each one's bar.
+install_cron deploy/flash_arb_cron.txt flash_arb_paper.py flash_arb
+install_cron deploy/stablecoin_arb_cron.txt stablecoin_arb.py stablecoin_arb
+install_cron deploy/dex_arb_cron.txt dex_arb.py dex_arb
+install_cron deploy/dex_flash_arb_cron.txt dex_flash_arb_paper.py dex_flash_arb
+install_cron deploy/pattern_flow_cron.txt pattern_flow_paper.py pattern_flow
+# Centralized Telegram trade-close alerts (per-arm win/loss + running total).
+install_cron deploy/trade_close_notifier_cron.txt trade_close_notifier.py trade_close_notifier
 
 echo ""
 echo "=== Setup complete ==="

@@ -1,0 +1,12 @@
+# Telegram trade-close alerts — centralized, generic across every paper arm.
+# Installed by deploy/setup_vps.sh. Scans every data/*_state.json's "closed" list for
+# NEW entries since the last run (tracked in data/notify_seen.json) and sends one
+# Telegram message per new close: win/loss amount + that arm's running total P&L.
+# New arms need zero wiring here — it reads the same generic state-file shape the
+# dashboard does.
+#
+# Runs every 5 min, independent of each arm's own tick cadence (hourly/15-min/daily),
+# so a close is caught promptly no matter which arm produced it. Sends synchronously
+# (not the bot's async/queued notifier) so the one-shot process actually waits for
+# delivery before exiting.
+*/5 * * * * cd /opt/crypto-bot && set -a && . ./.env && set +a && ./venv/bin/python scripts/trade_close_notifier.py >> logs/trade_close_notifier.log 2>&1
