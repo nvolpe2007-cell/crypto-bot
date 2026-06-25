@@ -111,7 +111,14 @@ class FundingScanner:
                 symbol = item.get("symbol", "")
                 if not symbol.endswith("USDT"):
                     continue
-                rate = float(item.get("lastFundingRate", 0))
+                try:
+                    rate = float(item.get("lastFundingRate", 0))
+                except (TypeError, ValueError):
+                    # One malformed entry must not abort the whole-list parse —
+                    # premiumIndex returns hundreds of symbols; raising here would
+                    # propagate to the outer except and silently drop every
+                    # symbol after this one for the rest of this scan cycle.
+                    continue
                 if rate == 0:
                     continue
                 apy = rate * 3 * 365 * 100
@@ -149,7 +156,10 @@ class FundingScanner:
                 rate_str = t.get("fundingRate", "0")
                 try:
                     rate = float(rate_str)
-                except ValueError:
+                except (TypeError, ValueError):
+                    # TypeError too: a null fundingRate field (float(None)) raises
+                    # TypeError, not ValueError — same "skip this one entry, keep
+                    # parsing the rest of the list" intent as the ValueError case.
                     continue
                 if rate == 0:
                     continue
