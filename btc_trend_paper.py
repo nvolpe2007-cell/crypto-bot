@@ -41,6 +41,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.state import sanitize_for_json
+
 KRAKEN_PAIR = os.getenv("BTC_TREND_PAIR", "XBTUSD")     # BTC/USD on Kraken
 SMA_N = int(os.getenv("BTC_TREND_SMA", "100"))          # trend leg
 MOMO_N = int(os.getenv("BTC_TREND_MOMO", "20"))         # momentum leg
@@ -88,7 +90,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 
