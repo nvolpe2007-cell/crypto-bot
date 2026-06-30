@@ -113,3 +113,44 @@ def test_idempotent_no_double_act(monkeypatch):
     before = dict(state["last_bar_t"])
     assert kt.process_symbol("BTC", bars, state) == 0
     assert state["last_bar_t"] == before
+
+
+# ── master kill switch: halts NEW entries, never exits ──────────────────────
+
+def test_kill_switch_blocks_seed_entry(monkeypatch):
+    monkeypatch.setattr(kt, "SMA_N", 3)
+    monkeypatch.setattr(kt, "MOMO_N", 2)
+    monkeypatch.setattr(kt, "WARMUP", 4)
+    monkeypatch.setattr(kt, "_is_killed", lambda: True)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    acted = kt.process_symbol("BTC", _bars([10, 10, 10, 30]), state)
+    assert acted == 0
+    assert "BTC" not in state["positions"]
+
+
+def test_kill_switch_blocks_new_open_but_not_close(monkeypatch):
+    monkeypatch.setattr(kt, "SMA_N", 3)
+    monkeypatch.setattr(kt, "MOMO_N", 2)
+    monkeypatch.setattr(kt, "WARMUP", 4)
+    closes = [100, 100, 100, 90, 200]               # seed cash, then confluence on
+    bars = _bars(closes)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    kt.process_symbol("BTC", bars[:4], state)       # inception seed (cash)
+    monkeypatch.setattr(kt, "_is_killed", lambda: True)
+    acted = kt.process_symbol("BTC", bars, state)   # would OPEN, but killed
+    assert acted == 0
+    assert "BTC" not in state["positions"]
+
+    # exits still work while killed: open one (unkilled) on a fresh bar, then
+    # close on another fresh bar while killed again.
+    monkeypatch.setattr(kt, "_is_killed", lambda: False)
+    bars_open = _bars(closes + [210])               # still confluence-on -> OPEN
+    kt.process_symbol("BTC", bars_open, state)
+    assert "BTC" in state["positions"]
+    monkeypatch.setattr(kt, "_is_killed", lambda: True)
+    bars2 = _bars(closes + [210, 50])                # below SMA -> CLOSE
+    acted = kt.process_symbol("BTC", bars2, state)
+    assert acted == 1
+    assert "BTC" not in state["positions"]
