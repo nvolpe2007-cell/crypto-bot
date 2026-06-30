@@ -20,13 +20,15 @@ import statistics as st
 from typing import List
 
 N_MIN, T_MIN = 30, 2.0
+DSR_MIN = 0.95
+_EULER = 0.5772156649015329
 
 
 def summary(net_rets: List[float]) -> dict:
     n = len(net_rets)
     if n == 0:
         return dict(n=0, total=0.0, expectancy=0.0, win_rate=0.0, t_stat=0.0,
-                    sharpe=0.0, max_dd=0.0, profit_factor=0.0)
+                    sharpe=0.0, max_dd=0.0, profit_factor=0.0, skew=0.0, kurt=3.0)
     total = sum(net_rets)
     mean = total / n
     sd = st.pstdev(net_rets) if n < 2 else st.stdev(net_rets)
@@ -37,13 +39,50 @@ def summary(net_rets: List[float]) -> dict:
     win_rate = len(wins) / n
     gross_win, gross_loss = sum(wins), -sum(losses)
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+    sd_pop = st.pstdev(net_rets)
+    if n >= 2 and sd_pop > 0:
+        m3 = sum((r - mean) ** 3 for r in net_rets) / n
+        m4 = sum((r - mean) ** 4 for r in net_rets) / n
+        skew, kurt = m3 / sd_pop ** 3, m4 / sd_pop ** 4
+    else:
+        skew, kurt = 0.0, 3.0
     cum = peak = dd = 0.0
     for r in net_rets:
         cum += r
         peak = max(peak, cum)
         dd = min(dd, cum - peak)
     return dict(n=n, total=total, expectancy=mean, win_rate=win_rate, t_stat=t_stat,
-                sharpe=sharpe, max_dd=dd, profit_factor=profit_factor)
+                sharpe=sharpe, max_dd=dd, profit_factor=profit_factor,
+                skew=skew, kurt=kurt)
+
+
+def expected_max_sharpe(sharpes: List[float]) -> float:
+    """Expected MAX per-trade Sharpe across N unskilled trials (False Strategy
+    Theorem) — the benchmark a grid-selected edge must beat, not zero. Rises with
+    the number of param sets tried and their Sharpe spread. N<2 / no variance → 0."""
+    N = len(sharpes)
+    if N < 2:
+        return 0.0
+    var = st.pvariance(sharpes)
+    if var <= 0:
+        return 0.0
+    sd = math.sqrt(var)
+    Z = st.NormalDist()
+    return sd * ((1.0 - _EULER) * Z.inv_cdf(1.0 - 1.0 / N)
+                 + _EULER * Z.inv_cdf(1.0 - 1.0 / (N * math.e)))
+
+
+def deflated_sharpe(sharpe: float, n: int, skew: float, kurt: float, sr0: float) -> float:
+    """P(true Sharpe > sr0), correcting for trials (via sr0) AND non-normal returns
+    (skew/kurtosis). The honest test that a backtest Sharpe isn't a multiple-testing
+    fluke. Robust when > DSR_MIN."""
+    if n < 2:
+        return 0.0
+    denom = 1.0 - skew * sharpe + ((kurt - 1.0) / 4.0) * sharpe * sharpe
+    if denom <= 0:
+        return 0.0
+    z = (sharpe - sr0) * math.sqrt(n - 1.0) / math.sqrt(denom)
+    return st.NormalDist().cdf(z)
 
 
 def verdict(s: dict) -> str:
