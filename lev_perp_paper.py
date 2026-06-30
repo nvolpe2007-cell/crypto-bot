@@ -274,7 +274,7 @@ def _check_exit(pos: dict, bar: dict) -> tuple[float, str] | None:
     return None
 
 
-def process_symbol(base: str, bars: list[dict], state: dict) -> int:
+def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None = None) -> int:
     closes = [b["c"] for b in bars]
     if len(closes) < SMA_N + 1:
         print(f"{base}: warm-up ({len(closes)}/{SMA_N + 1} daily bars)")
@@ -314,6 +314,7 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
                 tag = "TP✅" if reason == "take_profit" else "LIQ❌"
                 print(f"{base}: {tag} {'LONG' if pos['side'] > 0 else 'SHORT'} @ {price:.2f} "
                       f"net=${rec['pnl']:+.2f} ({rec['pnl_pct_margin']:+.1f}% margin)")
+                _notify_trade_close(rec, state, prices or {})
                 acted += 1
 
         # 2) Flip exit: trend reversed, close at bar close
@@ -323,6 +324,7 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
             rec = _close(state, base, bar["c"], str(bar["t"]), "flip")
             print(f"{base}: FLIP-CLOSE {'LONG' if pos['side'] > 0 else 'SHORT'} @ {bar['c']:.2f} "
                   f"net=${rec['pnl']:+.2f}")
+            _notify_trade_close(rec, state, prices or {})
             acted += 1
 
         # 3) Re-enter only if filters pass
@@ -341,70 +343,85 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
     return acted
 
 
-def _notify(state: dict, prices: dict[str, float], acted: int) -> None:
-    if os.getenv("LEV_PERP_NOTIFY", "1") != "1":
-        return
-    force = os.getenv("LEV_PERP_NOTIFY_FORCE", "0") == "1"
-    interval_h = float(os.getenv("LEV_PERP_NOTIFY_INTERVAL_HOURS", "24"))
-    now = datetime.now(timezone.utc)
-    last = state.get("last_notify_ts")
-    due = True
-    if last:
-        try:
-            due = (now - datetime.fromisoformat(last)).total_seconds() >= interval_h * 3600
-        except ValueError:
-            due = True
-    if not (force or acted > 0 or due):
-        return
-
-    eq    = state.get("equity", STARTING_EQUITY)
-    start = state.get("starting_equity", STARTING_EQUITY)
-    pnl   = eq - start
-    icon  = "📈" if pnl >= 0 else "📉"
-    unreal = 0.0
-    pos_lines = []
-    for base, p in state.get("positions", {}).items():
-        px = prices.get(base)
-        if px:
-            r = p["side"] * (px - p["entry"]) / p["entry"]
-            u = p["notional_usd"] * r
-            unreal += u
-            sd = "🟢LONG" if p["side"] > 0 else "🔴SHORT"
-            pos_lines.append(f"  {base} {sd} {p['leverage']:g}x @ ${p['entry']:,.2f} "
-                             f"(mark ${px:,.2f}, {r*100:+.1f}% px = ${u:+.2f}; "
-                             f"tp ${p['tp']:,.2f} / liq ${p['liq']:,.2f})")
-        else:
-            sd = "LONG" if p["side"] > 0 else "SHORT"
-            pos_lines.append(f"  {base} {sd} {p['leverage']:g}x @ ${p['entry']:,.2f}")
-    closed = state.get("closed", [])
-    wins   = sum(1 for c in closed if c.get("pnl", 0) > 0)
-    tps    = sum(1 for c in closed if c.get("reason") == "take_profit")
-    liqs   = sum(1 for c in closed if c.get("reason") == "liquidation")
-
-    lines = [
-        f"{icon} <b>Leveraged Perp ({LEVERAGE:g}x) — Paper Account</b>",
-        f"Equity: <b>${eq:,.2f}</b>  (start ${start:,.0f}, {pnl:+.2f})",
-        f"Filters: RSI<{RSI_MAX} | age≥{MIN_TREND_AGE}d | vol≥{VOL_MULT}x | ADX dead-zone={'skip' if SKIP_ADX_DEAD_ZONE else 'off'}",
-        f"Unrealized: <b>${unreal:+.2f}</b>   Closed: {len(closed)}"
-        + (f" ({wins}W/{len(closed)-wins}L, {tps} TP / {liqs} liq)" if closed else ""),
-        "<b>Open positions:</b>" if pos_lines else "No open positions.",
-        *pos_lines,
-    ]
-    if closed:
-        last_c = closed[-1]
-        sd = "SHORT" if last_c.get("side", 1) < 0 else "LONG"
-        lines.append(f"Last close: {last_c['symbol']} {sd} ${last_c['pnl']:+.2f} "
-                     f"({last_c.get('pnl_pct_margin', 0):+.1f}% margin, {last_c.get('reason')})")
+def _send_telegram(msg: str, state: dict) -> None:
+    """Best-effort Telegram send. Updates last_notify_ts on success."""
     try:
         import sys
         sys.path.insert(0, str(Path(__file__).parent))
         from src.notifications import create_notifier_from_env
         notifier = create_notifier_from_env()
         notifier._async_safe = False
-        if notifier.send_message("\n".join(lines)):
-            state["last_notify_ts"] = now.isoformat()
+        if notifier.send_message(msg):
+            state["last_notify_ts"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         print(f"[lev_perp_paper] telegram notify skipped: {e}")
+
+
+def _notify_trade_close(rec: dict, state: dict, prices: dict[str, float]) -> None:
+    """Fire a Telegram message immediately when a trade closes."""
+    if os.getenv("LEV_PERP_NOTIFY", "1") != "1":
+        return
+
+    eq     = state.get("equity", STARTING_EQUITY)
+    start  = state.get("starting_equity", STARTING_EQUITY)
+    total_pnl = eq - start
+    closed = state.get("closed", [])
+    wins   = sum(1 for c in closed if c.get("pnl", 0) > 0)
+    tps    = sum(1 for c in closed if c.get("reason") == "take_profit")
+    liqs   = sum(1 for c in closed if c.get("reason") == "liquidation")
+    n      = len(closed)
+
+    pnl    = rec["pnl"]
+    reason = rec["reason"]
+    base   = rec["symbol"]
+    side   = "SHORT" if rec["side"] < 0 else "LONG"
+    pct    = rec["pnl_pct_margin"]
+
+    if reason == "take_profit":
+        trade_icon = "✅ TAKE PROFIT"
+    elif reason == "liquidation":
+        trade_icon = "💀 LIQUIDATED"
+    else:
+        trade_icon = "🔄 TREND FLIP"
+
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+    pct_str = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
+    total_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+    win_rate = f"{wins/n*100:.0f}%" if n else "—"
+
+    # Open positions status
+    pos_lines = []
+    unreal = 0.0
+    for b, p in state.get("positions", {}).items():
+        px = prices.get(b)
+        if px:
+            r = p["side"] * (px - p["entry"]) / p["entry"]
+            u = p["notional_usd"] * r
+            unreal += u
+            arrow = "🟢" if u >= 0 else "🔴"
+            sd = "L" if p["side"] > 0 else "S"
+            pos_lines.append(f"{arrow} {b} {sd}{p['leverage']:g}x  ${px:,.2f}  {r*100:+.1f}%  ${u:+.2f}")
+
+    lines = [
+        f"<b>{trade_icon}</b>",
+        f"",
+        f"<b>{base}</b> {side} {LEVERAGE:g}x",
+        f"Entry: ${rec['entry']:,.2f}  →  Exit: ${rec['exit']:,.2f}",
+        f"P&L: <b>{pnl_str}</b>  ({pct_str} on margin)",
+        f"",
+        f"━━━━━━━━━━━━━━━━━━",
+        f"💰 <b>Account</b>",
+        f"Equity:   <b>${eq:,.2f}</b>",
+        f"Total P&L: <b>{total_str}</b>  ({total_pnl/start*100:+.1f}%)",
+        f"Record:   {wins}W / {n-wins}L  (WR {win_rate})  |  {tps} TP / {liqs} liq",
+        f"Unrealized: ${unreal:+.2f}",
+        f"",
+        f"━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>Open Positions</b>",
+        *(["\n".join(pos_lines)] if pos_lines else ["None — waiting for filters"]),
+    ]
+
+    _send_telegram("\n".join(lines), state)
 
 
 def main():
@@ -419,8 +436,7 @@ def main():
             continue
         if bars:
             prices[base] = bars[-1]["c"]
-        total += process_symbol(base, bars, state)
-    _notify(state, prices, total)
+        total += process_symbol(base, bars, state, prices)
     _save_state(state)
     eq    = state.get("equity", STARTING_EQUITY)
     start = state.get("starting_equity", STARTING_EQUITY)
