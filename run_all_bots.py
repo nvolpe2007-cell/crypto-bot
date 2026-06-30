@@ -60,6 +60,23 @@ class MasterBotRunner:
         self.dex_arb_bot = None
         self.stablecoin_arb_bot = None
 
+        # asyncio only holds a WEAK reference to a Task once you discard the
+        # `asyncio.create_task(...)` return value — the task can then be
+        # garbage-collected mid-run with no error, no log line, no Telegram
+        # alert (see the "Save a reference to the result" warning in the
+        # asyncio docs). Every background task this runner starts gets parked
+        # here so it lives for the lifetime of the runner instead of the
+        # lifetime of whichever local variable briefly held it.
+        self._background_tasks: list = []
+
+    def _spawn(self, coro, *, name: str = None) -> asyncio.Task:
+        """asyncio.create_task() that also keeps a strong reference, so the
+        task can't be silently garbage-collected mid-run (see __init__)."""
+        t = asyncio.create_task(coro, name=name)
+        self._background_tasks.append(t)
+        t.add_done_callback(self._background_tasks.remove)
+        return t
+
     async def _check_critical_tasks(
         self,
         critical_tasks: list,
@@ -113,7 +130,8 @@ class MasterBotRunner:
         loop = asyncio.get_event_loop()
         try:
             for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
+                loop.add_signal_handler(
+                    sig, lambda: self._spawn(self.shutdown(), name="shutdown"))
         except NotImplementedError:
             pass  # Windows: handled by KeyboardInterrupt in main()
 
@@ -138,7 +156,7 @@ class MasterBotRunner:
                 min_spread_pct=self.config.get("dex_arb", {}).get("min_spread", 0.5),
                 trade_size_usd=self.config.get("dex_arb", {}).get("trade_size", 100)
             )
-            asyncio.create_task(self.dex_arb_bot.start())
+            self._spawn(self.dex_arb_bot.start(), name="dex_arb_bot")
 
         # Start stablecoin arb
         if self.config.get("stablecoin_arb", {}).get("enabled", True):
@@ -148,7 +166,7 @@ class MasterBotRunner:
                 min_profit_pct=self.config.get("stablecoin_arb", {}).get("min_profit", 0.1),
                 trade_size_usd=self.config.get("stablecoin_arb", {}).get("trade_size", 500)
             )
-            asyncio.create_task(self.stablecoin_arb_bot.start())
+            self._spawn(self.stablecoin_arb_bot.start(), name="stablecoin_arb_bot")
 
         # Start alt-perp confluence strategy (src/altperp/). PAPER-only by design
         # — directional edge unproven per research (memory: altperp-strategy), so
@@ -166,12 +184,12 @@ class MasterBotRunner:
                         "on" if ai_on else "off")
             from src.altperp.runner import run as altperp_run
             altperp_notifier = create_notifier_from_env()
-            asyncio.create_task(altperp_run(notifier=altperp_notifier))
+            self._spawn(altperp_run(notifier=altperp_notifier), name="altperp")
 
         logger.info("All bots started. Dashboard at http://localhost:8080  |  Press Ctrl+C to stop.")
 
         # Start dashboard server alongside bots
-        asyncio.create_task(run_dashboard(host="0.0.0.0", port=8080))
+        self._spawn(run_dashboard(host="0.0.0.0", port=8080), name="dashboard")
 
         # Keep running; check critical task health every 30 s.
         while self.running:
