@@ -419,6 +419,23 @@ class ExchangeConnection:
             circuit=self._order_circuit,
         )
 
+    async def fetch_order(self, order_id: str, symbol: str,
+                          retries: int = 3) -> Dict:
+        """Fetch a specific order's current status with retry.
+
+        Uses _order_circuit (same as cancel_order/get_open_orders) so a run of
+        order-management failures trips the same cooldown gate rather than
+        contaminating the data circuit.
+
+        Raises on exhausted retries so that callers can treat an unverifiable
+        order as unconfirmed rather than assuming it filled.
+        """
+        return await self._retry(
+            self.exchange.fetch_order, order_id, symbol,
+            retries=retries, label=f'fetch_order({order_id})',
+            circuit=self._order_circuit,
+        )
+
     async def get_open_orders(self, symbol: Optional[str] = None,
                               retries: int = 3) -> List:
         """Get open orders with retry."""
