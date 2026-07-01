@@ -31,6 +31,13 @@ from src.cot_report import cot_signal
 from src.session_filter import SessionEdge, window_of_hour
 from src.td_sequential import td_state
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 # Session/time-of-day gate. Default OFF (measure-first): we tag every trade with
 # its session verdict so proof_scorecard can measure per-session edge BEFORE we
 # ever gate on it. Set SESSION_FILTER_HARD=1 to actually veto entries in windows
@@ -319,6 +326,12 @@ def _commit_entry(cand: dict, state: dict, dlog: DecisionLog, notify=None) -> bo
     the cap doing its job — never a forced trade. Returns True if opened."""
     base, tf, key = cand["base"], cand["tf"], cand["key"]
     label = f"{base} {tf}m"
+
+    if _is_killed():
+        dlog._write("skip_kill_switch", {"symbol": base, "tf": tf,
+                    "ts": cand["position"]["entry_ts"],
+                    "reason": "master kill switch engaged"})
+        return False
 
     if len(state["positions"]) >= MAX_OPEN_POSITIONS:
         dlog._write("skip_max_positions", {"symbol": base, "tf": tf,

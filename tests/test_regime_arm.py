@@ -153,3 +153,38 @@ def test_close_pnl_sign(tmp_path, monkeypatch):
                                  "entry_ts": "0", "size_usd": 100.0}
     rec2 = ra._close(state, "ETH", 90.0, "1", "test")  # -10% move, short → +10
     assert rec2["pnl"] == pytest.approx(10.0)
+
+
+# ── master kill switch: halts NEW entries, never exits ──────────────────────
+
+def test_kill_switch_blocks_seed_entry(monkeypatch):
+    monkeypatch.setattr(ra, "EMA_FAST", 3)
+    monkeypatch.setattr(ra, "EMA_SLOW", 5)
+    monkeypatch.setattr(ra, "SLOPE_WIN", 2)
+    monkeypatch.setattr(ra, "COST_MULT", 0.5)
+    monkeypatch.setattr(ra, "_is_killed", lambda: True)
+    bars = _ramp_bars(100, +1.0, 60)          # steady uptrend -> would SEED LONG
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 500.0, "equity": 500.0, "started_at": "x"}
+    acted = ra.process_symbol("BTC", bars, state)
+    assert acted == 0
+    assert "BTC" not in state["positions"]    # seed entry suppressed by kill switch
+
+
+def test_kill_switch_blocks_new_open_but_not_exit(monkeypatch):
+    monkeypatch.setattr(ra, "EMA_FAST", 3)
+    monkeypatch.setattr(ra, "EMA_SLOW", 5)
+    monkeypatch.setattr(ra, "SLOPE_WIN", 2)
+    monkeypatch.setattr(ra, "COST_MULT", 0.5)
+    bars = _ramp_bars(100, +1.0, 60)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 500.0, "equity": 500.0, "started_at": "x"}
+    ra.process_symbol("BTC", bars, state)      # seed long (unkilled)
+    assert "BTC" in state["positions"]
+
+    more_bars = _ramp_bars(100, +1.0, 65)      # same prefix + 5 new closed bars
+    monkeypatch.setattr(ra, "target_with_hysteresis", lambda *a, **k: -1)  # force a flip
+    monkeypatch.setattr(ra, "_is_killed", lambda: True)
+    acted = ra.process_symbol("BTC", more_bars, state)
+    assert acted == 1                          # the exit (close) still counts
+    assert "BTC" not in state["positions"]     # but no new short was opened — flat

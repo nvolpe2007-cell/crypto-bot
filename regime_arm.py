@@ -33,6 +33,13 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 # ── Config (env-overridable) ──────────────────────────────────────────────────
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 _env = os.getenv("REGIME_SYMBOLS", "").strip()
@@ -293,7 +300,9 @@ def process_symbol(base, bars, state) -> int:
         i = len(closes) - 1
         want = target_with_hysteresis(i, closes, ema_f, ema_s, atrp, 0)
         state["last_bar_t"][base] = bars[-1]["t"]
-        if want == 1:
+        if want != 0 and _is_killed():
+            print(f"{base}: SEED SKIP (kill switch engaged)")
+        elif want == 1:
             _open(state, base, "long", closes[i], str(bars[-1]["t"]))
             print(f"{base}: SEED LONG @ {closes[i]:.2f}")
         elif want == -1:
@@ -314,11 +323,15 @@ def process_symbol(base, bars, state) -> int:
                              "regime_flip" if want != 0 else "regime_exit")
                 print(f"{base}: CLOSE {rec['side']} @ {bar['c']:.2f} net=${rec['pnl']:+.2f}")
                 acted += 1
+                cur = 0
             if want != 0:
-                _open(state, base, "long" if want == 1 else "short", bar["c"], str(bar["t"]))
-                print(f"{base}: OPEN {'LONG' if want==1 else 'SHORT'} @ {bar['c']:.2f}")
-                acted += 1
-            cur = want
+                if _is_killed():
+                    print(f"{base}: SKIP entry (kill switch engaged)")
+                else:
+                    _open(state, base, "long" if want == 1 else "short", bar["c"], str(bar["t"]))
+                    print(f"{base}: OPEN {'LONG' if want==1 else 'SHORT'} @ {bar['c']:.2f}")
+                    acted += 1
+                    cur = want
         state["last_bar_t"][base] = bar["t"]
     return acted
 
