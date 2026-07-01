@@ -128,6 +128,12 @@ def _make_exchange() -> MagicMock:
         "price": 50_000.0,
         "fee": {"cost": 1.30},
     })
+    ex.fetch_order = AsyncMock(return_value={
+        "id": "order-001",
+        "status": "closed",
+        "average": 50_000.0,
+        "fee": {"cost": 1.30},
+    })
     return ex
 
 
@@ -379,6 +385,149 @@ class TestOpenLong:
         sig = _make_signal()
         pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
         assert pos.entry_fee == pytest.approx(2.60)
+
+
+# ── open_long: empty-status fill verification ────────────────────────────────────
+#
+# Kraken market orders occasionally return status='' on the initial response
+# before the fill is fully processed.  Previously, open_long() treated ''
+# the same as 'closed'/'filled' and recorded the position without verification —
+# a silent assumption that could record a position for an order that never
+# actually filled.  Now, '' triggers a single fetch_order() poll: if that
+# confirms fill, the position is recorded; otherwise it is rejected so the
+# next startup reconcile_positions() can catch any real fill.
+
+class TestOpenLongStatusVerification:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_closed_status_does_not_call_fetch_order(self):
+        """An explicit 'closed' status is unambiguous — no poll needed."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        trader.exchange.fetch_order.assert_not_called()
+
+    def test_empty_status_calls_fetch_order_for_verification(self):
+        """status='' must trigger a fetch_order() poll rather than being
+        accepted as a confirmed fill without verification."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "closed",
+            "average": 50_000.0, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        trader.exchange.fetch_order.assert_called_once_with("order-pending", "BTC/USD")
+
+    def test_empty_status_confirmed_by_poll_records_position(self):
+        """When fetch_order() returns 'closed', the position must be recorded."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 0.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "closed",
+            "average": 50_100.0, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        assert "BTC/USD" in trader.positions
+
+    def test_empty_status_confirmed_uses_polled_fill_price(self):
+        """The position entry price must come from the polled order response,
+        not the initial (pre-fill) response."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "", "average": 0.0, "fee": {"cost": 0.0},
+        })
+        polled_price = 50_200.0
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "o", "status": "closed",
+            "average": polled_price, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal(close=polled_price)
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        assert pos.entry_price == pytest.approx(polled_price)
+
+    def test_empty_status_still_empty_after_poll_returns_none(self):
+        """If fetch_order() also returns '' the order is still unconfirmed —
+        the position must NOT be recorded."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+
+    def test_empty_status_fetch_order_exception_returns_none(self):
+        """If fetch_order() raises, the position must not be recorded — we
+        cannot confirm the fill and must not assume it happened."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(
+            side_effect=RuntimeError("exchange timeout")
+        )
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+
+    def test_open_status_still_rejected_without_poll(self):
+        """status='open' means the order is resting, not filled — must be
+        rejected whether or not it was returned as empty initially."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-open", "status": "open", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+        trader.exchange.fetch_order.assert_not_called()
+
+    def test_no_order_id_skips_poll_and_rejects(self):
+        """If the order response has no id, we cannot poll — treat as unconfirmed."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        trader.exchange.fetch_order.assert_not_called()
 
 
 # ── _update_chandelier_stop ─────────────────────────────────────────────────────
