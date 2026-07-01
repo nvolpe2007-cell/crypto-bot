@@ -2682,12 +2682,12 @@ def _save_open_positions(trader):
                 'funding_accrued':  pos.funding_accrued,
                 'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
             })
-        payload = json.dumps({
+        payload = json.dumps(_sanitize({
             'saved_at': datetime.now(timezone.utc).isoformat(),
             'cash':     trader.account.cash,
             'total_pnl': trader.account.total_pnl,
             'positions': out,
-        }, indent=2)
+        }), indent=2)
         # Write to tmp first, then rename — atomic on POSIX; prevents a
         # mid-write crash from leaving a truncated/corrupt positions file.
         with open(_tmp, 'w') as f:
@@ -2768,9 +2768,15 @@ def _load_open_positions(trader):
         # deducted, so we MUST adopt it — keeping the fresh initial_capital while
         # re-adding positions double-counts equity (a winning session, where
         # saved cash > initial_capital, was previously skipped by the old guard).
+        # Isolated in its own try/except: a malformed/missing cash value (e.g. a
+        # sanitized NaN saved as null) must not discard the positions already
+        # restored above into `trader.account.positions`.
         if restored and 'cash' in state:
-            trader.account.cash = float(state['cash'])
-            trader.account.total_pnl = float(state.get('total_pnl', trader.account.total_pnl))
+            try:
+                trader.account.cash = float(state['cash'])
+                trader.account.total_pnl = float(state.get('total_pnl', trader.account.total_pnl))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"[POSITIONS] Could not restore cash/total_pnl, keeping fresh account values: {e}")
         return restored
     except Exception as e:
         logger.error(f"[POSITIONS] Failed to load open positions from {_POSITIONS_FILE}: {e}")
