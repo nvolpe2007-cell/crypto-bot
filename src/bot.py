@@ -174,7 +174,13 @@ class ScalpingBot:
             allow_spot_shorts=False,
         )
 
-        notifier  = create_notifier_from_env()
+        # BOT_STATUS_NOTIFY=0 mutes the main session's own routine "checkin" traffic
+        # (bot-started, hourly digest, daily summary/scorecard, subsystem health,
+        # circuit-breaker, account report, shutdown, plus supervised()'s crash
+        # alerts for whichever arms run in-process here) WITHOUT touching
+        # lev_perp_paper.py / pairs_paper.py, which build their own independent
+        # notifiers in their own processes and are unaffected by this flag.
+        notifier  = create_notifier_from_env() if os.getenv('BOT_STATUS_NOTIFY', '1') == '1' else None
         sentiment = SentimentMonitor(notifier=notifier)
         public_ws = KrakenPublicWS(self.symbols, ohlc_interval=1)
         # Streaming L2 book + trade tape — wakes the microstructure scalper
