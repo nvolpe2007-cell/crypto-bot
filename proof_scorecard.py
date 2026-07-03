@@ -454,6 +454,31 @@ def _lev_perp_forward() -> dict | None:
     return dict(label='Leveraged perp 3x + take-profit (FORWARD, paper)', executable=True, **s)
 
 
+def _lev_perp_v2_forward() -> dict | None:
+    """V2 of the leveraged perp arm (lev_perp_v2_paper.py): IDENTICAL entries
+    (SMA-50 direction, same four filters, vol-targeted leverage) but TRAILED
+    exits — ATR(14) chandelier ratcheting from the peak — instead of v1's fixed
+    +5% take-profit. Pre-specified A/B on the exit engine only: does letting
+    winners run beat capping them, judged on the same pre-registered bar.
+    Entry-week clustered like v1."""
+    path = DATA / 'lev_perp_v2_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Leveraged perp vol-tgt + ATR trail (FORWARD, paper)', executable=True, **s)
+
+
 def _pairs_forward() -> dict | None:
     """Market-neutral pairs arm forward record (pairs_paper.py): a DOLLAR-NEUTRAL
     relative-value trade — long the cheap leg, short the rich leg of a major pair when
@@ -631,6 +656,7 @@ def main():
         _regime_forward(),
         _microstructure_forward(),
         _lev_perp_forward(),
+        _lev_perp_v2_forward(),
         _pairs_forward(),
         _directional(),
     ] if a]
