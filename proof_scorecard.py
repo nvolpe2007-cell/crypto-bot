@@ -479,6 +479,32 @@ def _lev_perp_v2_forward() -> dict | None:
     return dict(label='Leveraged perp vol-tgt + ATR trail (FORWARD, paper)', executable=True, **s)
 
 
+def _lev_perp_agg_variant(fname: str, label: str) -> dict | None:
+    """Aggressive-config twins of the two lev_perp arms: SAME code, env-raised
+    risk (LEV_PERP_VOL_TARGET=3.0, LEV_PERP_LEVERAGE=5 vs the 2.0/3x originals),
+    own state files. Pre-specified 2026-07-02 as a 2x2 (exit engine x risk
+    level) so leverage is judged as its own variable on the forward clock —
+    the 21-month replay favored 3%/5x (+45% vs +30%, maxDD -10%, 0 liqs) but
+    that sweep is exactly the post-hoc selection this scorecard exists to
+    discipline. Entry-week clustered like the originals."""
+    path = DATA / fname
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label=label, executable=True, **s)
+
+
 def _pairs_forward() -> dict | None:
     """Market-neutral pairs arm forward record (pairs_paper.py): a DOLLAR-NEUTRAL
     relative-value trade — long the cheap leg, short the rich leg of a major pair when
@@ -657,6 +683,10 @@ def main():
         _microstructure_forward(),
         _lev_perp_forward(),
         _lev_perp_v2_forward(),
+        _lev_perp_agg_variant('lev_perp_agg_state.json',
+                              'Leveraged perp 5x vol-tgt3 + take-profit (FORWARD, paper)'),
+        _lev_perp_agg_variant('lev_perp_v2_agg_state.json',
+                              'Leveraged perp 5x vol-tgt3 + ATR trail (FORWARD, paper)'),
         _pairs_forward(),
         _directional(),
     ] if a]
