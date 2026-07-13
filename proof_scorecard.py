@@ -504,6 +504,26 @@ def _pairs_forward() -> dict | None:
     return dict(label='Market-neutral pairs (FORWARD, paper)', executable=True, **s)
 
 
+def _rebalance_forward() -> dict | None:
+    """Rebalanced-allocation forward record (rebalance_paper.py): the ONE positive,
+    robust-OOS result of the ~320-strategy search (memory exhaustive_search_320_zero /
+    rebalance_premium_verdict). A diversified 50% crypto / 25% gold / 25% cash book
+    rebalanced monthly — prediction-free, fully SPOT-EXECUTABLE on Kraken (long-only, no
+    leverage/short), booking each monthly holding period as one record. NOT alpha (can't
+    profit in a full bear, only lose far less); the bar judges whether the structural
+    vol-harvest + diversification clears on the forward clock. Low turnover => ~12 obs/yr,
+    so n>=30 is a multi-year timeline by design. Each record also carries the rebalancing
+    PREMIUM vs a never-rebalanced hold of the same target."""
+    path = DATA / 'rebalance_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+    s = _stats(nets)
+    return dict(label='Rebalanced allocation (crypto+gold+cash, FORWARD)', executable=True, **s)
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -657,6 +677,7 @@ def main():
         _microstructure_forward(),
         _lev_perp_forward(),
         _pairs_forward(),
+        _rebalance_forward(),
         _directional(),
     ] if a]
 
