@@ -29,7 +29,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from proof_scorecard import _family_t_bar, _stats, _verdict  # the real, pre-registered bar
+from proof_scorecard import (  # the real, pre-registered bar
+    _family_t_bar, _stats, _verdict,
+    _deflated_sharpe, _expected_max_sharpe, DSR_MIN,
+)
 
 # Arm registry: (display name, state file, cluster granularity, executable-today,
 # strategy family). Executable = runnable on a US Kraken-spot account right now
@@ -125,7 +128,8 @@ def read_arm_record(data_dir: str, fname: str, gran: str) -> dict | None:
 def score_arms(data_dir: str, cfg: AllocConfig | None = None) -> list[dict]:
     """Score every registered arm on the real proof bar. Returns one row per arm
     that has a state file, each with: name, family, executable, equity, n,
-    expectancy, t_clustered, sharpe, proven (clears the family-wise bar)."""
+    expectancy, t_clustered, sharpe, proven (clears both the family-wise t-bar
+    AND the Deflated Sharpe bar — matching proof_scorecard.main()'s final verdict)."""
     cfg = cfg or AllocConfig()
     raw = []
     for name, fname, gran, execu, family in ARMS:
@@ -136,15 +140,21 @@ def score_arms(data_dir: str, cfg: AllocConfig | None = None) -> list[dict]:
         raw.append((name, family, execu, rec, s))
     k = max(1, len(raw))                # family-wise correction over arms judged
     t_family = _family_t_bar(k)
+    sr0 = _expected_max_sharpe([s["sharpe"] for _, _, _, _, s in raw if s["n"] >= 2])
     rows = []
     for name, family, execu, rec, s in raw:
         a = dict(label=name, executable=execu, **s)
-        proven = _verdict(a, t_family, k).startswith("PROVEN ✓")
+        dsr = _deflated_sharpe(
+            s["sharpe"], s.get("eff_n", s["n"]),
+            s.get("skew", 0.0), s.get("kurt", 3.0), sr0,
+        )
+        proven = _verdict(a, t_family, k).startswith("PROVEN ✓") and dsr > DSR_MIN
         rows.append({
             "name": name, "family": family, "executable": execu, "equity": rec["equity"],
             "start": rec["start"], "n": s["n"], "expectancy": round(s["expectancy"], 5),
             "t_clustered": round(s["t_clustered"], 2), "sharpe": round(s["sharpe"], 3),
             "max_dd": round(s["max_dd"], 4), "proven": proven, "t_family": round(t_family, 2),
+            "dsr": round(dsr, 3), "sr0": round(sr0, 3),
         })
     return rows
 
