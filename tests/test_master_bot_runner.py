@@ -1,13 +1,18 @@
 """
-Unit tests for MasterBotRunner._check_critical_tasks()
+Unit tests for MasterBotRunner._check_critical_tasks() and MasterBotRunner._spawn().
 
-Verifies that the health-monitor correctly:
+_check_critical_tasks tests verify that the health-monitor correctly:
 - ignores tasks that are still running
 - ignores tasks that were cancelled (e.g. clean shutdown)
 - raises RuntimeError (with original exc as __cause__) when a task crashed
 - logs a warning (without raising) when a task exits cleanly unexpectedly
 - sends a Telegram notification on crash and on unexpected clean exit
 - swallows notifier failures so they never mask the real crash
+
+_spawn tests verify that background tasks (dashboard, dex/stablecoin arb,
+altperp, the signal-handler shutdown) are held by a strong reference so they
+can't be silently garbage-collected mid-run — asyncio.create_task()'s return
+value, if discarded, is only weakly referenced by the event loop.
 """
 
 import asyncio
@@ -285,3 +290,72 @@ class TestMultipleTasks:
         runner = _make_runner()
         notifier = _make_notifier()
         await runner._check_critical_tasks([], notifier)  # no raise
+
+
+# ---------------------------------------------------------------------------
+# Tests: _spawn() keeps a strong reference (no GC-mid-run hazard)
+# ---------------------------------------------------------------------------
+
+class TestSpawn:
+    async def test_returns_a_task(self):
+        runner = _make_runner()
+        t = runner._spawn(asyncio.sleep(0), name="x")
+        assert isinstance(t, asyncio.Task)
+        await t
+
+    async def test_task_tracked_while_running(self):
+        runner = _make_runner()
+        t = runner._spawn(asyncio.sleep(100), name="slow")
+        try:
+            assert t in runner._background_tasks
+        finally:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    async def test_task_untracked_after_completion(self):
+        """Confirms the done-callback removes the task once finished — proves
+        the list isn't just an ever-growing leak of every task ever spawned."""
+        runner = _make_runner()
+        t = runner._spawn(asyncio.sleep(0), name="quick")
+        await t
+        # the done-callback runs via call_soon; yield once so it fires
+        await asyncio.sleep(0)
+        assert t not in runner._background_tasks
+
+    async def test_task_survives_with_no_other_reference(self):
+        """The core regression test: spawn a task via _spawn(), drop every
+        local reference to it, force a GC pass, and confirm it still
+        completes — proving the runner's internal list is what's keeping it
+        alive, not the caller's variable."""
+        import gc
+
+        runner = _make_runner()
+        done = asyncio.Event()
+
+        async def _work():
+            await asyncio.sleep(0.05)
+            done.set()
+
+        runner._spawn(_work(), name="orphan")
+        # no local variable holds the task at all
+        gc.collect()
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        assert done.is_set()
+
+    async def test_multiple_spawned_tasks_all_tracked(self):
+        runner = _make_runner()
+        tasks = [runner._spawn(asyncio.sleep(100), name=f"t{i}") for i in range(3)]
+        try:
+            assert len(runner._background_tasks) == 3
+            assert all(t in runner._background_tasks for t in tasks)
+        finally:
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
