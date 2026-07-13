@@ -9,6 +9,7 @@ decayed-rate ticks, so the 24h gate never fired).
 """
 
 from datetime import datetime, timezone, timedelta
+from unittest.mock import MagicMock
 
 import arbitrage.funding_arb_paper as fap
 from arbitrage.funding_arb_paper import FundingArbPaperSim, PaperPosition
@@ -1221,3 +1222,195 @@ def test_load_state_tolerates_corrupt_json(tmp_path, monkeypatch):
                               state_file=state_file)
     assert sim.open_positions == {}
     assert sim.closed_positions == []
+
+
+# ── entry halt (master kill switch + per-arm drawdown cap) ────────────────────
+# This is the safety valve documented in CLAUDE.md (kill switch + per-arm loss
+# cap) — previously exercised only indirectly, never asserted on directly.
+
+def _halt_sim(tmp_path, opps, monkeypatch, notifier=None, max_drawdown_usd=0.0):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "halt_state.json")
+    return FundingArbPaperSim(
+        scanner=_FakeScanner(opps), notifier=notifier,
+        max_drawdown_usd=max_drawdown_usd,
+        state_file=tmp_path / "halt_state.json", label="Halt test")
+
+
+def test_entry_halt_master_kill_switch(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    sim = _halt_sim(tmp_path, [], monkeypatch, notifier=notifier)
+    monkeypatch.setattr(fap, "_is_killed", lambda: True)
+    reason = sim._entry_halt_reason()
+    assert reason is not None and "kill switch" in reason
+    notifier.send_message.assert_called_once()
+    # Still halted on a second call — must not spam a second alert.
+    sim._entry_halt_reason()
+    notifier.send_message.assert_called_once()
+
+
+def test_entry_halt_resumes_after_kill_clears(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    sim = _halt_sim(tmp_path, [], monkeypatch, notifier=notifier)
+    monkeypatch.setattr(fap, "_is_killed", lambda: True)
+    sim._entry_halt_reason()
+    monkeypatch.setattr(fap, "_is_killed", lambda: False)
+    reason = sim._entry_halt_reason()
+    assert reason is None
+    assert notifier.send_message.call_count == 2  # engage + resume
+    assert "resumed" in notifier.send_message.call_args[0][0].lower()
+
+
+def test_entry_halt_drawdown_cap_blocks_new_entries(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    monkeypatch.setattr(fap, "_is_killed", lambda: False)
+    sim = _halt_sim(tmp_path, [_opp("BTCUSDT", 80.0)], monkeypatch,
+                     notifier=notifier, max_drawdown_usd=10.0)
+    loss = PaperPosition(
+        symbol="X", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=30.0, entry_rate_8h=0.001, size_usd=100.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=0.0, entry_cost=15.0,
+    )
+    sim.closed_positions.append(loss)
+    reason = sim._entry_halt_reason()
+    assert reason is not None and "loss cap hit" in reason
+    sim._tick()
+    assert len(sim.open_positions) == 0   # halted — the rich BTC opp never opens
+    notifier.send_message.assert_called_once()
+
+
+def test_entry_halt_clear_with_no_drawdown(tmp_path, monkeypatch):
+    monkeypatch.setattr(fap, "_is_killed", lambda: False)
+    sim = _halt_sim(tmp_path, [], monkeypatch, max_drawdown_usd=10.0)
+    assert sim._entry_halt_reason() is None
+
+
+# ── deleveraging-regime veto: announce-once on engage/clear ────────────────────
+
+def test_announce_regime_veto_engage_then_clear(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    sim = _regime_sim(tmp_path, [], monkeypatch)
+    sim.notifier = notifier
+    sim._announce_regime_veto("deleveraging regime: 5/6 majors negative")
+    assert notifier.send_message.call_count == 1
+    assert "deleveraging" in notifier.send_message.call_args[0][0].lower()
+    # Same reason again — must not spam every tick.
+    sim._announce_regime_veto("deleveraging regime: 5/6 majors negative")
+    assert notifier.send_message.call_count == 1
+    # Recovery — exactly one "cleared" notification.
+    sim._announce_regime_veto(None)
+    assert notifier.send_message.call_count == 2
+    assert "cleared" in notifier.send_message.call_args[0][0].lower()
+
+
+# ── soft-exit churn diagnostics ────────────────────────────────────────────────
+
+def test_is_soft_exit_classifies_reasons():
+    assert FundingArbPaperSim._is_soft_exit("funding_flipped") is True
+    assert FundingArbPaperSim._is_soft_exit("apy_decayed_to_-5.0") is True
+    assert FundingArbPaperSim._is_soft_exit("max_hold_7d") is False
+    assert FundingArbPaperSim._is_soft_exit("off_scanner_24h") is False
+    assert FundingArbPaperSim._is_soft_exit(None) is False
+
+
+def test_soft_exit_churn_counts_churned_vs_healthy_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr(fap, "STATE_FILE", tmp_path / "state.json")
+    sim = FundingArbPaperSim(scanner=_FakeScanner([]), notifier=None,
+                              state_file=tmp_path / "state.json")
+
+    def _closed(reason, cycles):
+        p = PaperPosition(
+            symbol="X", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+            entry_apy=30.0, entry_rate_8h=0.001, size_usd=100.0,
+            entry_time_iso=datetime.now(timezone.utc).isoformat(),
+            cycles_collected=cycles,
+        )
+        p.close_reason = reason
+        return p
+
+    sim.closed_positions = [
+        _closed("funding_flipped", 0),       # churned soft exit (<2 cycles)
+        _closed("apy_decayed_to_3.0", 1),     # churned soft exit (<2 cycles)
+        _closed("funding_flipped", 5),        # healthy soft exit
+        _closed("max_hold_7d", 10),           # hard exit — not soft
+    ]
+    churn = sim._soft_exit_churn()
+    assert churn["closed"] == 4
+    assert churn["soft_exits"] == 3
+    assert churn["churned_soft_exits"] == 2
+    assert churn["avg_cycles_per_close"] == round((0 + 1 + 5 + 10) / 4, 2)
+
+
+# ── daily P&L rollup (the only Telegram observability for this arm) ───────────
+
+def _rollup_sim(tmp_path, monkeypatch, notifier=None, label="Rollup test"):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(fap, "STATE_FILE", state_file)
+    return FundingArbPaperSim(scanner=_FakeScanner([]), notifier=notifier,
+                               state_file=state_file, label=label)
+
+
+def test_send_daily_rollup_reports_open_and_closed_today(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    sim = _rollup_sim(tmp_path, monkeypatch, notifier=notifier)
+    now = datetime.now(timezone.utc)
+
+    open_pos = PaperPosition(
+        symbol="BTCUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=40.0, entry_rate_8h=0.0011, size_usd=500.0,
+        entry_time_iso=now.isoformat(),
+        funding_collected=3.0, entry_cost=1.1, cycles_collected=4,
+    )
+    sim.open_positions["Binance:BTCUSDT"] = open_pos
+
+    closed_pos = PaperPosition(
+        symbol="ETHUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=35.0, entry_rate_8h=0.001, size_usd=400.0,
+        entry_time_iso=(now - timedelta(hours=10)).isoformat(),
+        funding_collected=2.0, entry_cost=0.9, cycles_collected=3,
+    )
+    closed_pos.closed = True
+    closed_pos.close_reason = "apy_decayed_to_5.0"
+    closed_pos.close_time_iso = (now - timedelta(hours=2)).isoformat()
+    sim.closed_positions.append(closed_pos)
+
+    sim._send_daily_rollup()
+
+    notifier.send_message.assert_called_once()
+    msg = notifier.send_message.call_args[0][0]
+    assert "Rollup test" in msg
+    assert "BTCUSDT" in msg   # open position line
+    assert "ETHUSDT" in msg   # closed-today line
+    assert sim.last_rollup_total == sim._total_pnl()
+    assert sim.state_file.exists()   # rollup also persists state
+
+
+def test_send_daily_rollup_empty_book_shows_none(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    sim = _rollup_sim(tmp_path, monkeypatch, notifier=notifier)
+    sim._send_daily_rollup()
+    msg = notifier.send_message.call_args[0][0]
+    assert msg.count("(none)") == 2   # no open positions, nothing closed today
+
+
+def test_send_daily_rollup_notifier_failure_does_not_raise(tmp_path, monkeypatch):
+    notifier = MagicMock()
+    notifier.send_message.side_effect = RuntimeError("telegram down")
+    sim = _rollup_sim(tmp_path, monkeypatch, notifier=notifier)
+    sim._send_daily_rollup()   # must not raise even though Telegram is down
+    notifier.send_message.assert_called_once()
+
+
+def test_send_daily_rollup_delta_tracks_change_since_last_rollup(tmp_path, monkeypatch):
+    sim = _rollup_sim(tmp_path, monkeypatch, notifier=None)
+    sim.last_rollup_total = 2.0
+    pos = PaperPosition(
+        symbol="SOLUSDT", exchange="Binance", direction="LONG_SPOT_SHORT_PERP",
+        entry_apy=40.0, entry_rate_8h=0.0011, size_usd=300.0,
+        entry_time_iso=datetime.now(timezone.utc).isoformat(),
+        funding_collected=5.0, entry_cost=1.0,
+    )
+    sim.open_positions["Binance:SOLUSDT"] = pos
+    sim._send_daily_rollup()
+    # last_rollup_total is replaced with the new cumulative total (not the delta).
+    assert abs(sim.last_rollup_total - pos.net_pnl) < 1e-9
