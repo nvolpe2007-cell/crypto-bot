@@ -33,6 +33,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.state import sanitize_for_json
+
 # ── Config (env-overridable) ──────────────────────────────────────────────────
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 _env = os.getenv("REGIME_SYMBOLS", "").strip()
@@ -239,7 +241,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 
