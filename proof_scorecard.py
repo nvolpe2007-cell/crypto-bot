@@ -332,6 +332,30 @@ def _btc_trend_forward() -> dict | None:
     return dict(label='BTC trend (focused, FORWARD)', executable=True, **s)
 
 
+def _trend_ensemble_forward() -> dict | None:
+    """BTC trend-ensemble arm (trend_ensemble_paper.py): long-only whole-book BTC
+    allocation on a 2-of-3 vote (SMA100 / SMA200 / 90d momentum) — the slower,
+    parameter-diversified sibling of btc_trend. Spot-executable. Entry-week
+    clustered; at ~8-10 flips/yr the n>=30 bar is a multi-year clock (stated in
+    the arm's docstring — we do not fake proof)."""
+    path = DATA / 'trend_ensemble_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='BTC trend ensemble 2-of-3 (FORWARD, paper)', executable=True, **s)
+
+
 def _kelly_trend_forward() -> dict | None:
     """Conviction-scaled fractional-Kelly COMPOUNDING on the SAME BTC trend signal
     (kelly_trend_paper.py). Identical entries/exits to BTC trend (focused) — the only
@@ -452,6 +476,57 @@ def _lev_perp_forward() -> dict | None:
             return 'unknown'
     s = _stats(nets, [_week(p) for p in closed])
     return dict(label='Leveraged perp 3x + take-profit (FORWARD, paper)', executable=True, **s)
+
+
+def _lev_perp_v2_forward() -> dict | None:
+    """V2 of the leveraged perp arm (lev_perp_v2_paper.py): IDENTICAL entries
+    (SMA-50 direction, same four filters, vol-targeted leverage) but TRAILED
+    exits — ATR(14) chandelier ratcheting from the peak — instead of v1's fixed
+    +5% take-profit. Pre-specified A/B on the exit engine only: does letting
+    winners run beat capping them, judged on the same pre-registered bar.
+    Entry-week clustered like v1."""
+    path = DATA / 'lev_perp_v2_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Leveraged perp vol-tgt + ATR trail (FORWARD, paper)', executable=True, **s)
+
+
+def _lev_perp_agg_variant(fname: str, label: str) -> dict | None:
+    """Aggressive-config twins of the two lev_perp arms: SAME code, env-raised
+    risk (LEV_PERP_VOL_TARGET=3.0, LEV_PERP_LEVERAGE=5 vs the 2.0/3x originals),
+    own state files. Pre-specified 2026-07-02 as a 2x2 (exit engine x risk
+    level) so leverage is judged as its own variable on the forward clock —
+    the 21-month replay favored 3%/5x (+45% vs +30%, maxDD -10%, 0 liqs) but
+    that sweep is exactly the post-hoc selection this scorecard exists to
+    discipline. Entry-week clustered like the originals."""
+    path = DATA / fname
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label=label, executable=True, **s)
 
 
 def _pairs_forward() -> dict | None:
@@ -645,12 +720,18 @@ def main():
         _tsmom_fast_forward(),
         _conf_forward(),
         _btc_trend_forward(),
+        _trend_ensemble_forward(),
         _kelly_trend_forward(),
         _tsmom_ls_forward(),
         _brain_forward(),
         _regime_forward(),
         _microstructure_forward(),
         _lev_perp_forward(),
+        _lev_perp_v2_forward(),
+        _lev_perp_agg_variant('lev_perp_agg_state.json',
+                              'Leveraged perp 5x vol-tgt3 + take-profit (FORWARD, paper)'),
+        _lev_perp_agg_variant('lev_perp_v2_agg_state.json',
+                              'Leveraged perp 5x vol-tgt3 + ATR trail (FORWARD, paper)'),
         _pairs_forward(),
         _rebalance_forward(),
         _directional(),
