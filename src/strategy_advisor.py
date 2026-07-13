@@ -310,7 +310,7 @@ def _strategic_advice(today: dict, alltime: dict, journal: TradeJournal) -> List
 
     # Confidence calibration check (all-time)
     conf_cal = alltime.get('conf_calibration', {})
-    if conf_cal.get('>85') and conf_cal.get('55-70'):
+    if '>85' in conf_cal and '55-70' in conf_cal:
         high_wr = conf_cal['>85']
         low_wr  = conf_cal['55-70']
         if high_wr > low_wr + 10:
