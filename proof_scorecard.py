@@ -332,6 +332,30 @@ def _btc_trend_forward() -> dict | None:
     return dict(label='BTC trend (focused, FORWARD)', executable=True, **s)
 
 
+def _trend_ensemble_forward() -> dict | None:
+    """BTC trend-ensemble arm (trend_ensemble_paper.py): long-only whole-book BTC
+    allocation on a 2-of-3 vote (SMA100 / SMA200 / 90d momentum) — the slower,
+    parameter-diversified sibling of btc_trend. Spot-executable. Entry-week
+    clustered; at ~8-10 flips/yr the n>=30 bar is a multi-year clock (stated in
+    the arm's docstring — we do not fake proof)."""
+    path = DATA / 'trend_ensemble_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='BTC trend ensemble 2-of-3 (FORWARD, paper)', executable=True, **s)
+
+
 def _kelly_trend_forward() -> dict | None:
     """Conviction-scaled fractional-Kelly COMPOUNDING on the SAME BTC trend signal
     (kelly_trend_paper.py). Identical entries/exits to BTC trend (focused) — the only
@@ -696,6 +720,7 @@ def main():
         _tsmom_fast_forward(),
         _conf_forward(),
         _btc_trend_forward(),
+        _trend_ensemble_forward(),
         _kelly_trend_forward(),
         _tsmom_ls_forward(),
         _brain_forward(),

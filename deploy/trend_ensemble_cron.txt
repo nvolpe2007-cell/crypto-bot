@@ -1,0 +1,2 @@
+# trend_ensemble arm — root crontab line (VPS). Daily bar closes 00:00 UTC.
+13 0 * * * cd /opt/crypto-bot && ./venv/bin/python trend_ensemble_paper.py >> logs/trend_ensemble.log 2>&1
