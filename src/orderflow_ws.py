@@ -228,6 +228,22 @@ class OrderFlowWS:
     def stop(self):
         self._running = False
 
+    def _reset_trade_state(self):
+        """Clear CVD/whale state on (re)connect.
+
+        The book channel sends a fresh "snapshot" on every resubscribe, so
+        `_handle_book_snapshot` already fully replaces stale book state. The
+        trade channel has no such snapshot — it's pure incremental tape — so
+        without this, `_cvd_trades`/`_trade_sizes` would carry trades from
+        before a disconnect forward and mix them with post-reconnect trades
+        the moment the first new trade arrives, corrupting the CVD trend.
+        """
+        for sym in self._symbols:
+            self._cvd_trades[sym].clear()
+            self._trade_sizes[sym].clear()
+            self._last_whale[sym] = None
+        self._cvd_updated.clear()
+
     # ── WebSocket connection ───────────────────────────────────────────────────
 
     async def _connect(self):
@@ -235,6 +251,7 @@ class OrderFlowWS:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(_WS_URL, heartbeat=20) as ws:
                 logger.info("[OFW] connected — subscribing to trade + book")
+                self._reset_trade_state()
 
                 # Subscribe to individual trade tape
                 await ws.send_json({
