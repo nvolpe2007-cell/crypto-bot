@@ -211,15 +211,46 @@ class LiveTrader:
                 self.notifier.send_error(f"Buy order failed for {symbol}: {e}")
             return None
 
-        # Verify fill — don't record position if order didn't confirm
+        # Verify fill — don't record position if order didn't confirm.
+        # Kraken market orders occasionally return status='' on the initial
+        # response before the fill is fully processed.  We poll once via
+        # fetch_order() to get the real status rather than trusting an empty
+        # string as a confirmed fill.  If polling fails or still returns an
+        # ambiguous status, we reject the position record: the startup
+        # reconcile_positions() will catch any real fill on next restart.
         status     = order.get('status', '')
         exec_price = float(order.get('average') or order.get('price') or price)
         order_id   = order.get('id', '')
 
-        if status not in ('closed', 'filled', ''):
-            logger.error(f"[LIVE] Order {order_id} status={status} — not confirmed filled, aborting position record")
+        if status == '' and order_id:
+            logger.warning(
+                f"[LIVE] Order {order_id} returned empty status — polling for fill confirmation"
+            )
+            try:
+                polled     = await self.exchange.fetch_order(order_id, symbol)
+                status     = polled.get('status', '')
+                polled_price = float(polled.get('average') or polled.get('price') or 0)
+                if polled_price > 0:
+                    exec_price = polled_price
+                polled_fee = float((polled.get('fee') or {}).get('cost', 0))
+                if polled_fee > 0:
+                    order = {**order, 'fee': {'cost': polled_fee}}
+            except Exception as e:
+                logger.warning(
+                    f"[LIVE] fetch_order({order_id}) failed during verify: {e} "
+                    f"— treating empty status as unconfirmed"
+                )
+                status = 'unknown'
+
+        if status not in ('closed', 'filled'):
+            logger.error(
+                f"[LIVE] Order {order_id} status={status!r} — not confirmed filled, "
+                f"aborting position record (reconcile_positions() will catch any real fill)"
+            )
             if self.notifier:
-                self.notifier.send_error(f"{symbol} order {order_id} status '{status}' — check Kraken manually")
+                self.notifier.send_error(
+                    f"{symbol} order {order_id} status {status!r} — check Kraken manually"
+                )
             return None
 
         sl_pct = signal.stop_loss_pct() / 100
