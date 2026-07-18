@@ -670,3 +670,101 @@ class TestStaleSnapshotWarning:
         trader2 = _fresh_trader()
         n = _load_open_positions(trader2)
         assert n == 1, "Load must succeed even when saved_at is absent"
+
+
+class TestNaNSanitization:
+    """A NaN/Inf value reaching disk must never silently corrupt a restored
+    position or account balance — _save_open_positions sanitizes NaN/Inf to
+    null, and _load_open_positions must degrade gracefully when it reads one
+    back (skip the bad position, keep fresh account values) rather than
+    propagate a NaN that would make every stop-loss/take-profit comparison
+    on that position evaluate to False forever."""
+
+    def test_nan_entry_price_written_as_null_not_nan_literal(self, clean_positions_file):
+        """json.dumps's default allow_nan=True would otherwise emit a bare
+        `NaN` token — non-standard JSON that other tools choke on even
+        though Python's own json.load tolerates it."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position(entry_price=float('nan'))
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            raw = f.read()
+        assert 'NaN' not in raw
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        assert data['positions'][0]['entry_price'] is None
+
+    def test_nan_position_skipped_but_other_positions_still_restored(self, clean_positions_file, caplog):
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position(entry_price=float('nan'))
+        trader.account.positions['ETH/USD'] = _spot_position(entry_price=3_000.0)
+        _save_open_positions(trader)
+
+        import logging
+        trader2 = _fresh_trader()
+        with caplog.at_level(logging.WARNING, logger='src.paper_trading'):
+            n = _load_open_positions(trader2)
+
+        assert n == 1, "Only the valid position should be restored"
+        assert 'ETH/USD' in trader2.account.positions
+        assert 'BTC/USD' not in trader2.account.positions
+        skip_warnings = [r for r in caplog.records if 'Could not restore position' in r.message]
+        assert skip_warnings, "A warning must be logged for the skipped NaN position"
+
+    def test_inf_size_also_skipped_gracefully(self, clean_positions_file):
+        trader = _fresh_trader()
+        trader.account.positions['SOL/USD'] = _spot_position(entry_price=150.0, size=float('inf'))
+        _save_open_positions(trader)
+
+        trader2 = _fresh_trader()
+        n = _load_open_positions(trader2)
+        assert n == 0
+        assert 'SOL/USD' not in trader2.account.positions
+
+    def test_nan_cash_sanitized_to_null_on_save(self, clean_positions_file):
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        trader.account.cash = float('nan')
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            raw = f.read()
+        assert 'NaN' not in raw
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        assert data['cash'] is None
+
+    def test_nan_cash_does_not_discard_already_restored_positions(self, clean_positions_file, caplog):
+        """A corrupted cash value must not make the whole load look like it
+        restored nothing — the position dict is populated independently of
+        the cash/total_pnl restore step, so the count returned (and the
+        positions dict) must reflect the position that DID come back."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        trader.account.cash = float('nan')
+        _save_open_positions(trader)
+
+        import logging
+        trader2 = _fresh_trader(capital=1_000.0)
+        with caplog.at_level(logging.WARNING, logger='src.paper_trading'):
+            n = _load_open_positions(trader2)
+
+        assert n == 1, "The position must still be restored despite corrupted cash"
+        assert 'BTC/USD' in trader2.account.positions
+        assert trader2.account.cash == 1_000.0, "Cash must keep its fresh value, not become NaN/None"
+        cash_warnings = [r for r in caplog.records if 'Could not restore cash' in r.message]
+        assert cash_warnings, "A warning must be logged when cash cannot be restored"
+
+    def test_inf_total_pnl_does_not_crash_load(self, clean_positions_file):
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        trader.account.total_pnl = float('inf')
+        _save_open_positions(trader)
+
+        trader2 = _fresh_trader()
+        n = _load_open_positions(trader2)
+        assert n == 1
+        assert trader2.account.total_pnl != float('inf')
