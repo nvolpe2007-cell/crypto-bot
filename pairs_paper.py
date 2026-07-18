@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
+from src.state import sanitize_for_json
+
 KRAKEN_PAIRS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 
 INTERVAL_MIN = int(os.getenv("PAIRS_INTERVAL_MIN", "60"))          # 60 = hourly bars
@@ -102,7 +104,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 

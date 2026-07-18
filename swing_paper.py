@@ -30,6 +30,7 @@ from src.event_calendar import blackout_reason
 from src.cot_report import cot_signal
 from src.session_filter import SessionEdge, window_of_hour
 from src.td_sequential import td_state
+from src.state import sanitize_for_json
 
 # Session/time-of-day gate. Default OFF (measure-first): we tag every trade with
 # its session verdict so proof_scorecard can measure per-session edge BEFORE we
@@ -141,7 +142,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 
