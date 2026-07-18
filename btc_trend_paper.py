@@ -43,6 +43,13 @@ from pathlib import Path
 
 from src.state import sanitize_for_json
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 KRAKEN_PAIR = os.getenv("BTC_TREND_PAIR", "XBTUSD")     # BTC/USD on Kraken
 SMA_N = int(os.getenv("BTC_TREND_SMA", "100"))          # trend leg
 MOMO_N = int(os.getenv("BTC_TREND_MOMO", "20"))         # momentum leg
@@ -124,7 +131,7 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
 
     if last_t is None:                              # baseline / inception
         state["last_bar_t"][base] = latest["t"]
-        if _want_long(closes):                      # participate from inception if confluence on
+        if _want_long(closes) and not _is_killed():  # participate from inception if confluence on
             _open(state, base, latest["c"], str(latest["t"]))
             print(f"{base}: SEED LONG @ {latest['c']:.2f} (>SMA{SMA_N} & {MOMO_N}d momo up)")
         else:
@@ -141,9 +148,12 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
             continue
         is_long = base in state["positions"]
         if want and not is_long:
-            _open(state, base, bar["c"], str(bar["t"]))
-            print(f"{base}: OPEN LONG @ {bar['c']:.2f} (>SMA{SMA_N} & {MOMO_N}d momo up)")
-            acted += 1
+            if _is_killed():
+                print(f"{base}: SKIP entry (kill switch engaged)")
+            else:
+                _open(state, base, bar["c"], str(bar["t"]))
+                print(f"{base}: OPEN LONG @ {bar['c']:.2f} (>SMA{SMA_N} & {MOMO_N}d momo up)")
+                acted += 1
         elif is_long and not want:
             rec = _close(state, base, bar["c"], str(bar["t"]), "confluence_off")
             print(f"{base}: CLOSE @ {bar['c']:.2f} net=${rec['pnl']:+.2f} "

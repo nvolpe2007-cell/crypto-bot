@@ -38,6 +38,13 @@ from pathlib import Path
 
 from src.state import sanitize_for_json
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 _env = os.getenv("TSMOM_LS_SYMBOLS", "").strip()
 if _env:
@@ -207,10 +214,13 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
 
     if last_t is None:                              # baseline / inception
         state["last_bar_t"][base] = latest["t"]
-        side = _target_side(latest["c"], sma, 0)
-        _open(state, base, side, latest["c"], str(latest["t"]))
-        print(f"{base}: SEED {'LONG' if side > 0 else 'SHORT'} @ {latest['c']:.2f} "
-              f"({SMA_N}SMA {sma:.2f})")
+        if _is_killed():
+            print(f"{base}: SEED SKIP (kill switch engaged)")
+        else:
+            side = _target_side(latest["c"], sma, 0)
+            _open(state, base, side, latest["c"], str(latest["t"]))
+            print(f"{base}: SEED {'LONG' if side > 0 else 'SHORT'} @ {latest['c']:.2f} "
+                  f"({SMA_N}SMA {sma:.2f})")
         return 0
 
     new = [b for b in bars if b["t"] > last_t]
@@ -223,13 +233,17 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
         cur = state["positions"].get(base, {}).get("side", 0)
         want = _target_side(bar["c"], s, cur)
         if want != cur:
-            if cur != 0:                            # flip: realize the old side first
-                rec = _close(state, base, bar["c"], str(bar["t"]), "flip")
-                print(f"{base}: CLOSE {'LONG' if cur > 0 else 'SHORT'} @ {bar['c']:.2f} "
-                      f"net=${rec['pnl']:+.2f} (fund ${rec['funding_cost']:.2f})")
-            _open(state, base, want, bar["c"], str(bar["t"]))
-            print(f"{base}: OPEN {'LONG' if want > 0 else 'SHORT'} @ {bar['c']:.2f}")
-            acted += 1
+            if _is_killed():
+                print(f"{base}: SKIP flip (kill switch engaged, holding "
+                      f"{'LONG' if cur > 0 else 'SHORT' if cur < 0 else 'no position'})")
+            else:
+                if cur != 0:                        # flip: realize the old side first
+                    rec = _close(state, base, bar["c"], str(bar["t"]), "flip")
+                    print(f"{base}: CLOSE {'LONG' if cur > 0 else 'SHORT'} @ {bar['c']:.2f} "
+                          f"net=${rec['pnl']:+.2f} (fund ${rec['funding_cost']:.2f})")
+                _open(state, base, want, bar["c"], str(bar["t"]))
+                print(f"{base}: OPEN {'LONG' if want > 0 else 'SHORT'} @ {bar['c']:.2f}")
+                acted += 1
         state["last_bar_t"][base] = bar["t"]
     return acted
 

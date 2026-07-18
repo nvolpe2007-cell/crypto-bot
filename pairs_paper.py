@@ -43,6 +43,13 @@ from pathlib import Path
 
 from src.state import sanitize_for_json
 
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 KRAKEN_PAIRS = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 
 INTERVAL_MIN = int(os.getenv("PAIRS_INTERVAL_MIN", "60"))          # 60 = hourly bars
@@ -228,7 +235,7 @@ def _notify(state: dict, prices: dict, acted: int) -> None:
 def process(state: dict, closes_by_base: dict[str, dict[int, float]],
             prices: dict[str, float], now) -> int:
     acted = 0
-    allow_open = not state.get("halted", False)
+    allow_open = not state.get("halted", False) and not _is_killed()
     for pair in _PAIRS:
         a, b = pair
         key = "-".join(pair)
