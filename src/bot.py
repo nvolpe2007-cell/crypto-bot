@@ -4,6 +4,7 @@ Coordinates data fetching, strategy signals, and trade execution
 """
 
 import asyncio
+import functools
 import signal
 import yaml
 import os
@@ -344,10 +345,15 @@ async def main():
 
     loop = asyncio.get_running_loop()
     notifier = create_notifier_from_env()
+    # Each top-level subsystem runs under `supervised()` (the same auto-restart
+    # wrapper already used for the websocket feeds below) so an unhandled crash
+    # in one — e.g. the dashboard — restarts just that subsystem instead of
+    # propagating through this gather and killing the whole process, which would
+    # take the live/paper trading loop and funding scanner down with it too.
     gather_task = asyncio.gather(
-        bot.start(),
-        run_dashboard(),
-        _run_funding_scanner(notifier=notifier),
+        supervised('bot', bot.start, notifier=notifier),
+        supervised('dashboard', run_dashboard, notifier=notifier),
+        supervised('funding_scanner', functools.partial(_run_funding_scanner, notifier=notifier), notifier=notifier),
     )
 
     def _handle_shutdown():
