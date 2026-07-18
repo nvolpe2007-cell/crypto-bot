@@ -63,6 +63,7 @@ from src.live_trading import (
     _quick_diagnose,
     _update_chandelier_stop,
     _kill_switch_engaged,
+    _daily_loss_halted,
     _sltp_circuit_alert,
     _sltp_circuit_cleared,
     run_live_trading_session,
@@ -126,6 +127,12 @@ def _make_exchange() -> MagicMock:
         "status": "closed",
         "average": 50_000.0,
         "price": 50_000.0,
+        "fee": {"cost": 1.30},
+    })
+    ex.fetch_order = AsyncMock(return_value={
+        "id": "order-001",
+        "status": "closed",
+        "average": 50_000.0,
         "fee": {"cost": 1.30},
     })
     return ex
@@ -246,6 +253,32 @@ class TestReconcilePositions:
             {"symbol": "BTC/USD", "contracts": 0, "entryPrice": 50_000.0}
         ])
         asyncio.run(trader.reconcile_positions())
+        assert "BTC/USD" not in trader.positions
+
+    def test_falls_back_to_ticker_when_entry_and_mark_price_missing(self):
+        """entryPrice/markPrice can be absent on some position responses —
+        the position must still be tracked, not silently dropped."""
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC/USD", "contracts": 0.001}
+        ])
+        trader.exchange.get_ticker = AsyncMock(return_value={"last": 51_000.0})
+        asyncio.run(trader.reconcile_positions())
+        assert "BTC/USD" in trader.positions
+        assert trader.positions["BTC/USD"].entry_price == 51_000.0
+
+    def test_raises_when_price_and_ticker_fallback_both_unavailable(self):
+        """If we truly cannot determine a price for an untracked exchange
+        position, silently dropping it would leave it untracked while still
+        open on Kraken — the next signal loop would then open a SECOND
+        position on top of it. Must raise and abort startup instead."""
+        trader = _make_trader()
+        trader.exchange.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC/USD", "contracts": 0.001}
+        ])
+        trader.exchange.get_ticker = AsyncMock(side_effect=RuntimeError("no ticker"))
+        with pytest.raises(RuntimeError):
+            asyncio.run(trader.reconcile_positions())
         assert "BTC/USD" not in trader.positions
 
     def test_ignores_unknown_symbol(self):
@@ -379,6 +412,149 @@ class TestOpenLong:
         sig = _make_signal()
         pos = self._run(trader.open_long("BTC/USD", 50_000.0, 100.0, sig))
         assert pos.entry_fee == pytest.approx(2.60)
+
+
+# ── open_long: empty-status fill verification ────────────────────────────────────
+#
+# Kraken market orders occasionally return status='' on the initial response
+# before the fill is fully processed.  Previously, open_long() treated ''
+# the same as 'closed'/'filled' and recorded the position without verification —
+# a silent assumption that could record a position for an order that never
+# actually filled.  Now, '' triggers a single fetch_order() poll: if that
+# confirms fill, the position is recorded; otherwise it is rejected so the
+# next startup reconcile_positions() can catch any real fill.
+
+class TestOpenLongStatusVerification:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_closed_status_does_not_call_fetch_order(self):
+        """An explicit 'closed' status is unambiguous — no poll needed."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "closed", "average": 50_000.0,
+            "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        trader.exchange.fetch_order.assert_not_called()
+
+    def test_empty_status_calls_fetch_order_for_verification(self):
+        """status='' must trigger a fetch_order() poll rather than being
+        accepted as a confirmed fill without verification."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "closed",
+            "average": 50_000.0, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        trader.exchange.fetch_order.assert_called_once_with("order-pending", "BTC/USD")
+
+    def test_empty_status_confirmed_by_poll_records_position(self):
+        """When fetch_order() returns 'closed', the position must be recorded."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 0.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "closed",
+            "average": 50_100.0, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        assert "BTC/USD" in trader.positions
+
+    def test_empty_status_confirmed_uses_polled_fill_price(self):
+        """The position entry price must come from the polled order response,
+        not the initial (pre-fill) response."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "o", "status": "", "average": 0.0, "fee": {"cost": 0.0},
+        })
+        polled_price = 50_200.0
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "o", "status": "closed",
+            "average": polled_price, "fee": {"cost": 1.30},
+        })
+        sig = _make_signal(close=polled_price)
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is not None
+        assert pos.entry_price == pytest.approx(polled_price)
+
+    def test_empty_status_still_empty_after_poll_returns_none(self):
+        """If fetch_order() also returns '' the order is still unconfirmed —
+        the position must NOT be recorded."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+
+    def test_empty_status_fetch_order_exception_returns_none(self):
+        """If fetch_order() raises, the position must not be recorded — we
+        cannot confirm the fill and must not assume it happened."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-pending", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(
+            side_effect=RuntimeError("exchange timeout")
+        )
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+
+    def test_open_status_still_rejected_without_poll(self):
+        """status='open' means the order is resting, not filled — must be
+        rejected whether or not it was returned as empty initially."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "order-open", "status": "open", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        assert "BTC/USD" not in trader.positions
+        trader.exchange.fetch_order.assert_not_called()
+
+    def test_no_order_id_skips_poll_and_rejects(self):
+        """If the order response has no id, we cannot poll — treat as unconfirmed."""
+        trader = _make_trader()
+        trader.exchange.get_balance = AsyncMock(return_value={"USD": {"free": 500.0}})
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "", "status": "", "average": 50_000.0,
+            "fee": {"cost": 0.0},
+        })
+        sig = _make_signal()
+        pos = self._run(trader.open_long("BTC/USD", 50_000.0, 50.0, sig))
+        assert pos is None
+        trader.exchange.fetch_order.assert_not_called()
 
 
 # ── _update_chandelier_stop ─────────────────────────────────────────────────────
@@ -547,6 +723,27 @@ class TestCloseLong:
         trade = self._run(trader.close_long("BTC/USD", 50_000.0, "SIGNAL"))
         assert trade.pnl == pytest.approx(-(entry_fee + exit_fee))
         assert trade.fees == pytest.approx(entry_fee + exit_fee)
+
+    def test_pnl_pct_is_net_of_fees_not_gross_price_delta(self):
+        """Regression: pnl_pct must be computed over (size_usd + entry_fee) cost basis,
+        like pnl itself — not the raw (exit-entry)/entry price delta. With heavy fees a
+        trade can show a positive price move yet still be a net loser; pnl_pct must
+        agree with pnl's sign, not silently report a gross 'gain' on a losing trade.
+        """
+        trader = _make_trader()
+        entry_fee = 5.0  # heavy fee relative to a $100 position
+        self._setup_position(trader, entry_price=50_000.0, size=0.002, size_usd=100.0,
+                             entry_fee=entry_fee)
+        exit_fee = 0.26
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 51_000.0,  # +2% price move
+            "fee": {"cost": exit_fee},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade.pnl < 0  # fees overwhelm the 2% gain
+        cost_basis = 100.0 + entry_fee
+        assert trade.pnl_pct == pytest.approx(trade.pnl / cost_basis * 100)
+        assert trade.pnl_pct < 0  # must agree in sign with pnl, not report a gross +2%
 
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
@@ -890,6 +1087,56 @@ class TestKillSwitchEngaged:
         kill_isolated.engage("test")
         # Must not raise even though send_message blows up
         assert _kill_switch_engaged(notifier, was_killed=False) is True
+
+
+# ── _daily_loss_halted ───────────────────────────────────────────────────────────
+#
+# Before this fix, breaching the daily loss cap set trader.running=False, which
+# also stops the background _sltp_watcher (and every other background task) —
+# they all loop on `while trader.running:`. That abandoned any position still
+# open at the moment of breach with zero further stop-loss/take-profit
+# protection until a human intervened. This helper instead halts NEW entries
+# only, mirroring _kill_switch_engaged's halt-not-kill pattern, and never
+# touches trader.running.
+
+class TestDailyLossHalted:
+    def test_under_threshold_returns_false(self):
+        assert _daily_loss_halted(None, session_loss=10.0, max_daily_loss=15.0, was_halted=False) is False
+
+    def test_at_threshold_engages(self):
+        assert _daily_loss_halted(None, session_loss=15.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_over_threshold_engages(self):
+        assert _daily_loss_halted(None, session_loss=42.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_stays_latched_even_if_loss_recovers(self):
+        """A later winning exit pulling session_loss back under the cap must
+        not silently re-arm entries — that needs a manual restart."""
+        assert _daily_loss_halted(None, session_loss=0.0, max_daily_loss=15.0, was_halted=True) is True
+
+    def test_notifies_once_on_breach(self):
+        notifier = MagicMock()
+        halted = _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False)
+        assert halted is True
+        assert notifier.send_message.call_count == 1
+        msg = notifier.send_message.call_args[0][0]
+        assert "DAILY LOSS LIMIT" in msg
+        assert "20.00" in msg
+
+    def test_does_not_renotify_while_still_halted(self):
+        notifier = MagicMock()
+        halted = _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False)
+        halted = _daily_loss_halted(notifier, session_loss=25.0, max_daily_loss=15.0, was_halted=halted)
+        assert halted is True
+        assert notifier.send_message.call_count == 1
+
+    def test_no_notifier_does_not_raise(self):
+        assert _daily_loss_halted(None, session_loss=20.0, max_daily_loss=15.0, was_halted=False) is True
+
+    def test_notifier_exception_swallowed(self):
+        notifier = MagicMock()
+        notifier.send_message.side_effect = RuntimeError("telegram down")
+        assert _daily_loss_halted(notifier, session_loss=20.0, max_daily_loss=15.0, was_halted=False) is True
 
 
 # ── _sltp_circuit_alert / _sltp_circuit_cleared ─────────────────────────────────

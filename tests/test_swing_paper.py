@@ -253,6 +253,14 @@ def test_conviction_rewards_stronger_trend():
     assert swing_paper._conviction(strong) > swing_paper._conviction(weak)
 
 
+def test_kill_switch_blocks_new_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(swing_paper, "_is_killed", lambda: True)
+    state = {"positions": {}, "closed": []}
+    opened = swing_paper._commit_entry(_cand("BTC", 0.5), state, _dlog(tmp_path))
+    assert opened is False
+    assert state["positions"] == {}
+
+
 def test_gap_down_through_stop_fills_at_open(tmp_path):
     """When a bar GAPS open below the stop, the (market) stop fills at the worse
     open price, not at the stop — otherwise gap-downs overstate P&L."""

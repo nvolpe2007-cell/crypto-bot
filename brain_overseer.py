@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.state import sanitize_for_json
+
 DATA = Path(os.getenv("BRAIN_OVERSEER_DATA_DIR", "data"))
 STATE_FILE = Path(os.getenv("BRAIN_OVERSEER_STATE_FILE",
                             str(DATA / "brain_overseer_state.json")))
@@ -143,7 +145,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 

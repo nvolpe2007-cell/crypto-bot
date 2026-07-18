@@ -9,7 +9,8 @@ Safety guarantees:
   - Startup reconciliation: syncs bot state with actual Kraken open positions
   - Order fill verification: position only recorded after confirmed fill
   - Fee tracking: actual fees pulled from order response
-  - Daily loss circuit breaker: stops trading if loss exceeds MAX_DAILY_LOSS
+  - Daily loss circuit breaker: halts NEW entries if realized loss exceeds
+    MAX_DAILY_LOSS, without abandoning SL/TP protection on any open position
   - Min confidence: 70 (higher bar than paper's 60)
 """
 
@@ -129,7 +130,9 @@ class LiveTrader:
         exhausted) instead of swallowing the error and assuming "no open
         positions" — that assumption could let the bot open a duplicate
         position on top of one already live on Kraken. The caller must not
-        start trading if this raises.
+        start trading if this raises. Also raises if an untracked exchange
+        position has no usable entry/mark price and the ticker fallback also
+        fails — recording it with a fabricated price is worse than aborting.
         """
         exchange_positions = await self.exchange.get_positions(self.symbols)
         open_syms = set()
@@ -141,18 +144,35 @@ class LiveTrader:
                 if sym not in self.positions:
                     # Exchange has a position we don't know about — record it
                     price = float(ep.get('entryPrice') or ep.get('markPrice') or 0)
-                    if price > 0:
-                        self.positions[sym] = LivePosition(
-                            symbol=sym,
-                            entry_time=datetime.now(timezone.utc),
-                            entry_price=price,
-                            size=size,
-                            size_usd=size * price,
-                            order_id='reconciled',
-                            stop_loss_price=price * 0.98,   # 2% default SL
-                            take_profit_price=price * 1.03,
+                    if price <= 0:
+                        # entryPrice/markPrice missing on the position response —
+                        # fall back to a live ticker price rather than silently
+                        # dropping this position. Silently skipping here would
+                        # leave it out of self.positions while it's still in
+                        # open_syms, so the next signal loop sees pos is None
+                        # and opens a SECOND position on top of this real one.
+                        try:
+                            ticker = await self.exchange.get_ticker(sym)
+                            price = float(ticker.get('last') or ticker.get('close') or ticker.get('bid') or 0)
+                        except Exception as e:
+                            logger.error(f"[RECONCILE] Ticker fallback for {sym} failed: {e}")
+                    if price <= 0:
+                        raise RuntimeError(
+                            f"Untracked open position on {sym} (size={size:.6f}) but no price "
+                            f"available from entryPrice/markPrice or ticker fallback — refusing "
+                            f"to silently drop it, which could open a duplicate position."
                         )
-                        logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
+                    self.positions[sym] = LivePosition(
+                        symbol=sym,
+                        entry_time=datetime.now(timezone.utc),
+                        entry_price=price,
+                        size=size,
+                        size_usd=size * price,
+                        order_id='reconciled',
+                        stop_loss_price=price * 0.98,   # 2% default SL
+                        take_profit_price=price * 1.03,
+                    )
+                    logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
 
         # Remove positions bot thinks are open but exchange doesn't
         for sym in list(self.positions.keys()):
@@ -191,15 +211,46 @@ class LiveTrader:
                 self.notifier.send_error(f"Buy order failed for {symbol}: {e}")
             return None
 
-        # Verify fill — don't record position if order didn't confirm
+        # Verify fill — don't record position if order didn't confirm.
+        # Kraken market orders occasionally return status='' on the initial
+        # response before the fill is fully processed.  We poll once via
+        # fetch_order() to get the real status rather than trusting an empty
+        # string as a confirmed fill.  If polling fails or still returns an
+        # ambiguous status, we reject the position record: the startup
+        # reconcile_positions() will catch any real fill on next restart.
         status     = order.get('status', '')
         exec_price = float(order.get('average') or order.get('price') or price)
         order_id   = order.get('id', '')
 
-        if status not in ('closed', 'filled', ''):
-            logger.error(f"[LIVE] Order {order_id} status={status} — not confirmed filled, aborting position record")
+        if status == '' and order_id:
+            logger.warning(
+                f"[LIVE] Order {order_id} returned empty status — polling for fill confirmation"
+            )
+            try:
+                polled     = await self.exchange.fetch_order(order_id, symbol)
+                status     = polled.get('status', '')
+                polled_price = float(polled.get('average') or polled.get('price') or 0)
+                if polled_price > 0:
+                    exec_price = polled_price
+                polled_fee = float((polled.get('fee') or {}).get('cost', 0))
+                if polled_fee > 0:
+                    order = {**order, 'fee': {'cost': polled_fee}}
+            except Exception as e:
+                logger.warning(
+                    f"[LIVE] fetch_order({order_id}) failed during verify: {e} "
+                    f"— treating empty status as unconfirmed"
+                )
+                status = 'unknown'
+
+        if status not in ('closed', 'filled'):
+            logger.error(
+                f"[LIVE] Order {order_id} status={status!r} — not confirmed filled, "
+                f"aborting position record (reconcile_positions() will catch any real fill)"
+            )
             if self.notifier:
-                self.notifier.send_error(f"{symbol} order {order_id} status '{status}' — check Kraken manually")
+                self.notifier.send_error(
+                    f"{symbol} order {order_id} status {status!r} — check Kraken manually"
+                )
             return None
 
         sl_pct = signal.stop_loss_pct() / 100
@@ -258,8 +309,9 @@ class LiveTrader:
 
         # Use the actual entry fee charged at open (not a re-estimate) so realized
         # PnL matches the real account balance change.
-        pnl     = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
-        pnl_pct = (exec_price - pos.entry_price) / pos.entry_price * 100
+        pnl        = (exec_price - pos.entry_price) * pos.size - pos.entry_fee - exit_fee
+        cost_basis = pos.size_usd + pos.entry_fee
+        pnl_pct    = pnl / cost_basis * 100 if cost_basis else 0.0
 
         trade = Trade(
             entry_time=pos.entry_time,
@@ -469,6 +521,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     equity_curve:   List[dict]              = []
     iteration = 0
     killed = False  # master kill switch state — see _kill_switch_engaged()
+    daily_loss_halted = False  # daily-loss breaker state — see _daily_loss_halted()
 
     # Seed OHLCV
     for sym in symbols:
@@ -545,18 +598,16 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
             # Same flag the paper arms honor; file/env toggled, no restart needed.
             killed = _kill_switch_engaged(notifier, killed)
 
-            # Daily loss circuit breaker
+            # Daily loss circuit breaker — halts NEW entries only (same
+            # halt-not-kill pattern as the master kill switch above). Must NOT
+            # set trader.running=False here: that flag also gates the
+            # background _sltp_watcher/_candle_refresher/_ofi_fetcher tasks,
+            # so flipping it would abandon any still-open real-money position
+            # with no further stop-loss/take-profit protection.
             session_loss = session_start_pnl - trader.account.total_pnl
-            if session_loss >= max_daily_loss:
-                logger.warning(f"[LIVE RISK] Daily loss limit ${max_daily_loss:.2f} hit — stopping")
-                if notifier:
-                    notifier.send_message(
-                        f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
-                        f"Lost ${session_loss:.2f} today (limit: ${max_daily_loss:.2f})\n"
-                        f"Bot stopped — restart manually when ready"
-                    )
-                trader.running = False
-                break
+            daily_loss_halted = _daily_loss_halted(
+                notifier, session_loss, max_daily_loss, daily_loss_halted
+            )
 
             ws_prices = public_ws.get_prices() if public_ws else {}
 
@@ -614,7 +665,8 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 current_equity = trader.account.initial_capital + trader.account.total_pnl
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
-                if sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE and not killed:
+                if (sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE
+                        and not killed and not daily_loss_halted):
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
 
@@ -779,6 +831,38 @@ def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool)
             except Exception:
                 pass
     return killed
+
+
+def _daily_loss_halted(notifier: Optional[TelegramNotifier], session_loss: float,
+                       max_daily_loss: float, was_halted: bool) -> bool:
+    """Daily loss circuit breaker — halts NEW entries only, once realized
+    `session_loss` breaches `max_daily_loss`. Mirrors _kill_switch_engaged's
+    halt-not-kill pattern: it never touches trader.running, so the SL/TP
+    watcher keeps protecting any position that was still open when the
+    breaker tripped instead of abandoning it. One-way latch for the rest of
+    the session — a later winning exit pulling session_loss back under the
+    cap does not re-arm entries; per the alert text, that needs a manual
+    restart.
+    """
+    if was_halted:
+        return True
+    if session_loss < max_daily_loss:
+        return False
+    logger.warning(
+        f"[LIVE RISK] Daily loss limit ${max_daily_loss:.2f} hit "
+        f"(lost ${session_loss:.2f}) — halting new entries (exits continue)"
+    )
+    if notifier:
+        try:
+            notifier.send_message(
+                f"⛔ <b>DAILY LOSS LIMIT HIT</b>\n"
+                f"Lost ${session_loss:.2f} today (limit: ${max_daily_loss:.2f})\n"
+                f"New entries halted — any open position remains protected by "
+                f"its stop-loss/take-profit. Restart the bot manually to resume entries."
+            )
+        except Exception:
+            pass
+    return True
 
 
 def _sltp_circuit_alert(notifier: Optional[TelegramNotifier], symbol: str,

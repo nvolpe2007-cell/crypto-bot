@@ -5,10 +5,17 @@ execute_partial_cover — closes a fraction of a short position
 
 Key invariants verified:
   1. Position size decreases by the correct fraction.
-  2. Cash delta equals proceeds minus exit fee (no more, no less).
-  3. pnl_partial is net of exit fee (not gross).
+  2. Cash delta equals proceeds minus exit fee (no more, no less) — the
+     entry fee was already paid out of cash at open, so it is NOT deducted
+     from cash again here.
+  3. pnl_partial is net of exit fee AND this leg's proportional share of the
+     original entry fee (pos.entry_fee * fraction).
   4. A 50-50 split (partial + final full close) produces identical cash and
      total_pnl to a single full close at the same prices.
+  5. pos.entry_fee is reduced by the closed fraction, so a later close only
+     charges entry fee for the size it actually closes.
+  6. Each partial close appends its own Trade to closed_trades (so T1 exits
+     are not invisible to trade-count stats / the journal pipeline).
 
 Invariant 4 is the critical regression test: if partial close accounting is
 wrong, the two paths diverge and the paper trader gives unrealistic results.
@@ -128,17 +135,18 @@ class TestPartialSell:
     # ── pnl accounting ────────────────────────────────────────────────────────
 
     def test_pnl_partial_is_net_of_exit_fee(self):
-        """At break-even price, pnl_partial = −exit_fee (only fee is deducted)."""
+        """At break-even price, pnl_partial = −exit_fee − this leg's share of
+        the entry fee (gross price P&L ≈ 0 at break-even)."""
         t = _trader()
         _exec_buy(t)
         pos = t.account.positions[SYMBOL]
         partial_size = pos.size * 0.5
+        entry_fee_partial = pos.entry_fee * 0.5
         slip = t.slippage_pct
         exec_price = PRICE * (1 - slip)
         exit_fee = exec_price * partial_size * t.fee_pct
-        # Gross price P&L ≈ 0 at break-even; net = -fee
         gross_pnl = (exec_price - pos.entry_price) * partial_size
-        expected_pnl = gross_pnl - exit_fee
+        expected_pnl = gross_pnl - exit_fee - entry_fee_partial
 
         pnl = t.execute_partial_sell(SYMBOL, PRICE, T1)
 
@@ -149,6 +157,46 @@ class TestPartialSell:
         _exec_buy(t)
         pnl_partial = t.execute_partial_sell(SYMBOL, PRICE * 1.02, T1)
         assert abs(t.account.total_pnl - pnl_partial) < 1e-10
+
+    # ── entry-fee proportional reduction ──────────────────────────────────────
+
+    def test_entry_fee_reduced_proportionally(self):
+        """pos.entry_fee must shrink by the closed fraction, else a later close
+        re-charges the full original entry fee against a smaller remaining size."""
+        t = _trader()
+        _exec_buy(t)
+        original_entry_fee = t.account.positions[SYMBOL].entry_fee
+        t.execute_partial_sell(SYMBOL, PRICE * 1.02, T1, fraction=0.4)
+        remaining_entry_fee = t.account.positions[SYMBOL].entry_fee
+        assert abs(remaining_entry_fee - original_entry_fee * 0.6) < 1e-10
+
+    def test_multiple_partials_reduce_entry_fee_correctly(self):
+        """Two sequential partials must each take their share of the entry fee
+        that remained at the time, not the original fee twice over."""
+        t = _trader()
+        _exec_buy(t)
+        original_entry_fee = t.account.positions[SYMBOL].entry_fee
+        t.execute_partial_sell(SYMBOL, PRICE * 1.01, T1, fraction=0.5)
+        after_first = t.account.positions[SYMBOL].entry_fee
+        assert abs(after_first - original_entry_fee * 0.5) < 1e-10
+        t.execute_partial_sell(SYMBOL, PRICE * 1.01, T1, fraction=0.5)
+        after_second = t.account.positions[SYMBOL].entry_fee
+        assert abs(after_second - original_entry_fee * 0.25) < 1e-10
+
+    # ── trade-record creation ─────────────────────────────────────────────────
+
+    def test_partial_sell_appends_trade_record(self):
+        """A partial close must NOT be invisible to closed_trades — it needs
+        its own Trade record like any other exit."""
+        t = _trader()
+        _exec_buy(t)
+        assert len(t.account.closed_trades) == 0
+        pnl_partial = t.execute_partial_sell(SYMBOL, PRICE * 1.02, T1, fraction=0.4)
+        assert len(t.account.closed_trades) == 1
+        trade = t.account.closed_trades[0]
+        assert trade.side == 'partial_sell'
+        assert abs(trade.pnl - pnl_partial) < 1e-10
+        assert trade.size > 0
 
     # ── consistency: partial + full == single full ────────────────────────────
 
@@ -235,16 +283,18 @@ class TestPartialCover:
     # ── pnl accounting ────────────────────────────────────────────────────────
 
     def test_pnl_partial_is_net_of_exit_fee(self):
-        """Covering at same market price as entry: pnl = gross − exit_fee."""
+        """Covering at same market price as entry: pnl = gross − exit_fee −
+        this leg's share of the entry fee."""
         t = _trader()
         _exec_short(t)
         pos = t.account.positions[SYMBOL]
         partial_size = pos.size * 0.5
+        entry_fee_partial = pos.entry_fee * 0.5
         slip = t.slippage_pct
         exec_price = PRICE * (1 + slip)   # cover at a slightly higher price
         exit_fee = exec_price * partial_size * t.fee_pct
         gross_pnl = (pos.entry_price - exec_price) * partial_size
-        expected_pnl = gross_pnl - exit_fee
+        expected_pnl = gross_pnl - exit_fee - entry_fee_partial
 
         pnl = t.execute_partial_cover(SYMBOL, PRICE, T1)
 
@@ -255,6 +305,29 @@ class TestPartialCover:
         _exec_short(t)
         pnl_partial = t.execute_partial_cover(SYMBOL, PRICE * 0.99, T1)
         assert abs(t.account.total_pnl - pnl_partial) < 1e-10
+
+    # ── entry-fee proportional reduction ──────────────────────────────────────
+
+    def test_entry_fee_reduced_proportionally(self):
+        t = _trader()
+        _exec_short(t)
+        original_entry_fee = t.account.positions[SYMBOL].entry_fee
+        t.execute_partial_cover(SYMBOL, PRICE * 0.99, T1, fraction=0.4)
+        remaining_entry_fee = t.account.positions[SYMBOL].entry_fee
+        assert abs(remaining_entry_fee - original_entry_fee * 0.6) < 1e-10
+
+    # ── trade-record creation ─────────────────────────────────────────────────
+
+    def test_partial_cover_appends_trade_record(self):
+        t = _trader()
+        _exec_short(t)
+        assert len(t.account.closed_trades) == 0
+        pnl_partial = t.execute_partial_cover(SYMBOL, PRICE * 0.98, T1, fraction=0.4)
+        assert len(t.account.closed_trades) == 1
+        trade = t.account.closed_trades[0]
+        assert trade.side == 'partial_cover'
+        assert abs(trade.pnl - pnl_partial) < 1e-10
+        assert trade.size > 0
 
     # ── cash accounting ───────────────────────────────────────────────────────
 

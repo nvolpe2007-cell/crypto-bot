@@ -32,6 +32,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.state import sanitize_for_json
+
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 _env = os.getenv("TSMOM_SYMBOLS", "").strip()
 if _env:
@@ -85,7 +94,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 
@@ -120,7 +129,7 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
 
     if last_t is None:                              # baseline / inception
         state["last_bar_t"][base] = latest["t"]
-        if latest["c"] > sma:                       # participate from inception if in uptrend
+        if latest["c"] > sma and not _is_killed():   # participate from inception if in uptrend
             _open(state, base, latest["c"], str(latest["t"]))
             print(f"{base}: SEED LONG @ {latest['c']:.2f} (close>{SMA_N}SMA {sma:.2f})")
         else:
@@ -138,9 +147,12 @@ def process_symbol(base: str, bars: list[dict], state: dict) -> int:
         is_long = base in state["positions"]
         want_long = _target_position(bar["c"], s, is_long)
         if want_long and not is_long:
-            _open(state, base, bar["c"], str(bar["t"]))
-            print(f"{base}: OPEN LONG @ {bar['c']:.2f} (>{SMA_N}SMA+band)")
-            acted += 1
+            if _is_killed():
+                print(f"{base}: SKIP entry (kill switch engaged)")
+            else:
+                _open(state, base, bar["c"], str(bar["t"]))
+                print(f"{base}: OPEN LONG @ {bar['c']:.2f} (>{SMA_N}SMA+band)")
+                acted += 1
         elif is_long and not want_long:
             rec = _close(state, base, bar["c"], str(bar["t"]), "trend_exit")
             print(f"{base}: CLOSE @ {bar['c']:.2f} net=${rec['pnl']:+.2f} "

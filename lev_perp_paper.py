@@ -73,6 +73,15 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.state import sanitize_for_json
+
+# Master kill switch (best-effort import — never block trading if it can't load).
+try:
+    from src.kill_switch import is_killed as _is_killed
+except Exception:  # pragma: no cover - import-path safety net
+    def _is_killed() -> bool:
+        return False
+
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
 _env = os.getenv("LEV_PERP_SYMBOLS", "").strip()
 if _env:
@@ -273,7 +282,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 
@@ -361,7 +370,9 @@ def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None
         state["last_bar_t"][base] = latest["t"]
         # Apply entry filters even at seed time
         skip_reasons: list = []
-        if _news_halted():
+        if _is_killed():
+            print(f"{base}: SEED SKIPPED — kill switch engaged")
+        elif _news_halted():
             print(f"{base}: SEED SKIPPED — news halt active")
         elif _entry_filter(bars, closes, skip_reasons):
             side = _target_side(latest["c"], sma)
@@ -409,7 +420,9 @@ def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None
             skip_reasons: list = []
             bars_to_idx = bars[: idx + 1]
             closes_to_idx = closes[: idx + 1]
-            if _news_halted():
+            if _is_killed():
+                print(f"{base}: SKIP entry — kill switch engaged")
+            elif _news_halted():
                 print(f"{base}: SKIP entry — news halt active")
             elif _entry_filter(bars_to_idx, closes_to_idx, skip_reasons):
                 _open(state, base, want, bar["c"], str(bar["t"]), closes_to_idx)

@@ -184,3 +184,27 @@ def test_snapshot_totals(data_dir):
     assert snap["totals"]["pnl"] == 50.0
     assert snap["totals"]["n_arms"] == 2
     assert snap["totals"]["active"] == 1
+
+
+def test_collect_arms_flags_allocator_as_meta(data_dir):
+    _write_state(data_dir, "a", start=1000, equity=1000)
+    _write_state(data_dir, "allocator", start=1000, equity=1000)
+    rows = {r["stem"]: r for r in dd.collect_arms(data_dir)}
+    assert rows["a"]["meta"] is False
+    assert rows["allocator"]["meta"] is True
+
+
+def test_snapshot_totals_excludes_allocator_double_count(data_dir):
+    # The allocator weights INTO arm "a" — its equity derives from the same
+    # underlying capital "a" already reports, so it must not add to totals.
+    _write_state(data_dir, "a", start=1000, equity=1100, positions={"BTC": {}})
+    _write_state(data_dir, "allocator", start=1000, equity=1050, positions={"a": 1.0})
+    snap = dd.snapshot(data_dir)
+    # Without the fix this would be 2150.0 / 2000.0 — double-counting "a"'s capital.
+    assert snap["totals"]["equity"] == 1100.0
+    assert snap["totals"]["start"] == 1000.0
+    assert snap["totals"]["pnl"] == 100.0
+    assert snap["totals"]["n_arms"] == 1
+    assert snap["totals"]["active"] == 1
+    # The allocator still shows up in the per-arm table for its own track record.
+    assert any(r["stem"] == "allocator" for r in snap["arms"])
