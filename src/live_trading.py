@@ -130,7 +130,9 @@ class LiveTrader:
         exhausted) instead of swallowing the error and assuming "no open
         positions" — that assumption could let the bot open a duplicate
         position on top of one already live on Kraken. The caller must not
-        start trading if this raises.
+        start trading if this raises. Also raises if an untracked exchange
+        position has no usable entry/mark price and the ticker fallback also
+        fails — recording it with a fabricated price is worse than aborting.
         """
         exchange_positions = await self.exchange.get_positions(self.symbols)
         open_syms = set()
@@ -142,18 +144,35 @@ class LiveTrader:
                 if sym not in self.positions:
                     # Exchange has a position we don't know about — record it
                     price = float(ep.get('entryPrice') or ep.get('markPrice') or 0)
-                    if price > 0:
-                        self.positions[sym] = LivePosition(
-                            symbol=sym,
-                            entry_time=datetime.now(timezone.utc),
-                            entry_price=price,
-                            size=size,
-                            size_usd=size * price,
-                            order_id='reconciled',
-                            stop_loss_price=price * 0.98,   # 2% default SL
-                            take_profit_price=price * 1.03,
+                    if price <= 0:
+                        # entryPrice/markPrice missing on the position response —
+                        # fall back to a live ticker price rather than silently
+                        # dropping this position. Silently skipping here would
+                        # leave it out of self.positions while it's still in
+                        # open_syms, so the next signal loop sees pos is None
+                        # and opens a SECOND position on top of this real one.
+                        try:
+                            ticker = await self.exchange.get_ticker(sym)
+                            price = float(ticker.get('last') or ticker.get('close') or ticker.get('bid') or 0)
+                        except Exception as e:
+                            logger.error(f"[RECONCILE] Ticker fallback for {sym} failed: {e}")
+                    if price <= 0:
+                        raise RuntimeError(
+                            f"Untracked open position on {sym} (size={size:.6f}) but no price "
+                            f"available from entryPrice/markPrice or ticker fallback — refusing "
+                            f"to silently drop it, which could open a duplicate position."
                         )
-                        logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
+                    self.positions[sym] = LivePosition(
+                        symbol=sym,
+                        entry_time=datetime.now(timezone.utc),
+                        entry_price=price,
+                        size=size,
+                        size_usd=size * price,
+                        order_id='reconciled',
+                        stop_loss_price=price * 0.98,   # 2% default SL
+                        take_profit_price=price * 1.03,
+                    )
+                    logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
 
         # Remove positions bot thinks are open but exchange doesn't
         for sym in list(self.positions.keys()):
