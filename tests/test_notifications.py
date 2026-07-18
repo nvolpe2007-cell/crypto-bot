@@ -583,6 +583,73 @@ class TestSendMessage:
         assert result is False
 
 
+# ── TelegramNotifier._send_now: 429 rate-limit retry/backoff ──────────────────
+# Without this, a burst of alerts (e.g. several trades in quick succession)
+# hitting Telegram's per-chat rate limit would just be logged and dropped —
+# exactly when the bot is busiest and alerts matter most.
+
+class TestSendNowRateLimit:
+    @staticmethod
+    def _resp(status_code, headers=None, json_body=None):
+        r = MagicMock()
+        r.status_code = status_code
+        r.headers = headers or {}
+        r.json.return_value = json_body or {}
+        r.raise_for_status = MagicMock()
+        return r
+
+    def test_429_then_success_retries_and_delivers(self):
+        notifier = _enabled()
+        rate_limited = self._resp(429, headers={"Retry-After": "1"})
+        ok = self._resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]) as mock_post, \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is True
+        assert mock_post.call_count == 2
+        mock_sleep.assert_called_once_with(1.0)
+
+    def test_429_exhausts_retries_returns_false(self):
+        notifier = _enabled()
+        rate_limited = self._resp(429, headers={"Retry-After": "0.1"})
+        with patch("requests.post", return_value=rate_limited) as mock_post, \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is False
+        assert mock_post.call_count == notifier._MAX_RATE_LIMIT_RETRIES + 1
+        assert mock_sleep.call_count == notifier._MAX_RATE_LIMIT_RETRIES
+
+    def test_429_uses_json_retry_after_when_header_missing(self):
+        notifier = _enabled()
+        rate_limited = self._resp(429, headers={}, json_body={"parameters": {"retry_after": 3}})
+        ok = self._resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is True
+        mock_sleep.assert_called_once_with(3.0)
+
+    def test_429_falls_back_to_exponential_backoff_without_hint(self):
+        notifier = _enabled()
+        rate_limited = self._resp(429, headers={}, json_body={})
+        ok = self._resp(200)
+        with patch("requests.post", side_effect=[rate_limited, ok]), \
+                patch("src.notifications.time.sleep") as mock_sleep:
+            result = notifier.send_message("hello")
+        assert result is True
+        mock_sleep.assert_called_once_with(1.0)  # 2**0
+
+    def test_400_path_unaffected_by_429_handling(self):
+        notifier = _enabled()
+        bad = self._resp(400, json_body={"description": "bad entity"})
+        bad.text = "bad entity"
+        retried = self._resp(200)
+        with patch("requests.post", side_effect=[bad, retried]) as mock_post:
+            result = notifier.send_message("<b>broken")
+        assert result is True
+        assert mock_post.call_count == 2
+
+
 # ── TelegramNotifier.send_message (async_safe=True) ───────────────────────────
 # The live bot drives its whole trading loop from one asyncio event loop.
 # async_safe=True moves the HTTP call onto a background thread so a slow

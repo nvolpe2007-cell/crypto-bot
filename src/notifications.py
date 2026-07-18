@@ -8,6 +8,7 @@ import os
 import queue
 import requests
 import threading
+import time
 from typing import Optional
 from dataclasses import dataclass
 
@@ -200,32 +201,73 @@ class TelegramNotifier:
             except Exception:
                 logger.exception("Telegram background send crashed")
 
+    # Telegram's own per-chat/per-bot rate limit (HTTP 429) is otherwise
+    # indistinguishable from any other failure: raise_for_status() raises,
+    # we log and drop the message, and a burst of trade alerts goes dark
+    # exactly when the bot is busiest. Retry it instead, honoring whatever
+    # backoff Telegram asks for.
+    _MAX_RATE_LIMIT_RETRIES = 3
+
+    @staticmethod
+    def _retry_after_secs(response, attempt: int) -> float:
+        """Telegram's requested backoff (header or JSON body), else 1/2/4s."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is None:
+            try:
+                retry_after = response.json().get("parameters", {}).get("retry_after")
+            except Exception:
+                retry_after = None
+        if retry_after is not None:
+            try:
+                return max(float(retry_after), 0.0)
+            except (TypeError, ValueError):
+                pass
+        return float(2 ** attempt)
+
     def _send_now(self, message: str, parse_mode: str = "HTML") -> bool:
-        try:
-            response = requests.post(
-                f"{self.base_url}/sendMessage",
-                json={"chat_id": self.chat_id, "text": message, "parse_mode": parse_mode},
-                timeout=10,
-            )
-            # A 400 with parse_mode set is almost always an entity-parse error from
-            # an unescaped <, >, or & in dynamic text. Don't lose the alert — log
-            # Telegram's actual reason and resend as plain text.
-            if response.status_code == 400 and parse_mode:
-                try:
-                    desc = response.json().get("description", response.text[:200])
-                except Exception:
-                    desc = response.text[:200]
-                logger.warning(f"Telegram 400 (parse_mode={parse_mode}): {desc} — retrying as plain text")
-                response = requests.post(
-                    f"{self.base_url}/sendMessage",
-                    json={"chat_id": self.chat_id, "text": message},
-                    timeout=10,
+        payload = {"chat_id": self.chat_id, "text": message, "parse_mode": parse_mode}
+        for attempt in range(self._MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+            except Exception as e:
+                logger.error(f"Failed to send Telegram message: {e}")
+                return False
+
+            if response.status_code == 429:
+                if attempt == self._MAX_RATE_LIMIT_RETRIES:
+                    logger.error(
+                        f"Telegram rate-limited (429) after {attempt + 1} attempts — dropping message"
+                    )
+                    return False
+                wait = self._retry_after_secs(response, attempt)
+                logger.warning(
+                    f"Telegram rate-limited (429) — retrying in {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{self._MAX_RATE_LIMIT_RETRIES})"
                 )
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
-            return False
+                time.sleep(wait)
+                continue
+
+            try:
+                # A 400 with parse_mode set is almost always an entity-parse error from
+                # an unescaped <, >, or & in dynamic text. Don't lose the alert — log
+                # Telegram's actual reason and resend as plain text.
+                if response.status_code == 400 and parse_mode:
+                    try:
+                        desc = response.json().get("description", response.text[:200])
+                    except Exception:
+                        desc = response.text[:200]
+                    logger.warning(f"Telegram 400 (parse_mode={parse_mode}): {desc} — retrying as plain text")
+                    response = requests.post(
+                        f"{self.base_url}/sendMessage",
+                        json={"chat_id": self.chat_id, "text": message},
+                        timeout=10,
+                    )
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                logger.error(f"Failed to send Telegram message: {e}")
+                return False
+        return False
 
     # ── Pre-trade reasoning (probability gate output) ──────────────────────────
 
