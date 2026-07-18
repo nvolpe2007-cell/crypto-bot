@@ -1,8 +1,8 @@
 """
 Funding Rate Arbitrage — Paper Trading Simulator
 
-Reuses the FundingScanner (already running in src/bot.py) for live funding-rate
-data, then simulates cash-and-carry positions:
+Reuses the FundingScanner (already running in src/paper_trading.py) for live
+funding-rate data, then simulates cash-and-carry positions:
 
     Positive APY: LONG SPOT + SHORT PERP (collect funding from longs)
     Negative APY: SHORT SPOT + LONG PERP (collect funding from shorts)
