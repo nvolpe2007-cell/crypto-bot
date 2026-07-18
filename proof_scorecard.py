@@ -710,7 +710,13 @@ def _swing_attribution() -> None:
         _show('TD signal', lambda p: p.get('td_signal'))
 
 
-def main():
+def build_arms() -> tuple:
+    """Return (arms, k, t_family) for all forward arms that have data.
+
+    Single source of truth for the arm list — used by both main() and
+    weekly_report.py so new arms added here automatically appear in the
+    weekly health-check without a separate update.
+    """
     arms = [a for a in [
         _arm('Aggressive funding', 'funding_arb_state.json', executable=False, borrow_correct=True),
         _arm('Majors funding',     'funding_arb_majors_state.json', executable=False, borrow_correct=False),
@@ -736,9 +742,13 @@ def main():
         _rebalance_forward(),
         _directional(),
     ] if a]
-
     k = len(arms)
     t_family = _family_t_bar(k)
+    return arms, k, t_family
+
+
+def main():
+    arms, k, t_family = build_arms()
     # Deflated-Sharpe benchmark: expected max per-trade Sharpe across the arms we
     # actually tried (n>=2). A real edge's Sharpe must beat THIS, not zero.
     sr0 = _expected_max_sharpe([a['sharpe'] for a in arms if a['n'] >= 2])
