@@ -503,6 +503,35 @@ def _lev_perp_v2_forward() -> dict | None:
     return dict(label='Leveraged perp vol-tgt + ATR trail (FORWARD, paper)', executable=True, **s)
 
 
+def _lev_perp_ema_forward() -> dict | None:
+    """EMA(21/55)-cross variant of the leveraged perp arm (lev_perp_ema_paper.py):
+    SAME chandelier exit engine as v2 (identical _atr/_open/_close/_check_exit/
+    _ratchet, imported not reimplemented), same four entry filters, but the
+    directional-bias signal is sign(EMA21-EMA55) instead of sign(close-SMA50).
+    Pre-specified 2026-07-27 from backtest_directional_bias.py: tested 5
+    candidate signals x 2 exit styles (10 configs) over 5y of daily OKX bars;
+    EMA-cross+chandelier was the standout (+$3,250 vs SMA50's +$1,279, positive
+    every year 2021-2026 and on all 3 symbols) but at raw t=2.12 did NOT clear
+    the 10-trial family-wise bar (2.80) -- a backtest lead, not proof. This arm
+    exists to earn that proof on the forward clock, three-way against v1/v2."""
+    path = DATA / 'lev_perp_ema_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Leveraged perp EMA(21/55) cross + ATR trail (FORWARD, paper)', executable=True, **s)
+
+
 def _lev_perp_agg_variant(fname: str, label: str) -> dict | None:
     """Aggressive-config twins of the two lev_perp arms: SAME code, env-raised
     risk (LEV_PERP_VOL_TARGET=3.0, LEV_PERP_LEVERAGE=5 vs the 2.0/3x originals),
@@ -734,6 +763,7 @@ def build_arms() -> tuple:
         _microstructure_forward(),
         _lev_perp_forward(),
         _lev_perp_v2_forward(),
+        _lev_perp_ema_forward(),
         _lev_perp_agg_variant('lev_perp_agg_state.json',
                               'Leveraged perp 5x vol-tgt3 + take-profit (FORWARD, paper)'),
         _lev_perp_agg_variant('lev_perp_v2_agg_state.json',
