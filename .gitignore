@@ -21,3 +21,4 @@ Modelfile
 archive/
 _swing_1y.jsonl
 _mr_test.jsonl
+.coverage
