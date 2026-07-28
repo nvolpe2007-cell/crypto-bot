@@ -43,6 +43,23 @@ ENTRY FILTERS (pattern-tested 2026-06-30, all gate-able via env vars):
     "false trend" territory — negative EV (-$8.59/trade) vs positive outside it.
   Set any filter's env var to 0/off to disable it individually.
 
+RISK CONTROLS (added 2026-07-01 after a 410-day BTC hourly backtest of this arm's
+own config — fixed 3x lost -41% over a full cycle; the SOL flip-close of 2026-06-30
+ran a -14.4% move into a -44%-of-margin loss because nothing capped it):
+  * HARD STOP at LEV_PERP_SL_PRICE_FRAC adverse PRICE move (default 5%, symmetric
+    with the TP). Checked intrabar. Conservative ordering: liquidation > stop > TP
+    when one bar touches several levels.
+  * VOL-TARGETED LEVERAGE: effective leverage = min(LEV_PERP_LEVERAGE,
+    LEV_PERP_VOL_TARGET / realized 20d daily vol %). Default target 2.0%/day. The
+    backtest's only profitable configs averaged ~1.1-1.2x effective; the 3x env cap
+    stays as the ceiling, vol decides the actual number per entry.
+  * CORRELATION CAP: BTC/ETH/SOL same-direction positions are ~one bet. New entries'
+    margin is divided by (1 + open same-direction count).
+  * NEWS HALT: if LEV_PERP_NEWS_HALT_FILE (default data/news_halt.json) contains
+    {"until": <epoch>} in the future, NO new entries are opened (exits still run).
+    The news tracker (or the owner, by hand) writes that file on CRITICAL events.
+  Set LEV_PERP_SL_PRICE_FRAC=0 / LEV_PERP_VOL_TARGET=0 to disable those two.
+
 FORWARD-ONLY: first run per symbol seeds the current position at TODAY's price/ts and
 books no history. Acts only on newly-CLOSED daily bars (no repaint).
 
@@ -86,6 +103,12 @@ SKIP_ADX_DEAD_ZONE  = os.getenv("LEV_PERP_SKIP_ADX_DEAD_ZONE", "1") == "1"
 ADX_DEAD_LOW        = float(os.getenv("LEV_PERP_ADX_DEAD_LOW", "20"))
 ADX_DEAD_HIGH       = float(os.getenv("LEV_PERP_ADX_DEAD_HIGH", "30"))
 ADX_PERIOD          = int(os.getenv("LEV_PERP_ADX_PERIOD", "14"))
+
+# ── Risk-control parameters ───────────────────────────────────────────────────
+SL_PRICE_FRAC   = float(os.getenv("LEV_PERP_SL_PRICE_FRAC", "0.05"))   # hard stop; 0 disables
+VOL_TARGET      = float(os.getenv("LEV_PERP_VOL_TARGET", "2.0"))      # %/day; 0 disables sizing
+VOL_N           = int(os.getenv("LEV_PERP_VOL_N", "20"))              # realized-vol lookback (days)
+NEWS_HALT_FILE  = Path(os.getenv("LEV_PERP_NEWS_HALT_FILE", "data/news_halt.json"))
 
 INTERVAL_DAILY  = 1440
 HOURS_PER_YEAR  = 24.0 * 365.0
@@ -203,6 +226,40 @@ def _target_side(close: float, sma: float) -> int:
     return 1 if close >= sma else -1
 
 
+def _realized_vol(closes: list[float], n: int = 20) -> float | None:
+    """Realized daily vol in %, population stdev of the last n daily returns."""
+    if len(closes) < n + 1:
+        return None
+    rets = [(closes[i] / closes[i-1] - 1) * 100 for i in range(len(closes) - n, len(closes))]
+    mean = sum(rets) / n
+    return (sum((r - mean) ** 2 for r in rets) / n) ** 0.5
+
+
+def _effective_leverage(closes: list[float]) -> float:
+    """Vol-targeted leverage: min(cap, target daily vol / realized vol)."""
+    if VOL_TARGET <= 0:
+        return LEVERAGE
+    vol = _realized_vol(closes, VOL_N)
+    if not vol:
+        return LEVERAGE
+    return max(0.1, min(LEVERAGE, VOL_TARGET / vol))
+
+
+def _entry_margin(state: dict, side: int) -> float:
+    """Correlation cap: same-direction majors are ~one bet; split the margin."""
+    same = sum(1 for p in state["positions"].values() if p["side"] == side)
+    return round(MARGIN / (1 + same), 2)
+
+
+def _news_halted() -> bool:
+    """True while NEWS_HALT_FILE's {"until": epoch} is in the future."""
+    try:
+        until = float(json.loads(NEWS_HALT_FILE.read_text()).get("until", 0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return datetime.now(timezone.utc).timestamp() < until
+
+
 def _load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -220,13 +277,21 @@ def _save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
-def _open(state: dict, base: str, side: int, price: float, ts: str) -> None:
-    state["positions"][base] = {
+def _open(state: dict, base: str, side: int, price: float, ts: str,
+          closes: list[float] | None = None) -> None:
+    lev = _effective_leverage(closes or [])
+    margin = _entry_margin(state, side)
+    liq_frac = max(1e-6, (1.0 - MAINT) / lev)
+    pos = {
         "symbol": base, "side": side, "entry": price, "entry_ts": ts,
-        "margin_usd": MARGIN, "leverage": LEVERAGE, "notional_usd": round(MARGIN * LEVERAGE, 2),
+        "margin_usd": margin, "leverage": round(lev, 2),
+        "notional_usd": round(margin * lev, 2),
         "tp":  round(price * (1 + side * TP_PRICE_FRAC), 8),
-        "liq": round(price * (1 - side * LIQ_PRICE_FRAC), 8),
+        "liq": round(price * (1 - side * liq_frac), 8),
     }
+    if SL_PRICE_FRAC > 0:
+        pos["stop"] = round(price * (1 - side * SL_PRICE_FRAC), 8)
+    state["positions"][base] = pos
 
 
 def _funding_cost(notional: float, entry_ts: str, exit_ts: str) -> float:
@@ -259,16 +324,25 @@ def _close(state: dict, base: str, price: float, ts: str, reason: str) -> dict:
 
 
 def _check_exit(pos: dict, bar: dict) -> tuple[float, str] | None:
+    """Conservative intrabar ordering: liquidation > stop > take-profit.
+    Positions opened before the stop existed get one synthesized from entry."""
     side = pos["side"]
     tp, liq = pos["tp"], pos["liq"]
+    stop = pos.get("stop")
+    if stop is None and SL_PRICE_FRAC > 0:
+        stop = round(pos["entry"] * (1 - side * SL_PRICE_FRAC), 8)
     if side > 0:
         if bar["l"] <= liq:
             return liq, "liquidation"
+        if stop is not None and bar["l"] <= stop:
+            return stop, "stop_loss"
         if bar["h"] >= tp:
             return tp, "take_profit"
     else:
         if bar["h"] >= liq:
             return liq, "liquidation"
+        if stop is not None and bar["h"] >= stop:
+            return stop, "stop_loss"
         if bar["l"] <= tp:
             return tp, "take_profit"
     return None
@@ -287,11 +361,14 @@ def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None
         state["last_bar_t"][base] = latest["t"]
         # Apply entry filters even at seed time
         skip_reasons: list = []
-        if _entry_filter(bars, closes, skip_reasons):
+        if _news_halted():
+            print(f"{base}: SEED SKIPPED — news halt active")
+        elif _entry_filter(bars, closes, skip_reasons):
             side = _target_side(latest["c"], sma)
-            _open(state, base, side, latest["c"], str(latest["t"]))
-            print(f"{base}: SEED {'LONG' if side > 0 else 'SHORT'} {LEVERAGE:g}x @ {latest['c']:.2f} "
-                  f"(tp {state['positions'][base]['tp']:.2f} liq {state['positions'][base]['liq']:.2f})")
+            _open(state, base, side, latest["c"], str(latest["t"]), closes)
+            p = state["positions"][base]
+            print(f"{base}: SEED {'LONG' if side > 0 else 'SHORT'} {p['leverage']:g}x @ {latest['c']:.2f} "
+                  f"(tp {p['tp']:.2f} stop {p.get('stop', 0):.2f} liq {p['liq']:.2f})")
         else:
             print(f"{base}: SEED SKIPPED — filters: {', '.join(skip_reasons)}")
         return 0
@@ -311,7 +388,7 @@ def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None
             if ex:
                 price, reason = ex
                 rec = _close(state, base, price, str(bar["t"]), reason)
-                tag = "TP✅" if reason == "take_profit" else "LIQ❌"
+                tag = {"take_profit": "TP✅", "stop_loss": "STOP🛑"}.get(reason, "LIQ❌")
                 print(f"{base}: {tag} {'LONG' if pos['side'] > 0 else 'SHORT'} @ {price:.2f} "
                       f"net=${rec['pnl']:+.2f} ({rec['pnl_pct_margin']:+.1f}% margin)")
                 _notify_trade_close(rec, state, prices or {})
@@ -332,9 +409,13 @@ def process_symbol(base: str, bars: list[dict], state: dict, prices: dict | None
             skip_reasons: list = []
             bars_to_idx = bars[: idx + 1]
             closes_to_idx = closes[: idx + 1]
-            if _entry_filter(bars_to_idx, closes_to_idx, skip_reasons):
-                _open(state, base, want, bar["c"], str(bar["t"]))
-                print(f"{base}: OPEN {'LONG' if want > 0 else 'SHORT'} {LEVERAGE:g}x @ {bar['c']:.2f}")
+            if _news_halted():
+                print(f"{base}: SKIP entry — news halt active")
+            elif _entry_filter(bars_to_idx, closes_to_idx, skip_reasons):
+                _open(state, base, want, bar["c"], str(bar["t"]), closes_to_idx)
+                p = state["positions"][base]
+                print(f"{base}: OPEN {'LONG' if want > 0 else 'SHORT'} {p['leverage']:g}x "
+                      f"@ {bar['c']:.2f} (margin ${p['margin_usd']:.0f})")
                 acted += 1
             else:
                 print(f"{base}: SKIP entry — {', '.join(skip_reasons)}")
@@ -381,6 +462,8 @@ def _notify_trade_close(rec: dict, state: dict, prices: dict[str, float]) -> Non
         trade_icon = "✅ TAKE PROFIT"
     elif reason == "liquidation":
         trade_icon = "💀 LIQUIDATED"
+    elif reason == "stop_loss":
+        trade_icon = "🛑 STOP LOSS"
     else:
         trade_icon = "🔄 TREND FLIP"
 

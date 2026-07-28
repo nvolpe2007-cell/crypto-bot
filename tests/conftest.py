@@ -213,3 +213,4 @@ import src.order_flow as _  # noqa: F401, E402
 import src.multi_timeframe as _  # noqa: F401, E402
 import src.portfolio_optimizer as _  # noqa: F401, E402
 import src.market_sentiment as _  # noqa: F401, E402
+import src.ml_scorer as _  # noqa: F401, E402
