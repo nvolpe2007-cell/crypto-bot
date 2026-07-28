@@ -279,3 +279,114 @@ hypotheses:
     notes: |
       Not a strategy per se — an enabling layer. Now correct; future
       strategies can condition on regime honestly.
+
+  - id: lev-perp-regime-entry-search
+    name: lev_perp regime/entry/universe search — 17-candidate sweep
+    family: directional
+    hypothesis: >
+      Refining lev_perp's regime gating, entry signal, exit mechanics or sizing
+      (Hurst/R-S regime gate, lag-1 autocorrelation gate, GARCH(1,1) vol-forecast
+      sizing, continuous-time Kelly leverage, chop-timeout exit, TSMOM-14,
+      MA10/40 cross, Donchian-20, 2-of-3 confluence) produces a config that
+      clears the repo's pre-registered proof bar.
+    code: >
+      scripts/lev_perp_regime_research.py, scripts/lev_perp_entry_signal_research.py,
+      scripts/lev_perp_universe_research.py, scripts/lev_perp_universe16_research.py,
+      scripts/lev_perp_cumulative_verdict.py
+    evidence:
+      - date: 2026-07-26
+        script: scripts/lev_perp_cumulative_verdict.py
+        method: >
+          Four rounds, 17 total candidates. Every candidate reused the PRODUCTION
+          cost/margin/funding/liquidation model imported directly from
+          lev_perp_paper.py / lev_perp_v2_paper.py (not reimplemented). Data:
+          Coinbase daily OHLCV via ccxt (keyless), 2021-06 onward. Judged by an
+          independent reviewer against proof_scorecard.py's bar (n>=30,
+          expectancy>0, Sidak family-corrected t, DSR > 0.95).
+        window: 2021-06 onward, daily
+        result: >
+          NULL RESULT. Round 1 (Kelly/GARCH/Hurst/autocorrelation/chop-timeout on
+          the existing SMA-50 entry) did nothing — Kelly-leverage variants inflated
+          total P&L via VARIANCE not edge (max drawdown 87-95% of book, worst
+          Sharpe/DSR of the round); the autocorrelation gate actively lost money.
+          Reconfirms RESEARCH_2026-07-01's volatility-drag finding on a wider set
+          of mechanics. Rounds 2-4 (entry-signal replacement, universe expansion)
+          moved the needle, but pooling all 17 attempts when computing
+          _expected_max_sharpe gives a CUMULATIVE DSR of 0.43-0.50 vs the required
+          >0.95 — the apparent winner is the luckiest draw among 17.
+    deployment_gate:
+      requires: DSR > 0.95 and n >= 30 and expectancy > 0 at the Sidak-corrected
+        t-bar, computed on the POOLED candidate count
+      blocked_by: cumulative DSR 0.43-0.50
+    status: sit-out
+    notes: |
+      Methodological finding worth more than the result: judging each round against
+      only that round's candidate count under-counts _expected_max_sharpe (sr0) and
+      inflates DSR. Any multi-round search MUST pool its total candidate count when
+      computing _expected_max_sharpe/DSR for a final verdict, not just the
+      candidates in the round that produced the winner.
+      Source doc: RESEARCH_2026-07-26_lev_perp_regime_and_entry_search.md (PR #85).
+
+  - id: lev-perp-universe-8coin
+    name: lev_perp v1 universe widening — 3 to 8 liquid coins
+    family: directional
+    hypothesis: >
+      lev_perp v1's trade frequency is limited by universe breadth, not by its
+      entry filters. Widening the traded universe from 3 (BTC/ETH/SOL) to the
+      already-vetted 8 liquid majors (+ADA, XRP, DOT, AVAX, LINK), with the
+      SMA-50 signal and all quality gates unchanged, raises trade count without
+      costing win rate.
+    code: scripts/lev_perp_v1_universe_research.py
+    evidence:
+      - date: 2026-07-26
+        script: scripts/lev_perp_v1_universe_research.py
+        method: >
+          lev_perp_paper.py reused COMPLETELY UNMODIFIED (process_symbol,
+          _check_exit, _entry_filter, _open, _close) — same SMA-50 direction
+          signal, same RSI/trend-age/volume/ADX quality filters, same fixed TP/SL,
+          same vol-targeted sizing. Only the traded universe changed. Judged as
+          k=1 (one new candidate vs production, no sweep).
+        window: 5-year replay, daily
+        result: >
+          3-coin production baseline: 324 trades, 50.6% win, +$0.058 expectancy,
+          t_clustered 0.10, DSR 0.538 — reproduces RESEARCH_2026-07-02 almost
+          exactly (324 vs 323 trades, 50.6% vs 51% WR), confirming the harness
+          replicates production rather than reimplementing it.
+          8-coin widened: 856 trades, 52.8% win, +$0.161 expectancy,
+          t_clustered 1.21, DSR 0.887. 2.6x trade count, win rate HELD, expectancy
+          nearly TRIPLED. Broad-based, not one lucky coin: 5 of 8 symbols net
+          positive (DOT +$83, ETH +$48, AVAX +$47, ADA +$19, LINK +$15), 3 negative
+          (XRP -$33, BTC -$30, SOL -$11), win rates 46-60% across all eight,
+          though DOT alone is ~60% of net.
+          STILL DOES NOT CLEAR THE BAR: t_clustered 1.21 vs 2.00 required,
+          DSR 0.887 vs 0.95 required.
+      - date: 2026-07-26
+        script: data/lev_perp_state.json (VPS live record)
+        window: 11 closed trades since started_at 2026-06-15
+        result: >
+          The live +$124 / 73% win / n=11 result is NOT edge. All 11 trades were
+          SHORT, entries 2026-06-14 -> 06-25, inside ONE clean monotonic BTC/ETH/SOL
+          downtrend: 8 straight take_profit hits (each capped at exactly +5%), then
+          the trend reversed into 3 losses. The first loss (SOL, reason: flip,
+          -14.44% price -> -44.25% of margin) is the exact incident documented in
+          lev_perp_paper.py's own docstring that motivated the hard stop-loss added
+          2026-07-01; the two losses after it were both stop_loss at exactly -5.0%,
+          i.e. the fix working. Zero new entries since 2026-07-04.
+          73% WR at n=11 is uninformative about the long-run rate (~51-53%).
+    deployment_gate:
+      requires: DSR > 0.95 and t_clustered >= 2.00 on this config specifically
+      blocked_by: DSR 0.887, t_clustered 1.21 — closest anything in this repo has
+        come to the bar, but not over it
+    status: paper-only
+    notes: |
+      DO NOT RE-PROPOSE without new evidence:
+        - Treating the live 73% / n=11 window as informative about v1's real edge.
+          The 5-year number is ~51% WR, breakeven-to-modestly-positive.
+        - Loosening the RSI / trend-age / volume / ADX entry filters to generate
+          more trades. They are validated quality gates, not overhead. Universe
+          breadth is the win-rate-safe frequency lever — more independent symbols
+          under the SAME gates.
+      Standing follow-on (untested): combine this universe widening WITH PR #85's
+      MA10/40-cross entry, which already beat raw SMA-50 on Sharpe in the 3-coin
+      round. That specific combination is the most promising untried candidate.
+      Source doc: RESEARCH_2026-07-26_lev_perp_v1_frequency.md (PR #87).
