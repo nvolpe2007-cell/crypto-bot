@@ -23,6 +23,12 @@ import os
 import sqlite3
 from typing import Any
 
+# Arms whose equity is a derivative OVERLAY on other arms' capital, not capital
+# of its own — e.g. the allocator is a fund-of-funds that weights INTO the same
+# arms already counted individually. Included in `arms` for visibility into its
+# own track record, but excluded from `totals` to avoid double-counting capital.
+_META_ARMS = {"allocator"}
+
 # Map raw state-file stems → friendly display names. Anything not listed falls
 # back to the stem itself, so new arms show up automatically.
 _DISPLAY_NAMES = {
@@ -134,6 +140,7 @@ def collect_arms(data_dir: str | None = None) -> list[dict[str, Any]]:
                 "status": status,
                 "t_stat": t,
                 "started_at": d.get("started_at"),
+                "meta": stem in _META_ARMS,
             }
         )
     rows.sort(key=lambda r: r["pnl"], reverse=True)
@@ -204,8 +211,12 @@ def snapshot(data_dir: str | None = None) -> dict[str, Any]:
     """Full dashboard payload: arms + attribution + tournament + readiness + totals."""
     arms = collect_arms(data_dir)
     attrib = collect_attribution(data_dir)
-    total_equity = round(sum(a["equity"] for a in arms), 2)
-    total_start = round(sum(a["start"] for a in arms), 2)
+    # Exclude meta/overlay arms (e.g. the allocator) from the aggregate totals —
+    # their equity already derives from other arms' equity counted below, so
+    # summing both would double-count the same underlying capital.
+    capital_arms = [a for a in arms if not a["meta"]]
+    total_equity = round(sum(a["equity"] for a in capital_arms), 2)
+    total_start = round(sum(a["start"] for a in capital_arms), 2)
     return {
         "arms": arms,
         "attribution": attrib,
@@ -216,7 +227,7 @@ def snapshot(data_dir: str | None = None) -> dict[str, Any]:
             "start": total_start,
             "pnl": round(total_equity - total_start, 2),
             "pnl_pct": round((total_equity - total_start) / total_start * 100, 2) if total_start else 0.0,
-            "n_arms": len(arms),
-            "active": sum(1 for a in arms if a["open"] > 0),
+            "n_arms": len(capital_arms),
+            "active": sum(1 for a in capital_arms if a["open"] > 0),
         },
     }
