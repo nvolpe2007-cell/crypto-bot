@@ -942,6 +942,35 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         asyncio.create_task(supervised('lev_perp', _lev_perp_loop, notifier=notifier))
         logger.info("[LEV-PERP] leveraged perp (3x + take-profit) daily forward arm started (in-process, paper)")
 
+    # ── Rebalanced-allocation forward arm (the one positive result of the search) ───
+    # ~320 strategies across 9 dimensions cleared ZERO survivors of the MC + multiple-
+    # testing + OOS gauntlet (memory exhaustive_search_320_zero); the only positive,
+    # robust-OOS lever was STRUCTURAL: a diversified 50% crypto / 25% gold / 25% cash
+    # book rebalanced monthly (memory rebalance_premium_verdict) — prediction-free and
+    # fully SPOT-EXECUTABLE on Kraken today (long-only, no leverage/short). NOT alpha
+    # (can't profit in a full bear, only lose far less); this forward-proves the harvest
+    # on its own $1k paper book, judged by proof_scorecard (_rebalance_forward). Runs the
+    # pre-registered rebalance_paper.py; disable with REBALANCE_ARM_ENABLED=0.
+    if os.getenv('REBALANCE_ARM_ENABLED', '1') == '1':
+        async def _rebalance_loop():
+            import subprocess, sys as _sys
+            interval = float(os.getenv('REBALANCE_INTERVAL_SEC', '21600'))  # 6h, idempotent
+            env = {**os.environ, 'REBALANCE_STATE_FILE': 'data/rebalance_paper_state.json',
+                   'REBALANCE_START_EQUITY': '1000'}
+            _loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    await _loop.run_in_executor(None, lambda: subprocess.run(
+                        [_sys.executable, 'rebalance_paper.py'], env=env, timeout=120,
+                        capture_output=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning(f"[REBALANCE] step failed: {_e}")
+                await asyncio.sleep(interval)
+        asyncio.create_task(supervised('rebalance_arm', _rebalance_loop, notifier=notifier))
+        logger.info("[REBALANCE] crypto+gold+cash monthly-rebalance forward arm started (in-process, spot)")
+
     # ── AI brain discretionary arm (Claude decides long/short/flat on its own book) ─
     # The mechanical arms follow a fixed rule; this one asks Claude each day to decide
     # per coin from the full market picture, on its own $1k paper perp account, judged
