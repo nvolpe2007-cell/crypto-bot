@@ -11,6 +11,9 @@ append an entry when you begin meaningful work and when you finish.
 3. **Stay in your lane** (see map below). Touching another lane's files → coordinate here first.
 4. After pushing, **verify `python -m pytest tests/ -q` still collects** (2 known pre-existing
    fails: `test_exchange` batching, `test_notifications` env-default — not yours).
+5. **Log your work as a NEW FILE in [`worklog/`](worklog/README.md)** — never append to the
+   archive table at the bottom of this file. One file per entry is what stops concurrent PRs
+   conflicting; see `worklog/README.md` for the format and the reason.
 
 ## Lane map
 | Lane | Owner | Primary files |
@@ -42,7 +45,26 @@ append an entry when you begin meaningful work and when you finish.
   conditional `_aggr_seg`). All tests: 2481 pass / 2 known pre-existing fails. VPS deployed, service
   healthy, aggressive arm correctly absent from heartbeat.
 
-## Log
+## Log — current
+
+**Entries now live in [`worklog/`](worklog/README.md), one file per entry.**
+
+```bash
+python scripts/worklog_index.py            # chronological, newest first
+python scripts/worklog_index.py --full     # with bodies
+```
+
+Add work by creating `worklog/YYYY-MM-DD-<agent>-<slug>.md`. Do **not** append to the
+archive below.
+
+Why: this file's single append-only table meant any two concurrent PRs conflicted on it
+by construction. On 2026-07-28, 21 of 25 open PRs were `CONFLICTING` with this file the
+common factor, and merging three PRs took two hand-resolved conflicts in it.
+
+## Log — archive (frozen 2026-07-28)
+
+Historical entries, preserved verbatim. **Read-only — do not add rows.**
+
 | Date (UTC) | Agent | Branch/PR | What |
 |---|---|---|---|
 | 2026-06-15 22:00–22:55 | Claude (computer) | merged to master | Brain MTM + drawdown stop; triarb phantom killed + ledger purged; brain in heartbeat; portfolio overseer; desk-context enrichment (commits 31b6e96→f1a3cc6). |

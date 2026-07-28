@@ -13,6 +13,12 @@ any agent's private memory. Rules:
 4. After pushing, confirm `python -m pytest tests/ -q` still collects (2 known pre-existing
    fails). Distrust "dead code" verdicts on files with fresh tests — they may be another agent's
    in-flight work. See memory `multi_agent_master_races`.
+5. **Log your work as a NEW FILE in [`worklog/`](worklog/README.md)** —
+   `worklog/YYYY-MM-DD-<agent>-<slug>.md`. Never append to `WORKLOG.md`'s archive table.
+   That table was a single append-only file, so any two concurrent PRs conflicted on it by
+   construction (2026-07-28: 21 of 25 open PRs `CONFLICTING`, this file the common factor).
+   One file per entry means two agents never collide. Read with
+   `python scripts/worklog_index.py`.
 
 ## Project Location
 `D:\crypto-bot\` (authoritative). Deployed to a Hetzner VPS at `178.105.41.226`.
