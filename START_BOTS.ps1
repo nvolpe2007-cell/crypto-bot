@@ -6,6 +6,10 @@ Write-Host ""
 
 Set-Location $PSScriptRoot
 
+# Keep this machine on the same page as origin/master before launching.
+# Git-only: never touches the bot, strategy, or data/. See deploy/sync_check.ps1.
+& "$PSScriptRoot/deploy/sync_check.ps1"
+
 # Install dependencies if needed
 if (-not (Test-Path ".venv") -and -not (Get-Command python -ErrorAction SilentlyContinue | Out-Null)) {
     Write-Host "  Installing Python dependencies..." -ForegroundColor Yellow

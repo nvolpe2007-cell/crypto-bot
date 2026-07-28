@@ -29,7 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.dashboard_data import _DISPLAY_NAMES, _closed_pnls, _data_dir, _load_json
 
 SEEN_FILE = "notify_seen.json"
-_SKIP_STEMS = {"allocator"}
+# Owner request (2026-07-01): only lev_perp and pairs_paper trade closes get a
+# Telegram alert — every other arm is allowed to run (or not) without pinging.
+# Allow-list rather than a skip-list so a newly added arm's state file doesn't
+# silently start alerting again.
+_ALLOWED_STEMS = {"lev_perp", "pairs_paper"}
 
 
 def _load_seen(dd: str) -> dict:
@@ -74,7 +78,7 @@ def main() -> int:
 
     for path in sorted(glob.glob(os.path.join(dd, "*_state.json"))):
         stem = os.path.basename(path)[: -len("_state.json")]
-        if stem in _SKIP_STEMS:
+        if stem not in _ALLOWED_STEMS:
             continue
         d = _load_json(path)
         if d is None or "starting_equity" not in d:

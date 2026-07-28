@@ -66,6 +66,19 @@ per symbol per day** on a breakout — a market entry with a **server-side brack
 and posts the day's P&L to Telegram. **Fail-safe:** no keys / no `alpaca-py` → it
 no-ops (no orders). **Verify everything in your Alpaca paper dashboard.**
 
+## Choose params HONESTLY: walk-forward + robustness
+Don't sweep `--or-minutes`/`--target-r` until a backtest looks good — that's how you
+fool yourself. Instead:
+```bash
+python -m stockbot.run_walkforward --synthetic
+python -m stockbot.run_walkforward --csv SPY_5m.csv --symbol SPY --train-days 40 --test-days 10
+```
+It **selects** the best params on each TRAIN window and trades them **untouched** on
+the next unseen TEST window; the pooled **out-of-sample** record is the honest verdict.
+It also reports **robustness** (is the edge a broad plateau or one lucky cell?) and a
+**deflated Sharpe** that corrects the best cell for how many param sets you tried.
+Trust the OOS block, not the best in-sample cell.
+
 ## The honesty bar (read before trusting anything)
 - A passing backtest is **IN-SAMPLE**. It is necessary, not sufficient. Before real
   money: **walk-forward / out-of-sample**, and a correction for **how many parameter
