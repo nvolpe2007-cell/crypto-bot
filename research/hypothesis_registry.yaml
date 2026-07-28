@@ -390,3 +390,115 @@ hypotheses:
       MA10/40-cross entry, which already beat raw SMA-50 on Sharpe in the 3-coin
       round. That specific combination is the most promising untried candidate.
       Source doc: RESEARCH_2026-07-26_lev_perp_v1_frequency.md (PR #87).
+
+  - id: kraken-dated-futures-basis
+    name: Kraken dated/calendar futures basis (term-structure carry)
+    family: funding-arb
+    hypothesis: >
+      Kraken's dated/calendar futures (FI_* contracts) trade at a basis to spot
+      that can be harvested as term-structure carry — STRATEGY_REVIEW.md's
+      Week-3 item "the real path to break the maker wall".
+    code: none — ruled out before any implementation
+    evidence:
+      - date: 2026-07-26
+        script: live check of futures.kraken.com/derivatives/api/v3/tickers
+        window: live snapshot
+        result: >
+          DEAD MARKET. Every FI_* contract shows zero bid, zero ask, zero 24h
+          volume, zero open interest, and mark price pegged exactly to index —
+          a listed-but-untraded product. There is no basis to harvest. This is
+          a liquidity/product-availability dead end, not a math problem,
+          consistent with this repo's recurring "the gap is the data feed or the
+          venue, not the model" pattern.
+    deployment_gate:
+      requires: a Kraken dated-futures market that actually trades (non-zero OI,
+        volume and two-sided quotes)
+      blocked_by: product is listed but untraded; nothing to measure
+    status: sit-out
+    notes: |
+      DO NOT RE-PROPOSE without new evidence: Kraken calendar/dated-futures basis
+      trading. The market is untraded (zero OI/volume/bid-ask), not a
+      signal-quality problem. Re-check the tickers endpoint before ever
+      reopening this — the verdict flips only if the product starts trading.
+      Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
+
+  - id: funding-decay-ou-timing
+    name: Funding decay/half-life entry timing (AR(1)/OU projection)
+    family: funding-arb
+    hypothesis: >
+      STRATEGY_REVIEW.md Week-3: "Time entries on decay/half-life — enter only
+      when funding z-score is high and persistence >= 3 cycles and predicted hold
+      clears the wall." Replacing the funding-arb arm's simple
+      consecutive-positive-hours entry gate with a causal AR(1) fit projecting
+      cumulative expected funding over ~3 half-lives should surface persistent
+      opportunities the simpler gate structurally cannot see.
+    code: scripts/funding_decay_research.py
+    evidence:
+      - date: 2026-07-26
+        script: scripts/funding_decay_research.py
+        method: >
+          Real Kraken Futures hourly funding history (public keyless
+          historicalfundingrates), ~377 days 2025-07-13 -> 2026-07-26, 29 liquid
+          majors overlapping arbitrage.funding_arb_paper.MAJOR_SYMBOLS. Cash-and-
+          carry is delta-neutral by construction so no price data is needed.
+          Both variants share the production cost/exit model (0.54% round-trip,
+          7d max hold, exit on funding flip or APY decay to 40% of entry
+          confirmed over 2h, 48h cooldown after a losing close, max 6 sign-flips
+          per trailing 30d) and differ ONLY in the entry-persistence signal.
+          k=1 (one new candidate vs production), so _family_t_bar(1) = T_MIN =
+          2.0 with no Sidak widening, and sr0=0 for the DSR.
+        window: 377 days, 29 majors, ~254,000 symbol-hours
+        result: >
+          REJECTED. Baseline (production logic) 0 trades — reproduces the known
+          "zero qualifying setups" finding of funding-arb-kraken exactly,
+          confirming faithful replication. OU-timed 1 trade, net -$0.38, 0% win
+          (XRP, held 51h, exited apy_decayed). Across 29 coins and ~254k
+          symbol-hours, decay-aware timing surfaces exactly one opportunity the
+          baseline cannot see, and it lost money.
+      - date: 2026-07-26
+        script: scripts/funding_decay_research.py (diagnostic, not a proposal)
+        method: >
+          Re-ran OU-timed with the 6-sign-flips/30d gate DISABLED, to test
+          whether that gate was hiding real edge rather than protecting the book.
+        result: >
+          n=102, net -$45.16, 1% win rate, expectancy -$0.44/trade, t=-41.24.
+          Unambiguous: the flip gate is correctly protective, not miscalibrated —
+          removing it reveals a worse book, not a hidden one. Kraken settles
+          funding hourly and hourly rates flip sign constantly (median 36-96 sign
+          flips per 30d window on the coins that would otherwise clear the
+          OU-projected-capture bar: TIA 622 candidate hours / median 68 flips,
+          INJ 340 / median 58, HBAR and LINK similar). The flip cap — tuned for
+          8-hourly Binance/Bybit cadence — is the actual binding constraint
+          keeping both variants near zero, not the entry-timing math.
+    deployment_gate:
+      requires: an entry-timing method showing positive expectancy over n >= 30
+        on this arm at the honest 0.54% Kraken round-trip cost
+      blocked_by: hypothesis rejected outright — both n=1 and the n=102
+        diagnostic are negative
+    status: sit-out
+    notes: |
+      Nothing cleared the bar; the hypothesis is REJECTED, not merely
+      "insufficient data". The 0.54% round-trip cost against Kraken's genuinely
+      noisy hourly funding leaves essentially no capturable persistence at any
+      entry-timing sophistication tested. Together with kraken-dated-futures-basis
+      this closes BOTH remaining unaddressed items from STRATEGY_REVIEW.md's
+      Week-3 roadmap, with the same conclusion the rest of this repo's research
+      keeps reaching: the arm is correctly idle, not under-engineered.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - AR(1)/OU decay timing in this form as a way to unlock more Kraken
+          funding-arb trades — tested, rejected.
+        - Loosening or removing the 6-flips/30d persistence gate to "let more
+          trades through" — the diagnostic shows exactly what is on the other
+          side of that gate, and it is worse.
+
+      STANDING METHODOLOGICAL LESSON: fitting a decay/half-life model on raw
+      high-frequency data captures whatever noise process dominates that
+      frequency, not the slower process the strategy cares about. AR(1) on the
+      raw hourly rate gave half-lives of ~1.5-2h (hour-to-hour noise); fitting on
+      a causal 24h rolling mean gave tens to hundreds of hours (the real funding
+      persistence). Check what timescale a model's half-life implies before
+      trusting projections built on it. The rolling-mean smooth was a one-time
+      methodological fix made before the full run — sweeping the smoothing window
+      to chase a better number would NOT have been legitimate.
+      Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
