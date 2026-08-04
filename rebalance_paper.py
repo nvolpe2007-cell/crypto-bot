@@ -15,7 +15,18 @@ like every other arm.
 
 SPEC (all env-tunable):
   * Universe: 10 liquid crypto majors + PAXG gold. Book: own $1,000 paper account.
-  * Target: 50% crypto (equal-weight across the 10) / 25% gold / 25% cash.
+  * Target: 50% crypto / 25% gold / 25% cash. Crypto sleeve weighting:
+    REBALANCE_WEIGHT_SCHEME=inverse_vol (default) sizes each coin inversely to its
+    trailing REBALANCE_VOL_LOOKBACK-day (default 60) realized volatility -- a coin
+    twice as volatile as another gets half the weight, so no single high-vol name
+    dominates the sleeve's risk. Backtested 2026-08-04 (research/lev-perp-directional-
+    bias session): on the same 10-coin basket, inverse-vol beat equal-weight over 5
+    years (-17.7% vs -20.2% total, ~same Sharpe, slightly shallower drawdown) --
+    real but modest; it makes a loser slightly less bad, not a winner, which is
+    exactly why the 25% gold / 25% cash structure carries the actual defensiveness.
+    Falls back to equal-weight per-symbol when vol history is missing/degenerate
+    (fail-safe, e.g. during warm-up or a fetch gap). REBALANCE_WEIGHT_SCHEME=equal
+    restores the original equal-weight sleeve.
   * Rebalance every REBALANCE_DAYS (default 30) back to target; drift in between.
   * Cost: 0.26% Kraken spot taker on the TURNOVER at each rebalance.
   * Each rebalance BOOKS the elapsed holding period as one closed record (pnl in $),
@@ -46,17 +57,65 @@ TAKER = float(os.getenv("REBALANCE_TAKER", "0.0026"))
 REBALANCE_DAYS = float(os.getenv("REBALANCE_DAYS", "30"))
 START_EQUITY = float(os.getenv("REBALANCE_START_EQUITY", "1000"))
 STATE_FILE = Path(os.getenv("REBALANCE_STATE_FILE", "data/rebalance_paper_state.json"))
+WEIGHT_SCHEME = os.getenv("REBALANCE_WEIGHT_SCHEME", "inverse_vol").strip().lower()
+VOL_LOOKBACK = int(os.getenv("REBALANCE_VOL_LOOKBACK", "60"))
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def target_weights() -> dict[str, float]:
-    w = {s: CRYPTO_FRAC / len(SYMBOLS) for s in SYMBOLS}
+def _inverse_vol_crypto_weights(vol: dict[str, float]) -> dict[str, float]:
+    """Weight each symbol inversely to its trailing realized vol (risk parity).
+    Each symbol with missing/degenerate (<=0 or NaN) vol gets an equal-weight
+    SHARE of the sleeve (CRYPTO_FRAC / len(SYMBOLS)) -- the same fallback it
+    would get under the plain equal-weight scheme -- and the usable symbols
+    split whatever crypto fraction remains, by inverse-vol proportion. Falls
+    back to full equal-weight if EVERY symbol lacks usable vol."""
+    usable = {s: v for s, v in vol.items() if s in SYMBOLS and v and v > 0}
+    if not usable:
+        return {s: CRYPTO_FRAC / len(SYMBOLS) for s in SYMBOLS}
+    missing = [s for s in SYMBOLS if s not in usable]
+    per_symbol_share = CRYPTO_FRAC / len(SYMBOLS)
+    w = {s: per_symbol_share for s in missing}
+    usable_frac = CRYPTO_FRAC - per_symbol_share * len(missing)
+    inv = {s: 1.0 / usable[s] for s in usable}
+    total_inv = sum(inv.values())
+    for s in usable:
+        w[s] = usable_frac * (inv[s] / total_inv)
+    return w
+
+
+def target_weights(vol: dict[str, float] | None = None) -> dict[str, float]:
+    if WEIGHT_SCHEME == "inverse_vol" and vol:
+        w = _inverse_vol_crypto_weights(vol)
+    else:
+        w = {s: CRYPTO_FRAC / len(SYMBOLS) for s in SYMBOLS}
     if GOLD_FRAC > 0:
         w[GOLD] = GOLD_FRAC
     return w
+
+
+def fetch_crypto_vol(lookback: int = VOL_LOOKBACK) -> dict[str, float]:
+    """Trailing daily-return std-dev per symbol over `lookback` days. Returns
+    an empty/partial dict on fetch failure -- callers must fail-safe to
+    equal-weight (see _inverse_vol_crypto_weights)."""
+    import ccxt
+    ex = ccxt.kraken({"enableRateLimit": True})
+    out: dict[str, float] = {}
+    for s in SYMBOLS:
+        try:
+            o = ex.fetch_ohlcv(f"{s}/USD", timeframe="1d", limit=lookback + 5)
+            closes = [row[4] for row in o]
+            if len(closes) < lookback // 2:  # need at least half the window
+                continue
+            rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
+            mean = sum(rets) / len(rets)
+            var = sum((r - mean) ** 2 for r in rets) / len(rets)
+            out[s] = var ** 0.5
+        except Exception as e:
+            print(f"{s}: vol fetch failed - {e}")
+    return out
 
 
 def fetch_prices() -> dict[str, dict]:
@@ -80,17 +139,17 @@ def _equity(units: dict, cash: float, px: dict) -> float:
     return cash + sum(u * px[s]["px"] for s, u in units.items() if s in px)
 
 
-def _seed(px: dict) -> dict:
-    w = target_weights()
+def _seed(px: dict, vol: dict | None = None) -> dict:
+    w = target_weights(vol)
     units = {s: (START_EQUITY * wt) / px[s]["px"] for s, wt in w.items() if s in px}
     cash = START_EQUITY * CASH_FRAC
     return {"units": units, "cash": cash}
 
 
-def _rebalance(units: dict, cash: float, px: dict) -> tuple[dict, float, float]:
+def _rebalance(units: dict, cash: float, px: dict, vol: dict | None = None) -> tuple[dict, float, float]:
     """Return-to-target; charge taker on turnover; re-target on post-cost equity."""
     eq = _equity(units, cash, px)
-    w = target_weights()
+    w = target_weights(vol)
     tgt_val = {s: eq * wt for s, wt in w.items()}
     turnover = sum(abs(tgt_val[s] - units.get(s, 0.0) * px[s]["px"]) for s in w if s in px)
     turnover += abs(eq * CASH_FRAC - cash)
@@ -126,7 +185,8 @@ def main():
 
     # first run: seed both strategy book and the buy&hold benchmark; book nothing.
     if not state.get("units"):
-        seed = _seed(px)
+        vol = fetch_crypto_vol() if WEIGHT_SCHEME == "inverse_vol" else {}
+        seed = _seed(px, vol)
         state = {
             "units": seed["units"], "cash": seed["cash"],
             "closed": [], "last_bar_t": latest_t, "last_rebal_t": latest_t,
@@ -136,11 +196,11 @@ def main():
             "starting_equity": START_EQUITY, "started_at": _now_iso(), "n_rebalances": 0,
             "target": {"crypto_frac": CRYPTO_FRAC, "gold_frac": GOLD_FRAC,
                        "cash_frac": CASH_FRAC, "rebalance_days": REBALANCE_DAYS,
-                       "symbols": SYMBOLS, "gold": GOLD},
+                       "symbols": SYMBOLS, "gold": GOLD, "weight_scheme": WEIGHT_SCHEME},
         }
         _save(state)
         print(f"[rebalance_paper] SEEDED ${START_EQUITY:.0f}: "
-              f"{int(CRYPTO_FRAC*100)}% crypto ({len(SYMBOLS)}) / "
+              f"{int(CRYPTO_FRAC*100)}% crypto ({len(SYMBOLS)}, {WEIGHT_SCHEME}) / "
               f"{int(GOLD_FRAC*100)}% {GOLD} / {int(CASH_FRAC*100)}% cash. "
               f"Rebalance every {REBALANCE_DAYS:.0f}d.")
         return
@@ -168,7 +228,8 @@ def main():
             "equity_after": round(eq, 2), "days": round(days_since, 1),
         }
         state["closed"].append(rec)
-        newbook, cost, _ = _rebalance(state["units"], state["cash"], px)
+        vol = fetch_crypto_vol() if WEIGHT_SCHEME == "inverse_vol" else {}
+        newbook, cost, _ = _rebalance(state["units"], state["cash"], px, vol)
         state["units"], state["cash"] = newbook["units"], newbook["cash"]
         state["equity_at_rebal"] = eq - cost
         state["bh_equity_at_rebal"] = bh_eq   # benchmark re-baselined, NOT rebalanced

@@ -64,3 +64,58 @@ def test_no_turnover_when_already_on_target(R):
     # rebalancing an already-on-target book at the same prices costs ~nothing
     _, cost, _ = R._rebalance(seed["units"], seed["cash"], px)
     assert cost == pytest.approx(0.0, abs=1e-9)
+
+
+class TestInverseVolWeighting:
+    def test_falls_back_to_equal_weight_with_no_vol_data(self, R):
+        w = R.target_weights(vol={})
+        assert sum(w[s] for s in R.SYMBOLS) == pytest.approx(R.CRYPTO_FRAC)
+        for s in R.SYMBOLS:
+            assert w[s] == pytest.approx(R.CRYPTO_FRAC / len(R.SYMBOLS))
+
+    def test_higher_vol_gets_lower_weight(self, R):
+        vol = {s: 0.02 for s in R.SYMBOLS}
+        vol[R.SYMBOLS[0]] = 0.08  # 4x as volatile as the rest
+        w = R.target_weights(vol=vol)
+        assert w[R.SYMBOLS[0]] < w[R.SYMBOLS[1]]
+        # still sums to the crypto sleeve fraction
+        assert sum(w[s] for s in R.SYMBOLS) == pytest.approx(R.CRYPTO_FRAC)
+
+    def test_gold_and_cash_fractions_unaffected(self, R):
+        vol = {s: 0.02 + 0.01 * i for i, s in enumerate(R.SYMBOLS)}
+        w = R.target_weights(vol=vol)
+        assert w[R.GOLD] == pytest.approx(R.GOLD_FRAC)
+        assert R.CASH_FRAC == pytest.approx(1 - R.CRYPTO_FRAC - R.GOLD_FRAC)
+
+    def test_symbol_with_missing_vol_gets_fair_remainder_not_zero(self, R):
+        vol = {s: 0.02 for s in R.SYMBOLS[:-1]}  # last symbol has no vol data
+        w = R.target_weights(vol=vol)
+        assert w[R.SYMBOLS[-1]] > 0
+        assert sum(w[s] for s in R.SYMBOLS) == pytest.approx(R.CRYPTO_FRAC)
+
+    def test_degenerate_zero_vol_excluded_not_infinite_weight(self, R):
+        vol = {s: 0.02 for s in R.SYMBOLS}
+        vol[R.SYMBOLS[0]] = 0.0  # degenerate -- must not divide by zero
+        w = R.target_weights(vol=vol)
+        assert w[R.SYMBOLS[0]] > 0  # falls back to the fair-remainder share
+        assert all(v == v for v in w.values())  # no NaN anywhere
+
+    def test_scheme_env_equal_ignores_vol(self, monkeypatch, R):
+        monkeypatch.setenv("REBALANCE_WEIGHT_SCHEME", "equal")
+        import importlib
+        req = importlib.reload(R)
+        vol = {s: (0.01 if i == 0 else 0.10) for i, s in enumerate(req.SYMBOLS)}
+        w = req.target_weights(vol=vol)
+        for s in req.SYMBOLS:
+            assert w[s] == pytest.approx(req.CRYPTO_FRAC / len(req.SYMBOLS))
+        importlib.reload(R)  # restore default scheme for subsequent tests
+
+
+def test_seed_uses_inverse_vol_when_provided(R):
+    px = _flat_px(R)
+    vol = {s: 0.02 for s in R.SYMBOLS}
+    vol[R.SYMBOLS[0]] = 0.10  # much more volatile -> should get less weight
+    seed = R._seed(px, vol)
+    assert seed["units"][R.SYMBOLS[0]] < seed["units"][R.SYMBOLS[1]]
+    eq = R._equity(seed["units"], seed["cash"], px)
+    assert eq == pytest.approx(R.START_EQUITY)
