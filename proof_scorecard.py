@@ -584,6 +584,35 @@ def _pairs_forward() -> dict | None:
     return dict(label='Market-neutral pairs (FORWARD, paper)', executable=True, **s)
 
 
+def _pairs_altcoin_forward() -> dict | None:
+    """Market-neutral ALTCOIN pairs arm forward record (pairs_altcoin_paper.py):
+    same dollar-neutral mechanics/costs as pairs_paper.py (_pairs_forward), but
+    trading 4 pairs found via an actual Engle-Granger cointegration test (not
+    assumed) on a wider 10-coin universe -- discovered on the FIRST HALF of 5y
+    of hourly data, backtested strictly on the unseen second half, and checked
+    to hold in BOTH independent sub-halves of that held-out period (2026-08-04
+    research/backtest_altcoin_pairs.py). The strongest backtest result of that
+    session (all 4 pairs clear the 10-trial Sidak family-wise bar on the full
+    held-out set); still a backtest, not proof -- this arm earns that proof on
+    the forward clock. Entry-week clustered like every other arm."""
+    path = DATA / 'pairs_altcoin_paper_state.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda p: p.get('exit_ts') or '')
+    nets = [float(p['pnl']) for p in closed]
+
+    def _week(p) -> str:
+        try:
+            dt = datetime.utcfromtimestamp(int(p.get('entry_ts')))
+            iso = dt.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        except (TypeError, ValueError):
+            return 'unknown'
+    s = _stats(nets, [_week(p) for p in closed])
+    return dict(label='Market-neutral ALTCOIN pairs (FORWARD, paper)', executable=True, **s)
+
+
 def _rebalance_forward() -> dict | None:
     """Rebalanced-allocation forward record (rebalance_paper.py): the ONE positive,
     robust-OOS result of the ~320-strategy search (memory exhaustive_search_320_zero /
@@ -769,6 +798,7 @@ def build_arms() -> tuple:
         _lev_perp_agg_variant('lev_perp_v2_agg_state.json',
                               'Leveraged perp 5x vol-tgt3 + ATR trail (FORWARD, paper)'),
         _pairs_forward(),
+        _pairs_altcoin_forward(),
         _rebalance_forward(),
         _directional(),
     ] if a]
