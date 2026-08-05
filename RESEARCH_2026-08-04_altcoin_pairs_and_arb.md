@@ -140,6 +140,47 @@ relationships from this broader effect (e.g. testing against a differently-
 shaped historical regime, if one becomes available, or simply waiting for
 forward evidence across a regime this backtest window didn't contain).
 
+## 3d. New filter: correlation-regime sizing (2026-08-05)
+
+Following directly from 3c's finding, tagged all 2,226 backtested trades (the 4
+shipped pairs, full 5-year window) with the market's rolling 30-day average
+pairwise correlation (across the 6 traded coins) at entry. Result: NOT a hard
+on/off filter -- every decile of the regime measure stayed net profitable -- but
+a real, modest, economically sensible gradient: the bottom 2 deciles (avg
+$1.48-1.63/trade, ~55% win rate) were meaningfully weaker than the rest (avg
+$2.5-4.5/trade, 65-73% win rate). Robustness-checked: both the weak-regime and
+strong-regime trade dates span MULTIPLE separate years each (2021-26 for the
+weak decile, 2022-26 for the strong one), not one clustered calendar stretch --
+a recurring pattern, not a one-off period.
+
+Interpretation: elevated market-wide correlation ("everything moves together")
+makes an individual pair's spread divergence more likely transient noise around
+a stable relationship; low correlation makes it more likely a real fundamental
+decoupling that won't revert.
+
+Implemented as a conservative SIZE multiplier in `pairs_altcoin_paper.py` (half
+size below the calibrated 20th-percentile correlation threshold, full size
+otherwise, fails safe to 1.0x on any data/fetch error) -- not a skip, since even
+the weak regime stays profitable and a hard skip would discard real edge.
+
+**Honest cost/benefit of the sizing rule itself** (same 2,226-trade backtest,
+unsized vs. regime-sized):
+
+| | Total P&L | t-stat | Max drawdown | Capital deployed |
+|---|---|---|---|---|
+| Unsized (full size always) | +$7,035 | +15.29 | -$173.47 | $333,900 |
+| Regime-sized (proposed) | +$6,535 | +15.90 | -$154.71 | $293,400 |
+
+This is a genuine risk/reward tradeoff, not a free win: regime sizing gives up
+~7% of raw dollar profit (by deploying less capital in weak-regime windows) in
+exchange for an ~11% shallower max drawdown and a slightly better risk-adjusted
+t-stat. Shipped anyway on the judgment that a smoother equity curve is worth a
+modest profit haircut for a strategy whose underlying edge (per 3c) is now
+understood to carry real regime risk -- reducing size exactly when the edge is
+both weaker AND, per 3c, potentially riding a broader/less-durable phenomenon
+is the more conservative choice. `PAIRS_ALTCOIN_REGIME_SIZING=0` restores full
+sizing always if that tradeoff isn't wanted.
+
 ## Disposition
 
 Shipped as `pairs_altcoin_paper.py` — same mechanics/costs as production

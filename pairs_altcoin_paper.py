@@ -35,6 +35,24 @@ pure mechanics (fetch_closed/_spread_series/_zscore/_open/_close/_leg_pnl/
 _unrealized/mtm_equity/maybe_drawdown_stop/_alert) as the single source of truth
 for cost/exit math; only the pair universe, state file, and Telegram label differ.
 
+REGIME-GATED SIZING (2026-08-05, research/backtest_altcoin_pairs_wide.py): tagging
+every one of the 2,226 backtested trades with the market's rolling 30-day average
+pairwise correlation at entry (across the 6 traded coins) found a real, modest,
+economically sensible gradient -- NOT a hard on/off filter, every decile of the
+regime measure stayed net profitable, but the bottom 2 deciles (avg $1.48-1.63/
+trade, ~55% WR) were meaningfully weaker than the rest (avg $2.5-4.5/trade,
+65-73% WR). Robustness-checked: both the weak and strong regime periods span
+MULTIPLE separate years (2021-26 / 2022-26), not one clustered calendar stretch,
+so it's a recurring pattern, not a one-off artifact. Interpretation: elevated
+market-wide correlation ("everything moves together") makes an individual pair's
+spread divergence more likely to be transient noise around a stable relationship;
+low correlation makes it more likely a real fundamental decoupling that won't
+revert. Implemented as a conservative SIZE multiplier (half size below the
+calibrated 20th-percentile threshold, full size otherwise) rather than a skip --
+the weak regime is still profitable, just less so, and a hard skip would discard
+real edge. Fails safe to full size (1.0x) on any fetch/compute error. Toggle:
+PAIRS_ALTCOIN_REGIME_SIZING=0 to disable and always trade full size.
+
     python pairs_altcoin_paper.py        # process any newly-closed bar, then exit
 """
 from __future__ import annotations
@@ -65,6 +83,52 @@ KRAKEN_PAIRS = {
 PAIRS = [("AVAX", "ETH"), ("BCH", "ETH"), ("ETH", "XRP"), ("LINK", "SOL")]
 
 STATE_FILE = Path(os.getenv("PAIRS_ALTCOIN_STATE_FILE", "data/pairs_altcoin_paper_state.json"))
+
+REGIME_SIZING_ENABLED = os.getenv("PAIRS_ALTCOIN_REGIME_SIZING", "1") == "1"
+REGIME_LOOKBACK_DAYS = int(os.getenv("PAIRS_ALTCOIN_REGIME_LOOKBACK_DAYS", "30"))
+REGIME_LOW_THRESHOLD = float(os.getenv("PAIRS_ALTCOIN_REGIME_LOW_THRESHOLD", "0.423"))  # calibrated 20th pctile
+REGIME_LOW_SIZE_MULT = float(os.getenv("PAIRS_ALTCOIN_REGIME_LOW_SIZE_MULT", "0.5"))
+
+
+def regime_size_mult() -> float:
+    """Rolling average pairwise correlation across the 6 traded coins. Below the
+    calibrated low-regime threshold -> half size (weaker but still-profitable
+    regime, per the backtest); otherwise full size. Fails safe to 1.0 (no
+    adjustment) on any fetch/compute problem -- a sizing refinement should never
+    be able to block or corrupt a trade decision, only scale it."""
+    if not REGIME_SIZING_ENABLED:
+        return 1.0
+    try:
+        import ccxt
+        ex = ccxt.kraken({"enableRateLimit": True})
+        closes = {}
+        for base, code in KRAKEN_PAIRS.items():
+            o = ex.fetch_ohlcv(f"{base}/USD", timeframe="1d", limit=REGIME_LOOKBACK_DAYS + 2)
+            closes[base] = [row[4] for row in o]
+        min_len = min(len(v) for v in closes.values())
+        if min_len < REGIME_LOOKBACK_DAYS // 2:
+            return 1.0
+        import statistics
+        rets = {b: [(c[i] - c[i-1]) / c[i-1] for i in range(1, min_len)]
+                for b, c in ((k, v[-min_len:]) for k, v in closes.items())}
+        bases = list(rets.keys())
+        pairwise = []
+        for i in range(len(bases)):
+            for j in range(i + 1, len(bases)):
+                ri, rj = rets[bases[i]], rets[bases[j]]
+                if statistics.pstdev(ri) == 0 or statistics.pstdev(rj) == 0:
+                    continue
+                mean_i, mean_j = statistics.mean(ri), statistics.mean(rj)
+                cov = sum((a - mean_i) * (b_ - mean_j) for a, b_ in zip(ri, rj)) / len(ri)
+                corr = cov / (statistics.pstdev(ri) * statistics.pstdev(rj))
+                pairwise.append(corr)
+        if not pairwise:
+            return 1.0
+        avg_corr = sum(pairwise) / len(pairwise)
+        return REGIME_LOW_SIZE_MULT if avg_corr < REGIME_LOW_THRESHOLD else 1.0
+    except Exception as e:
+        print(f"[pairs_altcoin_paper] regime sizing skipped (fail-safe to 1.0x): {e}")
+        return 1.0
 
 
 def _load_state() -> dict:
@@ -113,7 +177,7 @@ def _notify(state: dict, prices: dict, acted: int) -> None:
     pp._alert("\n".join(lines))
 
 
-def process(state: dict, closes_by_base: dict, prices: dict, now) -> int:
+def process(state: dict, closes_by_base: dict, prices: dict, now, size_mult: float = 1.0) -> int:
     acted = 0
     allow_open = not state.get("halted", False) and not _is_killed()
     for pair in PAIRS:
@@ -148,10 +212,19 @@ def process(state: dict, closes_by_base: dict, prices: dict, now) -> int:
                 print(f"{key}: STOP time held={held} net=${rec['pnl']:+.2f}")
                 acted += 1
         elif abs(z) >= pp.ENTRY_Z and allow_open:
-            pp._open(state, pair, z, prices, ts)
+            # size_mult scales this ONE open only -- restore immediately after so
+            # nothing else (existing positions' cost math, other pairs' opens if
+            # this run processes several) is affected by a stale override.
+            orig_notional = pp.LEG_NOTIONAL
+            try:
+                pp.LEG_NOTIONAL = round(orig_notional * size_mult, 2)
+                pp._open(state, pair, z, prices, ts)
+            finally:
+                pp.LEG_NOTIONAL = orig_notional
             p = state["positions"][key]
+            tag = f" (regime-sized {size_mult:g}x)" if size_mult != 1.0 else ""
             print(f"{key}: OPEN z={z:+.2f} LONG {p['long_sym']} / SHORT {p['short_sym']} "
-                  f"@ ${pp.LEG_NOTIONAL:.0f}/leg")
+                  f"@ ${p['leg_notional']:.0f}/leg{tag}")
             acted += 1
     return acted
 
@@ -187,7 +260,8 @@ def main() -> int:
         if stopped:
             print(f"[pairs_altcoin_paper] DRAWDOWN STOP — MTM ${eq_mtm:,.2f}; flattened + halted.")
 
-    acted = process(state, closes_by_base, prices, now)
+    size_mult = regime_size_mult()
+    acted = process(state, closes_by_base, prices, now, size_mult=size_mult)
     state["equity_mtm"] = round(pp.mtm_equity(state, prices), 2)
     _notify(state, prices, acted)
     _save_state(state)

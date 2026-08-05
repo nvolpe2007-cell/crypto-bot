@@ -89,6 +89,50 @@ class TestProcess:
         assert acted == 0
 
 
+class TestRegimeSizing:
+    def test_disabled_returns_full_size(self, monkeypatch):
+        monkeypatch.setattr(pac, "REGIME_SIZING_ENABLED", False)
+        assert pac.regime_size_mult() == 1.0
+
+    def test_fails_safe_to_full_size_on_fetch_error(self, monkeypatch):
+        monkeypatch.setattr(pac, "REGIME_SIZING_ENABLED", True)
+        import sys
+        # simulate ccxt raising during the fetch loop
+        class BoomKraken:
+            def __init__(self, *a, **k): pass
+            def fetch_ohlcv(self, *a, **k): raise RuntimeError("network down")
+        fake_ccxt = type(sys)("ccxt")
+        fake_ccxt.kraken = BoomKraken
+        monkeypatch.setitem(sys.modules, "ccxt", fake_ccxt)
+        assert pac.regime_size_mult() == 1.0
+
+    def test_open_applies_size_mult_and_restores_global_after(self, monkeypatch):
+        monkeypatch.setattr(pp, "LEG_NOTIONAL", 150.0)
+        monkeypatch.setattr(pp, "LOOKBACK", 10)
+        st = _state()
+        closes_link = {t: 100.0 for t in range(20)}
+        closes_sol = {t: 100.0 for t in range(20)}
+        closes_link[19] = 140.0
+        prices = {"LINK": 140.0, "SOL": 100.0, "ETH": 100.0, "AVAX": 100.0,
+                  "BCH": 100.0, "XRP": 100.0}
+        pac.process(st, {"LINK": closes_link, "SOL": closes_sol}, prices, now=None, size_mult=0.5)
+        pos = st["positions"]["LINK-SOL"]
+        assert pos["leg_notional"] == pytest.approx(75.0)   # 150 * 0.5
+        assert pp.LEG_NOTIONAL == 150.0                       # global restored, not left mutated
+
+    def test_full_size_mult_matches_unscaled_open(self, monkeypatch):
+        monkeypatch.setattr(pp, "LEG_NOTIONAL", 150.0)
+        monkeypatch.setattr(pp, "LOOKBACK", 10)
+        st = _state()
+        closes_link = {t: 100.0 for t in range(20)}
+        closes_sol = {t: 100.0 for t in range(20)}
+        closes_link[19] = 140.0
+        prices = {"LINK": 140.0, "SOL": 100.0, "ETH": 100.0, "AVAX": 100.0,
+                  "BCH": 100.0, "XRP": 100.0}
+        pac.process(st, {"LINK": closes_link, "SOL": closes_sol}, prices, now=None, size_mult=1.0)
+        assert st["positions"]["LINK-SOL"]["leg_notional"] == pytest.approx(150.0)
+
+
 class TestKillSwitch:
     def test_kill_switch_blocks_new_open(self, monkeypatch):
         monkeypatch.setattr(pp, "LEG_NOTIONAL", 150.0)
