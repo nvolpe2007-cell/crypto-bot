@@ -97,6 +97,49 @@ one that changes the practical conclusion: the strategy itself is robust across
 every independent window tested, which is the thing that actually matters for
 deploying it.
 
+## 3c. Important revision: this may be a broad regime effect, not pair-specific (2026-08-05)
+
+Extended the same walk-forward methodology to 16 coins (120 pairs) to look for
+*more* validated pairs, applying the "net-positive in every fold" bar as the
+selection criterion from the start. Result: **34 of 116 candidate pairs (29%)
+passed** — including economically arbitrary combinations like BTC/DOGE and
+SOL/ATOM that have no particular reason to move together beyond general crypto
+beta. That is a red flag, not a bigger win: if a third of essentially random
+liquid-altcoin pairs clear the same bar, the selection process isn't finding
+pair-specific relationships, it's picking up something much more general.
+
+**Negative control**: ran the identical mechanics on BTC vs. a synthetic series
+built from BTC's own returns *shuffled in time* (same volatility, genuinely no
+real relationship), 8 independent trials. **0 of 8 shuffled pairs passed** —
+so this isn't pure backtest-mechanic noise; real crypto pairs behave
+differently from random walks. But 29% of real pairs vs. 0% of random pairs
+still means the effect is much broader than "4 special pairs," more like
+"most liquid altcoin pairs during 2021-2026 show this to some degree."
+
+**Best interpretation**: likely a genuine but *broad* phenomenon — crypto
+altcoins share strong common-factor ("crypto beta") exposure, and this
+5-year window (2021 mania → 2022 crash → 2023-26 choppy recovery) was full of
+episodic, market-wide divergence-then-reconvergence events that show up in
+almost any two correlated alts' spread, not a durable economic relationship
+specific to LINK/SOL or ETH/AVAX. This raises real regime risk: a genuinely
+trending market (permanent winners/losers, not a boom-bust-recover cycle)
+could break this broadly, all at once, across every pair simultaneously —
+which is worse for diversification than it looks, since more pairs from the
+same broad effect isn't independent risk reduction, it's concentrated
+exposure to one factor.
+
+**What this means for the shipped arm (PR #93)**: NOT reverting it — the 4
+pairs still cleared every walk-forward fold, including the strict single-split
+test, and something real (not noise) is happening. But I'm not adding the 34
+newly-found pairs to the live arm; doing so would overstate confidence in
+something now understood to be more "broad market regime" than "specific
+pair edge." The right next step is letting the 4 already-shipped pairs earn
+real forward proof, and treating any further pair additions with real
+suspicion until there's a way to distinguish genuine idiosyncratic
+relationships from this broader effect (e.g. testing against a differently-
+shaped historical regime, if one becomes available, or simply waiting for
+forward evidence across a regime this backtest window didn't contain).
+
 ## Disposition
 
 Shipped as `pairs_altcoin_paper.py` — same mechanics/costs as production
