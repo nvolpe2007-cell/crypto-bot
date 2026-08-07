@@ -1,5 +1,9 @@
 # RESEARCH 2026-08-04 — Altcoin arbitrage survey + cointegrated pairs discovery
 
+> **⚠️ RETRACTED 2026-08-07 — see section 5. The core pairs finding (section 3)
+> was a data-fidelity artifact, not a real edge. Do NOT merge/deploy
+> `pairs_altcoin_paper.py` as originally shipped. Full explanation below.**
+
 Owner: "do more research on making a new strategy and filters... look at altcoin
 arbitrage also." Three avenues tested; two dead ends (both confirmed empirically,
 not just theoretically), one genuinely strong new lead.
@@ -181,7 +185,97 @@ both weaker AND, per 3c, potentially riding a broader/less-durable phenomenon
 is the more conservative choice. `PAIRS_ALTCOIN_REGIME_SIZING=0` restores full
 sizing always if that tradeoff isn't wanted.
 
-## Disposition
+## 4. Cross-sectional relative-strength momentum — DEAD (confirmed with walk-forward)
+
+Tried one genuinely different strategy shape (not absolute trend, not
+relative-value mean-reversion): rank all 16 coins by trailing 30-day return,
+hold the top-3 equal-weighted, weekly rebalance, pre-specified textbook
+parameters (not swept). 4-fold walk-forward on the same 16-coin universe:
+
+| Fold | Period | Total return | Max drawdown |
+|---|---|---|---|
+| 0 | 2021-08→2022-10 | **-78.6%** | -84.5% |
+| 1 | 2022-11→2024-01 | +24.4% | -46.1% |
+| 2 | 2024-01→2025-04 | +11.5% | -62.2% |
+| 3 | 2025-04→2026-07 | **-67.2%** | -82.0% |
+
+2 of 4 folds are catastrophic with ~83% drawdowns — the classic "momentum
+crash" failure mode where concentrated momentum portfolios get wiped out on
+regime reversals. Not pursued further (no parameter tuning attempted — that
+would be exactly the p-hacking this session's discipline exists to avoid).
+This independently reconfirms, with real walk-forward testing on this data,
+the earlier exhaustive 320-strategy search's finding that cross-sectional/
+dual momentum had zero survivors.
+
+## 5. RETRACTION — the pairs finding was a data-fidelity artifact (2026-08-07)
+
+While checking a routine execution-quality question (does entry hour-of-day
+matter?), found that **37% of all 2,226 backtested trades entered at exactly
+hour 0 UTC** — a classic signature of a data artifact, not a market pattern.
+Investigated and found the cause: `backtest_altcoin_pairs.py::load_hourly()`
+only fetched genuine hourly data for BTC/ETH/SOL; every other coin (including
+AVAX, BCH, XRP, LINK — the alt leg of all 4 "validated" pairs) used **daily
+closes forward-filled to hourly resolution**. The code even had a comment
+claiming "the backtest re-derives proper hourly z-scores from real hourly
+data where available" — that was aspirational text that was never actually
+implemented; the daily-ffill'd series was used directly in the P&L backtest,
+not just the initial screening step it was meant for.
+
+This matters enormously: a forward-filled series only changes value once a
+day, so a 7-day (168-hour) rolling z-score computed on it is really reacting
+to ~7 discrete daily jumps, not 168 independent hourly moves — the spread
+looks artificially smooth and "mean-reverting" because most of the apparent
+noise (23 of every 24 hours) is a flat line by construction, not because the
+underlying assets have a real, tradeable relationship.
+
+**Fetched genuine hourly OHLCV for AVAX/BCH/XRP/LINK (`fetch_hourly_wide.py`,
+same OKX method as the original BTC/ETH/SOL data) and re-ran the exact same
+walk-forward test with real data on every leg. Every single one of the 4
+"shipped" pairs completely fell apart:**
+
+| Pair | Fold 0 (real data) | Fold 1 | Fold 2 |
+|---|---|---|---|
+| ETH/AVAX | -$127 (t=-1.38) | -$148 (t=-1.93) | -$67 (t=-1.17) |
+| ETH/BCH | -$150 (t=-1.32) | -$123 (t=-1.37) | -$214 (t=-2.74) |
+| ETH/XRP | -$107 (t=-1.89) | -$158 (t=-1.14) | -$75 (t=-1.43) |
+| LINK/SOL | -$153 (t=-1.35) | +$12 (t=+0.14, noise) | -$73 (t=-1.56) |
+
+**Every fold for every pair is now negative or statistically indistinguishable
+from noise.** The original finding — the strongest, most-validated result of
+the whole research session, which survived a single train/test split AND a
+4-fold walk-forward AND a regime-sizing refinement — was, in full, an artifact
+of a data pipeline bug. None of the "robustness" it appeared to have (holding
+across years, across sub-periods) is evidence of anything real, because the
+underlying data itself was the same artifact in every window tested.
+
+**Disposition: `pairs_altcoin_paper.py` as shipped in PR #93 should NOT be
+merged/deployed.** The code's mechanics (imported from `pairs_paper.py`) are
+fine and the regime-sizing filter's *methodology* is sound, but the specific
+4 pairs it trades have no demonstrated edge once tested honestly. Options
+going forward, not yet decided:
+1. Close/withdraw PR #93 entirely.
+2. Redo the full pair-discovery scan (Engle-Granger cointegration test +
+   walk-forward) with 100% real hourly data from the start, on whatever coins
+   have genuine hourly history available, and see if anything survives. Given
+   how badly this collapsed, there is no strong prior that it will.
+3. At minimum, before ever merging, independently re-verify any future
+   "backtest lead" this rigorously against a live data-fidelity check.
+
+**Lesson for future research in this repo**: whenever mixing data sources of
+different native resolution (hourly cache vs. daily-only cache), verify the
+finer-resolution series is genuinely finer, not resampled/filled from the
+coarser one, BEFORE trusting any backtest built on it. A forward-filled
+series is not noise-free data, it's a different (and misleadingly smoother)
+signal that will not match live behavior.
+
+## Disposition (ORIGINAL — see section 5 for the retraction)
+
+~~Shipped as `pairs_altcoin_paper.py`~~ — **RETRACTED, see section 5. The 4
+pairs below were discovered and validated entirely on daily-forward-filled
+data for the alt leg, and none of them show any edge when re-tested with
+genuine hourly data. Do not merge/deploy the arm described here.**
+
+<details><summary>Original (now-retracted) disposition text</summary>
 
 Shipped as `pairs_altcoin_paper.py` — same mechanics/costs as production
 `pairs_paper.py` (imported, not reimplemented, so it's directly comparable),
@@ -192,6 +286,8 @@ has real (currently losing) forward history, so mixing in new pairs would corrup
 an in-progress proof record. Registered in `proof_scorecard.py` for its own
 forward verdict. Still a backtest, not proof — needs the same n≥30 forward trades
 before it counts as real, same bar as everything else here.
+
+</details>
 
 ## Honest caveats
 

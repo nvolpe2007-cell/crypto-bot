@@ -133,6 +133,24 @@ class TestRegimeSizing:
         assert st["positions"]["LINK-SOL"]["leg_notional"] == pytest.approx(150.0)
 
 
+class TestRetractionGuard:
+    """This arm's 4 pairs were retracted 2026-08-07 (validated on a daily-
+    forward-fill data bug, no edge with real hourly data). main() must refuse
+    to run unless explicitly overridden, so it can never silently trade on
+    a retracted finding even if a stale cron entry invokes it."""
+
+    def test_main_refuses_by_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("PAIRS_ALTCOIN_ACKNOWLEDGE_RETRACTION", raising=False)
+        monkeypatch.setenv("PAIRS_ALTCOIN_STATE_FILE", str(tmp_path / "state.json"))
+        assert pac.main() == 1
+        assert not (tmp_path / "state.json").exists()  # never even loaded/wrote state
+
+    def test_main_refuses_on_explicit_zero(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PAIRS_ALTCOIN_ACKNOWLEDGE_RETRACTION", "0")
+        monkeypatch.setenv("PAIRS_ALTCOIN_STATE_FILE", str(tmp_path / "state.json"))
+        assert pac.main() == 1
+
+
 class TestKillSwitch:
     def test_kill_switch_blocks_new_open(self, monkeypatch):
         monkeypatch.setattr(pp, "LEG_NOTIONAL", 150.0)

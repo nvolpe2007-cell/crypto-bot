@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+⚠️  RETRACTED 2026-08-07 — DO NOT DEPLOY. See RESEARCH_2026-08-04_altcoin_pairs_
+and_arb.md section 5. The 4 pairs below were discovered/validated on daily-
+forward-filled data for the alt leg (a data pipeline bug, not real hourly
+data); re-tested with genuine hourly OHLCV for AVAX/BCH/XRP/LINK and every
+single pair + every walk-forward fold turned negative or noise-level. The
+code/mechanics are fine (reused from pairs_paper.py) but these specific pairs
+have no demonstrated edge. Kept in the repo as a documented lesson, not as a
+ready-to-run arm. If reviving this idea, redo the full discovery scan with
+100% real hourly data from the start.
+
 MARKET-NEUTRAL ALTCOIN PAIRS — FORWARD paper runner (single-shot, scheduler-friendly).
 
 pairs_paper.py only ever traded the 3 combinations of {BTC, ETH, SOL} -- it never
@@ -230,6 +240,17 @@ def process(state: dict, closes_by_base: dict, prices: dict, now, size_mult: flo
 
 
 def main() -> int:
+    if os.getenv("PAIRS_ALTCOIN_ACKNOWLEDGE_RETRACTION", "0") != "1":
+        print(
+            "[pairs_altcoin_paper] REFUSING TO RUN: this arm's 4 pairs were "
+            "retracted 2026-08-07 -- see RESEARCH_2026-08-04_altcoin_pairs_"
+            "and_arb.md section 5. They were validated on daily-forward-filled "
+            "data for the alt leg and show no edge with real hourly data. "
+            "Set PAIRS_ALTCOIN_ACKNOWLEDGE_RETRACTION=1 to run anyway "
+            "(not recommended without redoing the discovery scan first)."
+        )
+        return 1
+
     state = _load_state()
     if state.get("halted") and os.getenv("PAIRS_ALTCOIN_REARM", "0") == "1":
         state["halted"] = False
