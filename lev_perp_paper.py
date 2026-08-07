@@ -83,10 +83,19 @@ except Exception:  # pragma: no cover - import-path safety net
         return False
 
 KRAKEN_PAIRS_ALL = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}
+# Superset for LEV_PERP_SYMBOLS overrides -- RESEARCH_2026-07-26_lev_perp_v1_
+# frequency.md found widening v1's universe 3->8 coins, SAME unchanged entry
+# signal/filters, the strongest single lever in this repo's whole search
+# history (DSR 0.538->0.887). KRAKEN_PAIRS_ALL itself stays 3-coin so every
+# arm that doesn't set LEV_PERP_SYMBOLS (the production v1 default, and both
+# agg twins) is byte-for-byte unaffected -- only an explicit override can
+# reach these 5 extra coins.
+KRAKEN_PAIRS_WIDE = {**KRAKEN_PAIRS_ALL, "ADA": "ADAUSD", "XRP": "XRPUSD",
+                     "DOT": "DOTUSD", "AVAX": "AVAXUSD", "LINK": "LINKUSD"}
 _env = os.getenv("LEV_PERP_SYMBOLS", "").strip()
 if _env:
     _want = {s.strip().upper() for s in _env.split(",") if s.strip()}
-    KRAKEN_PAIRS = {b: p for b, p in KRAKEN_PAIRS_ALL.items() if b in _want}
+    KRAKEN_PAIRS = {b: p for b, p in KRAKEN_PAIRS_WIDE.items() if b in _want}
 else:
     KRAKEN_PAIRS = dict(KRAKEN_PAIRS_ALL)
 
@@ -98,7 +107,7 @@ LIQ_PRICE_FRAC  = max(1e-6, (1.0 - MAINT) / LEVERAGE)
 TRADE_COST_FRAC = float(os.getenv("LEV_PERP_COST_FRAC", "0.0015"))
 FUNDING_APY     = float(os.getenv("LEV_PERP_FUNDING_APY", "0.10"))
 STARTING_EQUITY = float(os.getenv("LEV_PERP_START_EQUITY", "1000"))
-ALLOC_FRAC      = 1.0 / max(1, len(KRAKEN_PAIRS_ALL))
+ALLOC_FRAC      = 1.0 / max(1, len(KRAKEN_PAIRS))  # split across the ACTIVE traded set
 MARGIN          = round(STARTING_EQUITY * ALLOC_FRAC, 2)
 STATE_FILE      = Path(os.getenv("LEV_PERP_STATE_FILE", "data/lev_perp_state.json"))
 

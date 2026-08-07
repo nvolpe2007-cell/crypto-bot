@@ -1,0 +1,148 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema for hypothesis_registry.yaml
+#
+# Referenced by the registry header ("Schema: see schema.yaml"), which had gone
+# missing. This file documents the shape every registry entry must follow.
+# It is documentation, not a validator — nothing imports it.
+#
+# The point of the registry is to answer one question fast:
+#   "Have I already tested this, and what killed it?"
+# An entry that does not record what was MEASURED cannot answer that, so the
+# `evidence` block is the part that matters most.
+# ─────────────────────────────────────────────────────────────────────────────
+
+registry:
+  top_level_key: hypotheses          # a list of entry objects
+  ordering: append-only              # add new entries at the BOTTOM
+  immutability: >
+    Never edit the `evidence` block of an existing entry. New measurements are
+    appended as an additional item in that entry's `evidence` list, or as a new
+    follow-up entry with its own id. The record of what was believed at the time
+    is part of the evidence.
+
+entry:
+  id:
+    type: string
+    required: true
+    format: kebab-case, unique across the registry
+    convention: >
+      <family>-<mechanism> e.g. altperp-trend-donchian, funding-arb-kraken.
+      Stable once published — other docs and notes reference it.
+
+  name:
+    type: string
+    required: true
+    description: One-line human title.
+
+  family:
+    type: string
+    required: true
+    known_values: [altperp, funding-arb, market-neutral, directional, infrastructure]
+    description: >
+      Groups related attempts. Also the unit the Sidak family-corrected t-bar is
+      applied over in proof_scorecard.py — entries sharing a family are competing
+      hypotheses, and the multiple-testing correction must account for all of them.
+
+  hypothesis:
+    type: string (block scalar)
+    required: true
+    description: >
+      The claim being tested, stated so it could be false. Include the source if
+      it came from outside (paper, article, prior research doc).
+
+  code:
+    type: string
+    required: true
+    description: Path(s) to the implementation, or to the research script.
+
+  backtest:
+    type: string
+    required: false
+    description: Path to the backtest entry point, when separate from `code`.
+
+  evidence:
+    type: list
+    required: true
+    min_items: 1
+    description: >
+      Append-only measurement log, oldest first. An entry with no measurement is
+      only acceptable when the measurement is impossible — and must say so in
+      `result` (see altperp-flush-long).
+    item:
+      date:
+        type: date (YYYY-MM-DD)
+        required: true
+      script:
+        type: string
+        required: false
+        description: What produced this measurement, so it can be re-run.
+      window:
+        type: string
+        required: false
+        description: Data range / instruments the measurement covers.
+      method:
+        type: string
+        required: false
+        description: >
+          How it was measured. Record IS/OOS splits, walk-forward design, and
+          whether the PRODUCTION cost model was reused or reimplemented — a
+          result computed against a different cost model is not comparable.
+      result:
+        type: string
+        required: true
+        description: >
+          What was actually measured, with numbers. Record the honest verdict
+          including sign. "No trades fired" and "unmeasurable" are valid results
+          and must be written down rather than left blank.
+
+  deployment_gate:
+    type: object
+    required: true
+    description: >
+      What OOS evidence would justify deploying capital. Set BEFORE the next
+      measurement, never revised downward to fit a result that missed it.
+    fields:
+      requires:
+        type: string
+        required: true
+        description: >
+          The condition, stated numerically where possible. The repo bar is
+          proof_scorecard.py: n >= 30, expectancy > 0, Sidak family-corrected
+          clustered-t, Deflated Sharpe Ratio > 0.95. Multi-round searches must
+          pool their TOTAL candidate count when computing _expected_max_sharpe.
+      blocked_by:
+        type: string
+        required: false
+        description: What currently prevents the gate being evaluated or met.
+
+  status:
+    type: enum
+    required: true
+    values:
+      sit-out: measured, no edge found; do not deploy capital
+      paper-only: running paper, collecting forward-walk data; do not flip live
+      live-tiny: live with hard caps, monitored like a research instrument
+      live: proven OOS, deployed at size
+      killed: measured edge decayed / disproven; archived
+      infrastructure: enabling layer, not a strategy — no capital decision
+    note: >
+      Status is a consequence of the evidence against the gate, not a judgement
+      call. Nothing has ever reached `live` or `live-tiny`.
+
+  notes:
+    type: string (block scalar)
+    required: false
+    description: >
+      Standing conclusions, caveats, and — most usefully — a
+      "DO NOT RE-PROPOSE without new evidence" list naming the specific bad
+      arguments this hypothesis has already refuted.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conventions inherited from CLAUDE.md
+# ─────────────────────────────────────────────────────────────────────────────
+conventions:
+  - Costs dominate at this size. Never loosen a gate to force trades.
+  - Record what was MEASURED, not what was hoped.
+  - The deployment gate is what the OOS evidence says, not the IS evidence.
+  - A strategy that is breakeven gross is a loser net.
+  - Selectivity that monotonically improves results means optimal exposure is zero.

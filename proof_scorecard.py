@@ -768,6 +768,16 @@ def build_arms() -> tuple:
                               'Leveraged perp 5x vol-tgt3 + take-profit (FORWARD, paper)'),
         _lev_perp_agg_variant('lev_perp_v2_agg_state.json',
                               'Leveraged perp 5x vol-tgt3 + ATR trail (FORWARD, paper)'),
+        # 8-coin widened universe (BTC/ETH/SOL/ADA/XRP/DOT/AVAX/LINK), v1's exact
+        # unchanged SMA-50 signal/filters/exit -- RESEARCH_2026-07-26_lev_perp_v1_
+        # frequency.md found this the strongest single lever in the repo's search
+        # history (DSR 0.538->0.887 vs the 3-coin original), though the honest
+        # POOLED verdict across all candidates tried (RESEARCH_2026-07-26_lev_perp_
+        # regime_and_entry_search.md) still doesn't clear the bar. Reuses
+        # _lev_perp_agg_variant purely for its generic state-file-in/stats-out
+        # shape -- no aggressive risk knobs are actually changed here, only universe.
+        _lev_perp_agg_variant('lev_perp_8coin_state.json',
+                              'Leveraged perp 3x + take-profit, 8-coin universe (FORWARD, paper)'),
         _pairs_forward(),
         _rebalance_forward(),
         _directional(),
