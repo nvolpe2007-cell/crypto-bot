@@ -4,6 +4,7 @@ Coordinates data fetching, strategy signals, and trade execution
 """
 
 import asyncio
+import functools
 import signal
 import yaml
 import os
@@ -27,14 +28,9 @@ from .notifications import create_notifier_from_env
 from .market_sentiment import SentimentMonitor
 from .kraken_ws import KrakenPublicWS, KrakenPrivateWS, KrakenBookFeed, KrakenTradeFeed
 from .crypto_vol import CryptoVolMonitor
-from .state import read_state, write_state
 from .strategy_advisor import StrategyAdvisor
 from .trade_journal import TradeJournal
 from .task_supervisor import supervised
-import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'arbitrage'))
-from funding_scanner import FundingScanner
-from funding_arb_paper import FundingArbPaperSim
 
 # Load environment variables
 load_dotenv()
@@ -318,25 +314,6 @@ class ScalpingBot:
             await self.exchange.disconnect()
 
 
-async def _run_funding_scanner(notifier=None):
-    """Run funding rate scanner + paper-arb sim. Merge scanner results into shared state."""
-    scanner = FundingScanner(notifier=None)
-    arb_sim = FundingArbPaperSim(scanner=scanner, notifier=notifier)
-
-    async def _merge_state():
-        while True:
-            await asyncio.sleep(65)
-            try:
-                state = read_state()
-                state['funding_opportunities'] = scanner.get_state()
-                state['funding_arb'] = arb_sim.get_summary()
-                write_state(state)
-            except Exception as exc:
-                logger.warning("[FundingScanner] State merge failed: %s", exc)
-
-    await asyncio.gather(scanner.start(), arb_sim.start(), _merge_state())
-
-
 async def main():
     """Main entry point"""
     config = load_config()
@@ -344,10 +321,14 @@ async def main():
 
     loop = asyncio.get_running_loop()
     notifier = create_notifier_from_env()
+    # Each top-level subsystem runs under `supervised()` (the same auto-restart
+    # wrapper already used for the websocket feeds below) so an unhandled crash
+    # in one — e.g. the dashboard — restarts just that subsystem instead of
+    # propagating through this gather and killing the whole process, which would
+    # take the live/paper trading loop and funding scanner down with it too.
     gather_task = asyncio.gather(
-        bot.start(),
-        run_dashboard(),
-        _run_funding_scanner(notifier=notifier),
+        supervised('bot', bot.start, notifier=notifier),
+        supervised('dashboard', run_dashboard, notifier=notifier),
     )
 
     def _handle_shutdown():

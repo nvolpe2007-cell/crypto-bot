@@ -369,10 +369,17 @@ class PaperTrader:
                              fraction: float = 0.5) -> Optional[float]:
         """Close `fraction` of a long position.
 
-        Returns pnl_partial (net of exit fee) or None when no matching position.
-        Cash is credited with proceeds minus the exit fee, matching execute_sell
-        semantics so that partial + final close produce identical accounting to a
-        single full close at the same prices.
+        Returns pnl_partial (net of exit fee AND this leg's proportional share
+        of the original entry fee) or None when no matching position.
+        `pos.entry_fee` is reduced by the same fraction, so a later partial/
+        full close (or liquidation) only charges entry fee for the size it
+        actually closes instead of re-charging the whole original entry fee
+        against a smaller remaining size. Cash is credited with proceeds minus
+        the exit fee only (entry fee was already paid out of cash at open),
+        matching execute_sell semantics so partial + final close produce
+        identical cash to a single full close at the same prices. Each partial
+        fill is recorded as its own Trade in closed_trades, same as any other
+        exit, so trade counts/journal stats don't silently drop T1 exits.
         """
         if symbol not in self.account.positions:
             return None
@@ -383,10 +390,19 @@ class PaperTrader:
         slip = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 - slip)
         exit_fee = exec_price * partial_size * self.fee_pct
-        pnl_partial = (exec_price - pos.entry_price) * partial_size - exit_fee
+        entry_fee_partial = pos.entry_fee * fraction
+        pnl_partial = (exec_price - pos.entry_price) * partial_size - exit_fee - entry_fee_partial
+        cost_basis = pos.entry_price * partial_size + entry_fee_partial
+        pnl_pct = pnl_partial / cost_basis * 100 if cost_basis else 0.0
         pos.size -= partial_size
+        pos.entry_fee -= entry_fee_partial
         self.account.cash += exec_price * partial_size - exit_fee
         self.account.total_pnl += pnl_partial
+        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
+                      entry_price=pos.entry_price, exit_price=exec_price,
+                      size=partial_size, side='partial_sell', pnl=pnl_partial,
+                      pnl_pct=pnl_pct, fees=exit_fee + entry_fee_partial)
+        self.account.closed_trades.append(trade)
         logger.info(f"[PARTIAL SELL] {symbol} @ ${exec_price:,.2f}  "
                     f"size={partial_size:.6f}  pnl=${pnl_partial:+.4f}")
         return pnl_partial
@@ -395,11 +411,18 @@ class PaperTrader:
                               fraction: float = 0.5) -> Optional[float]:
         """Close `fraction` of a short position.
 
-        Returns pnl_partial (net of exit fee) or None when no matching position.
-        Cash formula mirrors execute_cover: releases entry_price × partial_size of
-        the locked collateral and adds the net P&L (which includes the exit fee),
-        so that partial + final cover produce identical accounting to a single full
-        cover at the same prices.
+        Returns pnl_partial (net of exit fee AND this leg's proportional share
+        of the original entry fee) or None when no matching position.
+        `pos.entry_fee` is reduced by the same fraction (mirrors
+        execute_partial_sell) so a later close doesn't re-charge the whole
+        original entry fee against a smaller remaining size. Cash formula
+        mirrors execute_cover: releases entry_price × partial_size of the
+        locked collateral and adds the *gross* P&L (entry fee was already
+        paid out of cash at open, so it must not be deducted from cash again
+        here even though it's now included in the reported pnl_partial), so
+        partial + final cover produce identical cash to a single full cover
+        at the same prices. Each partial fill is recorded as its own Trade in
+        closed_trades, same as any other exit.
         """
         if symbol not in self.account.positions:
             return None
@@ -410,13 +433,22 @@ class PaperTrader:
         slip = self._slippage_pct_for(symbol, price)
         exec_price = price * (1 + slip)
         exit_fee = exec_price * partial_size * self.fee_pct
-        pnl_partial = (pos.entry_price - exec_price) * partial_size - exit_fee
+        entry_fee_partial = pos.entry_fee * fraction
+        gross_pnl = (pos.entry_price - exec_price) * partial_size
+        pnl_partial = gross_pnl - exit_fee - entry_fee_partial
+        cost_basis = pos.entry_price * partial_size + entry_fee_partial
+        pnl_pct = pnl_partial / cost_basis * 100 if cost_basis else 0.0
         pos.size -= partial_size
-        # Release proportional collateral and return the net P&L for the covered
-        # portion.  Equivalent to (2×entry - exec) × partial - exit_fee, which
-        # mirrors execute_cover's "returned + pnl" formula on a pro-rated basis.
-        self.account.cash += pos.entry_price * partial_size + pnl_partial
+        pos.entry_fee -= entry_fee_partial
+        # Release proportional collateral plus gross P&L, net of exit fee only —
+        # entry fee must not be deducted from cash a second time (see docstring).
+        self.account.cash += pos.entry_price * partial_size + gross_pnl - exit_fee
         self.account.total_pnl += pnl_partial
+        trade = Trade(entry_time=pos.entry_time, exit_time=timestamp,
+                      entry_price=pos.entry_price, exit_price=exec_price,
+                      size=partial_size, side='partial_cover', pnl=pnl_partial,
+                      pnl_pct=pnl_pct, fees=exit_fee + entry_fee_partial)
+        self.account.closed_trades.append(trade)
         logger.info(f"[PARTIAL COVER] {symbol} @ ${exec_price:,.2f}  "
                     f"size={partial_size:.6f}  pnl=${pnl_partial:+.4f}")
         return pnl_partial

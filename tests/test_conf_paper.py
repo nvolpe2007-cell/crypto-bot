@@ -120,3 +120,45 @@ def test_idempotent_no_double_act_on_same_bars(monkeypatch):
     acted = cp.process_symbol("BTC", bars, state)    # same bars again
     assert acted == 0                                # nothing new to act on
     assert state["last_bar_t"] == before
+
+
+# ── master kill switch: halts NEW entries, never exits ──────────────────────
+
+def test_kill_switch_blocks_seed_entry(monkeypatch):
+    monkeypatch.setattr(cp, "SMA_N", 3)
+    monkeypatch.setattr(cp, "MOMO_N", 2)
+    monkeypatch.setattr(cp, "WARMUP", 4)
+    monkeypatch.setattr(cp, "_is_killed", lambda: True)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    bars = _bars([10, 10, 10, 30])                   # confluence ON at inception
+    acted = cp.process_symbol("BTC", bars, state)
+    assert acted == 0
+    assert "BTC" not in state["positions"]           # entry suppressed by kill switch
+
+
+def test_kill_switch_blocks_new_open_but_not_close(monkeypatch):
+    monkeypatch.setattr(cp, "SMA_N", 3)
+    monkeypatch.setattr(cp, "MOMO_N", 2)
+    monkeypatch.setattr(cp, "WARMUP", 4)
+    closes = [100, 100, 100, 90, 200]                # seed cash, then confluence on
+    bars = _bars(closes)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    cp.process_symbol("BTC", bars[:4], state)        # inception seed (cash)
+    monkeypatch.setattr(cp, "_is_killed", lambda: True)
+    acted = cp.process_symbol("BTC", bars, state)    # would OPEN, but killed
+    assert acted == 0
+    assert "BTC" not in state["positions"]
+
+    # exits still work while killed: open one (unkilled) on a fresh bar, then
+    # close on another fresh bar while killed again.
+    monkeypatch.setattr(cp, "_is_killed", lambda: False)
+    bars_open = _bars(closes + [210])                # still confluence-on -> OPEN
+    cp.process_symbol("BTC", bars_open, state)
+    assert "BTC" in state["positions"]
+    monkeypatch.setattr(cp, "_is_killed", lambda: True)
+    bars2 = _bars(closes + [210, 50])                 # below SMA -> CLOSE
+    acted = cp.process_symbol("BTC", bars2, state)
+    assert acted == 1                                # exit not blocked by kill switch
+    assert "BTC" not in state["positions"]

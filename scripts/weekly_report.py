@@ -366,23 +366,18 @@ def recommendations(trades: List[dict], log_stats: dict, calib: dict, kraken: di
 def proof_status() -> List[str]:
     """Each strategy arm's PRE-REGISTERED proof verdict, now judged against the
     Šidák family-wise t-bar (guards against best-of-k selection bias). Read-only
-    — imports proof_scorecard and rebuilds the same arm list its main() does."""
+    — delegates arm-list construction to proof_scorecard.build_arms() so new
+    arms added there automatically appear here without a separate update."""
     try:
         import proof_scorecard as ps
     except Exception as e:  # pragma: no cover - defensive
         return [f"proof_scorecard unavailable: {e}"]
-    arms = [a for a in [
-        ps._arm('Aggressive funding', 'funding_arb_state.json', executable=False, borrow_correct=True),
-        ps._arm('Majors funding', 'funding_arb_majors_state.json', executable=False, borrow_correct=False),
-        ps._arm('Kraken funding', 'funding_arb_kraken_state.json', executable=True, borrow_correct=False),
-        ps._swing_forward(),
-        ps._tsmom_forward(),
-        ps._directional(),
-    ] if a]
+    try:
+        arms, k, t_family = ps.build_arms()
+    except Exception as e:  # pragma: no cover - defensive
+        return [f"proof_scorecard.build_arms() failed: {e}"]
     if not arms:
         return ["no arms with data yet"]
-    k = len(arms)
-    t_family = ps._family_t_bar(k)
     lines = [f"family-wise bar (k={k}): clustered t&gt;{t_family:.2f}"]
     for a in arms:
         lines.append(f"{a['label']}: {ps._verdict(a, t_family, k)}")

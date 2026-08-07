@@ -196,3 +196,33 @@ def test_to_state_has_dashboard_shape(data_dir):
     s = a.to_state()
     # dashboard_data.collect_arms requires starting_equity; reads equity_mtm/equity
     assert {"starting_equity", "equity", "equity_mtm", "positions", "closed"} <= set(s)
+
+
+# ── DSR gate ──────────────────────────────────────────────────────────────────
+def test_score_arms_exposes_dsr_and_sr0(data_dir):
+    _write_arm(data_dir, "swing_paper_state.json", [1.0 + (i % 3) * 0.05 for i in range(35)])
+    rows = score_arms(data_dir)
+    row = rows[0]
+    assert "dsr" in row and "sr0" in row
+    assert 0.0 <= row["dsr"] <= 1.0
+    assert row["sr0"] >= 0.0
+
+
+def test_score_arms_low_sharpe_fails_dsr_gate(data_dir):
+    # Build a barely-positive arm: 30 trades each netting +0.001 with tight variance.
+    # The t-bar passes (high t) but Sharpe per-trade is near-zero, so DSR < 0.95.
+    pnls = [0.001] * 35
+    _write_arm(data_dir, "swing_paper_state.json", pnls)
+    row = next(r for r in score_arms(data_dir) if r["name"] == "swing")
+    # DSR should fail (near-zero Sharpe can't beat the expected-max-Sharpe sr0 floor)
+    assert row["dsr"] < 0.95
+    assert row["proven"] is False
+
+
+def test_score_arms_strong_arm_passes_dsr(data_dir):
+    # High, consistent per-trade Sharpe: each trade +1.0 with tiny variance.
+    pnls = [1.0 + (i % 3) * 0.01 for i in range(35)]
+    _write_arm(data_dir, "swing_paper_state.json", pnls)
+    row = next(r for r in score_arms(data_dir) if r["name"] == "swing")
+    assert row["dsr"] > 0.95
+    assert row["proven"] is True

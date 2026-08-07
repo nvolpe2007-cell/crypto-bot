@@ -25,6 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.state import sanitize_for_json
+
 # Trading universe. BTC/ETH/SOL co-move ~0.8, so they are effectively ONE bet — too few
 # INDEPENDENT setups for the brain to build a track record (it needs ~30 closed trades for
 # the memory/calibration loop to mean anything, and was stuck flat on 3 correlated coins).
@@ -249,7 +251,7 @@ def _load_state() -> dict:
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
+    tmp.write_text(json.dumps(sanitize_for_json(state), indent=2))
     tmp.replace(STATE_FILE)
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -107,7 +108,17 @@ def _compute_state() -> Optional[MacroState]:
         return None
 
     corr_30 = float(gr.tail(30).corr(br.tail(30))) if n >= 10 else 0.0
+    if math.isnan(corr_30):
+        # Zero-variance window (e.g. a stale/flat price feed) makes Pearson
+        # correlation undefined. NaN must not leak into MacroState: callers
+        # compare btc_gold_corr_30d/corr_strength with `<`/`>=`, and those
+        # comparisons are always False against NaN — silently skipping the
+        # "no regime" early-return in probability_gate._contagion_edge
+        # instead of correctly reporting "no measurable correlation".
+        corr_30 = 0.0
     corr_60 = float(gr.tail(60).corr(br.tail(60))) if n >= 30 else corr_30
+    if math.isnan(corr_60):
+        corr_60 = 0.0
 
     gold_close = float(g_series.iloc[-1])
     gold_prev  = float(g_series.iloc[-2])

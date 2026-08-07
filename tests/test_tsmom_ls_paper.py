@@ -144,3 +144,33 @@ def test_funding_reduces_pnl(monkeypatch):
     # net should be price P&L minus the funding cost
     price_ret = (rec["exit"] - rec["entry"]) / rec["entry"] * rec["size_usd"]
     assert rec["pnl"] == pytest.approx(price_ret - rec["funding_cost"], abs=1e-6)
+
+
+# ── master kill switch: halts NEW entries/flips, never an existing close ─────
+
+def test_kill_switch_blocks_seed(monkeypatch):
+    monkeypatch.setattr(ls, "SMA_N", 3)
+    monkeypatch.setattr(ls, "_is_killed", lambda: True)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    bars = _bars([100, 100, 100, 80])            # below SMA -> would seed SHORT
+    acted = ls.process_symbol("BTC", bars, state)
+    assert acted == 0
+    assert "BTC" not in state["positions"]       # seed suppressed by kill switch
+
+
+def test_kill_switch_blocks_flip(monkeypatch):
+    monkeypatch.setattr(ls, "SMA_N", 3)
+    monkeypatch.setattr(ls, "TRADE_COST_FRAC", 0.0)
+    monkeypatch.setattr(ls, "FUNDING_APY", 0.0)
+    monkeypatch.setattr(ls, "TRADE_SIZE", 100.0)
+    closes = [100, 100, 100, 80, 200]            # seed SHORT @80, then >SMA -> flip
+    bars = _bars(closes)
+    state = {"positions": {}, "closed": [], "last_bar_t": {},
+             "starting_equity": 1000.0, "equity": 1000.0}
+    ls.process_symbol("BTC", bars[:4], state)    # seed short @80 (unkilled)
+    monkeypatch.setattr(ls, "_is_killed", lambda: True)
+    acted = ls.process_symbol("BTC", bars, state)  # would flip to long, but killed
+    assert acted == 0
+    assert len(state["closed"]) == 0             # the old short is held, not closed
+    assert state["positions"]["BTC"]["side"] == -1

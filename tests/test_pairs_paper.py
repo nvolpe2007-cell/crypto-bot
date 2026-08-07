@@ -121,3 +121,29 @@ def test_process_idempotent_same_bar(monkeypatch):
     pp.process(st, closes, prices, now)
     acted2 = pp.process(st, closes, prices, now)     # same bar again
     assert acted2 == 0                                # no double-open
+
+
+def test_kill_switch_blocks_new_open(monkeypatch):
+    monkeypatch.setattr(pp, "LOOKBACK", 20)
+    monkeypatch.setattr(pp, "ENTRY_Z", 2.0)
+    monkeypatch.setattr(pp, "LEG_NOTIONAL", 100.0)
+    monkeypatch.setattr(pp, "_is_killed", lambda: True)
+    st = _state()
+    ts = list(range(1, 25))
+    btc = {t: 100.0 for t in ts}; eth = {t: 100.0 for t in ts}; eth[24] = 80.0
+    now = datetime.now(timezone.utc)
+    acted = pp.process(st, {"BTC": btc, "ETH": eth, "SOL": {}},
+                       {"BTC": 100.0, "ETH": 80.0, "SOL": 50.0}, now)
+    assert acted == 0
+    assert "BTC-ETH" not in st["positions"]
+
+
+def test_kill_switch_does_not_block_exit(monkeypatch):
+    monkeypatch.setattr(pp, "LEG_NOTIONAL", 100.0)
+    monkeypatch.setattr(pp, "COST_FRAC", 0.0)
+    monkeypatch.setattr(pp, "FUNDING_APY", 0.0)
+    monkeypatch.setattr(pp, "_is_killed", lambda: True)
+    st = _state()
+    pp._open(st, ("BTC", "ETH"), z=2.5, prices={"BTC": 100.0, "ETH": 100.0}, ts="0")
+    rec = pp._close(st, "BTC-ETH", {"BTC": 95.0, "ETH": 105.0}, "3600", "converged")
+    assert rec["pnl"] == pytest.approx(10.0)         # _close itself is never gated

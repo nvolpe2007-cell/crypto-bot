@@ -318,6 +318,90 @@ def test_all_weather_backtest_runs():
     backtest_all._selftest()  # raises AssertionError on any regression
 
 
+def test_backtest_selftest():
+    # synthetic extreme-funding short into a clean down-move nets positive
+    from src.altperp import backtest
+    backtest._selftest()  # raises AssertionError on any regression
+
+
+def test_confluence_selftest():
+    # tier1/tier2 sizing, trend filter, post-funding block, flush-long gating
+    from src.altperp import confluence
+    confluence._selftest()  # raises AssertionError on any regression
+
+
+def test_database_selftest():
+    # signal log + trade open/close round-trip through sqlite
+    from src.altperp import database as altperp_database
+    altperp_database._selftest()  # raises AssertionError on any regression
+
+
+def test_exits_selftest():
+    # hard stop, TP1/TP3, funding stop, trailing, time stop for both directions
+    from src.altperp import exits
+    exits._selftest()  # raises AssertionError on any regression
+
+
+def test_math_utils_selftest():
+    # CVD-from-trades, pct_change, funding/volume spike thresholds
+    from src.altperp import math_utils
+    math_utils._selftest()  # raises AssertionError on any regression
+
+
+def test_mean_reversion_selftest():
+    # mr_long/mr_short trigger on dips/spikes away from the mean, flat → no trade
+    from src.altperp import mean_reversion
+    mean_reversion._selftest()  # raises AssertionError on any regression
+
+
+def test_orders_selftest():
+    # paper fills apply slippage correctly; LIVE execution must raise, never silently fire
+    from src.altperp import orders
+    orders._selftest()  # raises AssertionError on any regression
+
+
+def test_position_sizing_selftest():
+    # risk-based notional/leverage sizing, including the leverage-cap clamp
+    from src.altperp import position_sizing
+    position_sizing._selftest()  # raises AssertionError on any regression
+
+
+def test_regime_selftest():
+    # trending/calm/ranging/volatile/crash classification on synthetic bars
+    from src.altperp import regime
+    regime._selftest()  # raises AssertionError on any regression
+
+
+def test_router_selftest():
+    # regime → strategy routing, including flat-on-no-signal and unbuilt-strategy cases
+    from src.altperp import router
+    router._selftest()  # raises AssertionError on any regression
+
+
+def test_signals_selftest():
+    # funding/OI/CVD/liquidity/trend/funding-dynamics signal extraction
+    from src.altperp import signals
+    signals._selftest()  # raises AssertionError on any regression
+
+
+def test_telegram_selftest():
+    # AltperpAlerter message formatting with no notifier (logs instead of sending)
+    from src.altperp import telegram
+    telegram._selftest()  # raises AssertionError on any regression
+
+
+def test_time_utils_selftest():
+    # minutes-to-funding-reset, pre/post-funding window boundaries
+    from src.altperp import time_utils
+    time_utils._selftest()  # raises AssertionError on any regression
+
+
+def test_trend_selftest():
+    # breakout-on-uptrend entry; flat tape stays flat
+    from src.altperp import trend
+    trend._selftest()  # raises AssertionError on any regression
+
+
 def test_circuit_breaker_daily_drawdown(tmp_path):
     pm, _ = _pm(tmp_path)
     pm.equity = 940.0  # -6% vs day_start 1000

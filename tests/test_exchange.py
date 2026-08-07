@@ -58,6 +58,7 @@ def _make_conn() -> ExchangeConnection:
     conn.exchange.fetch_balance = AsyncMock(return_value={})
     conn.exchange.create_order = AsyncMock(return_value={})
     conn.exchange.cancel_order = AsyncMock(return_value={})
+    conn.exchange.fetch_order = AsyncMock(return_value={})
     conn.exchange.fetch_open_orders = AsyncMock(return_value=[])
     conn.exchange.fetch_trades = AsyncMock(return_value=[])
     conn.exchange.fetch_positions = AsyncMock(return_value=[])
@@ -415,6 +416,70 @@ class TestGetPositions:
         conn.exchange.fetch_positions = AsyncMock(return_value=[])
         await conn.get_positions(['BTC/USD', 'ETH/USD'])
         conn.exchange.fetch_positions.assert_called_once_with(['BTC/USD', 'ETH/USD'])
+
+
+# ── fetch_order ────────────────────────────────────────────────────────────────────────
+
+class TestFetchOrder:
+    async def test_returns_order_on_success(self):
+        conn = _make_conn()
+        order = {'id': 'abc123', 'status': 'closed', 'average': 50_000.0}
+        conn.exchange.fetch_order = AsyncMock(return_value=order)
+        result = await conn.fetch_order('abc123', 'BTC/USD')
+        assert result == order
+
+    async def test_passes_order_id_and_symbol(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order = AsyncMock(return_value={'id': 'xyz', 'status': 'closed'})
+        await conn.fetch_order('xyz', 'ETH/USD')
+        conn.exchange.fetch_order.assert_called_once_with('xyz', 'ETH/USD')
+
+    async def test_retries_on_network_error(self):
+        conn = _make_conn()
+        conn.exchange.fetch_order = AsyncMock(
+            side_effect=[ccxt.NetworkError("blip"), {'id': 'o', 'status': 'closed'}]
+        )
+        result = await conn.fetch_order('o', 'BTC/USD', retries=3)
+        assert result['status'] == 'closed'
+        assert conn.exchange.fetch_order.call_count == 2
+
+    async def test_raises_after_all_retries_exhausted(self):
+        """Callers must treat an unverifiable order as unconfirmed — so we raise
+        rather than returning a fake 'unknown' result."""
+        conn = _make_conn()
+        conn.exchange.fetch_order = AsyncMock(
+            side_effect=ccxt.NetworkError("persistent failure")
+        )
+        with pytest.raises(ccxt.NetworkError):
+            await conn.fetch_order('o', 'BTC/USD', retries=2)
+        assert conn.exchange.fetch_order.call_count == 2
+
+    async def test_uses_order_circuit_not_generic(self):
+        """fetch_order is an order-management call: it must share _order_circuit
+        with cancel_order/get_open_orders so a data outage cannot block it,
+        and order failures do not contaminate the data circuit."""
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_order = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        conn._order_circuit.record_failure()
+        with pytest.raises(CircuitBreakerOpen):
+            await conn.fetch_order('o', 'BTC/USD')
+        conn.exchange.fetch_order.assert_not_called()
+
+    async def test_failure_does_not_trip_generic_circuit(self):
+        """A fetch_order failure must increment _order_circuit, not _circuit."""
+        conn = _make_conn()
+        conn._order_circuit = CircuitBreaker(threshold=1, cooldown_seconds=60.0)
+        conn.exchange.fetch_order = AsyncMock(
+            side_effect=ccxt.NetworkError("unreachable")
+        )
+        with pytest.raises(ccxt.NetworkError):
+            await conn.fetch_order('o', 'BTC/USD', retries=1)
+        assert conn._order_circuit.is_open
+        assert not conn._circuit.is_open
+        assert not conn._data_circuit.is_open
 
 
 # ── create_order — no retry ──────────────────────────────────────────────────────────────
