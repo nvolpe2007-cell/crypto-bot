@@ -192,6 +192,10 @@ def _delta_node(rows: list) -> dict:
         "liq": _f(r.get("reserve_usd")),
         "buys": r.get("buys_h24"),
         "sells": r.get("sells_h24"),
+        # Unique wallets: the cohort records these natively, so the v2 trigger
+        # can be evaluated here with no enrichment call.
+        "buyers": r.get("buyers_h24"),
+        "sellers": r.get("sellers_h24"),
         "price": _f(r.get("price_usd")),
     } for r in rows]}
 
@@ -221,7 +225,8 @@ def save_book(doc: dict) -> None:
 
 
 def open_position(book: dict, pool: str, arm: str, rec: _Rec, screen: dict,
-                  trigger: str, now_ms: int) -> dict | None:
+                  trigger: str, now_ms: int,
+                  v1_fired: bool = False, v2_fired: bool = False) -> dict | None:
     if pool in book["positions"]:
         return None
     price = rec.price_usd
@@ -240,6 +245,12 @@ def open_position(book: dict, pool: str, arm: str, rec: _Rec, screen: dict,
         # not silently dropped -- dropping these is what flatters a control arm.
         "tradeable": total_pct is not None,
         "trigger": trigger,
+        # Both delta variants recorded on EVERY position, independent of arm.
+        # Arm assignment is untouched so the pre-registered comparisons stay
+        # valid; v1-vs-v2 is then a declared slice of the same data rather than
+        # a fourth arm competing for the same pools.
+        "delta_v1_fired": bool(v1_fired),
+        "delta_v2_fired": bool(v2_fired),
         "status": "open",
         "mfe_pct": 0.0, "mae_pct": 0.0,
         "marks": 0,
@@ -324,20 +335,23 @@ def tick(book: dict, verbose: bool = False) -> dict:
         stats["evaluated"] += 1
 
         passed_gates = screen.get("verdict") == "PASS"
-        delta = meme_radar.evaluate_delta(_delta_node(rows))
+        node = _delta_node(rows)
+        delta = meme_radar.evaluate_delta(node)              # v1: trade counts
+        delta2 = meme_radar.evaluate_delta_buyers(node)      # v2: unique buyers
+        v1, v2 = bool(delta["fired"]), bool(delta2["fired"])
 
-        if passed_gates and delta["fired"]:
+        if passed_gates and v1:
             if open_position(book, pool, "pass", rec, screen,
-                             delta["trigger"], now):
+                             delta["trigger"], now, v1, v2):
                 stats["opened_pass"] += 1
         elif passed_gates:
             if open_position(book, pool, "gates", rec, screen,
-                             "gates only", now):
+                             "gates only", now, v1, v2):
                 stats["opened_gates"] += 1
         elif _in_control_sample(pool):
             if open_position(book, pool, "control", rec, screen,
                              "REJECT: " + "; ".join(
-                                 screen.get("reasons") or [])[:80], now):
+                                 screen.get("reasons") or [])[:80], now, v1, v2):
                 stats["opened_control"] += 1
 
     return stats

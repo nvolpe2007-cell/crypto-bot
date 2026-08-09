@@ -70,6 +70,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -292,6 +293,155 @@ def evaluate_delta(node: dict) -> dict:
     return out
 
 
+# ── delta v2: unique buyers instead of trade counts ───────────────────────────
+#
+# v1 above measures TRADE COUNT acceleration. That number is trivially inflated:
+# one wallet trading against itself produces unlimited "acceleration" at the cost
+# of gas. Measured on the cohort 2026-08-09, the p90 pool ran 5.7 trades per
+# unique wallet and 3.5% ran over 10x -- so the failure mode is not theoretical.
+#
+# v2 replaces it with growth in the count of DISTINCT BUYING WALLETS. Faking that
+# requires funding and operating n separate wallets rather than looping one, which
+# is a real cost that scales with the size of the lie.
+#
+# v1 is deliberately left intact and unmodified: scripts/meme_paper.py runs a
+# pre-registered experiment against it (RESEARCH_2026-08-09_meme_filter_test.md),
+# and silently redefining the thing under test would invalidate the very test
+# meant to judge this change. Both run side by side until that read-out.
+
+BUYER_GROWTH_MIN = 0.40     # +40% more distinct buyers across the window
+MIN_BUYERS_ABS = 8          # below this, "growth" is 2 wallets becoming 3
+
+
+def evaluate_delta_buyers(node: dict) -> dict:
+    """Delta on UNIQUE BUYER growth. Same contract as evaluate_delta().
+
+    Requires unique-wallet counts in the poll history (`buyers`/`sellers`), which
+    DexScreener does not publish -- the radar enriches candidates from
+    GeckoTerminal before calling this. When those fields are absent it reports
+    that plainly and does not fire, rather than silently falling back to the
+    trade-count logic it exists to replace.
+    """
+    out = {"fired": False, "trigger": "", "span_min": 0.0, "liq_growth": None,
+           "buyer_growth": None, "buyers_now": None, "buy_share": None,
+           "why": []}
+
+    polls = [p for p in (node.get("polls") or []) if isinstance(p, dict)]
+    if len(polls) < 2:
+        out["why"].append("only %d poll(s): nothing to compare yet" % len(polls))
+        return out
+
+    span_min = (polls[-1]["ms"] - polls[0]["ms"]) / 60_000.0
+    out["span_min"] = span_min
+    if span_min < MIN_SPAN_MIN:
+        out["why"].append("observed %.1f min < %.0f min minimum span"
+                          % (span_min, MIN_SPAN_MIN))
+        return out
+
+    with_buyers = [p for p in polls if p.get("buyers") is not None]
+    if len(with_buyers) < 2:
+        out["why"].append("no unique-wallet history (%d/%d polls enriched)"
+                          % (len(with_buyers), len(polls)))
+        return out
+
+    b0 = _f(with_buyers[0].get("buyers"))
+    b1 = _f(with_buyers[-1].get("buyers"))
+    out["buyers_now"] = b1
+    if b0 is not None and b1 is not None and b0 > 0:
+        out["buyer_growth"] = b1 / b0 - 1.0
+
+    liq0, liq1 = _f(polls[0].get("liq")), _f(polls[-1].get("liq"))
+    if liq0 and liq0 > 0 and liq1 is not None:
+        out["liq_growth"] = liq1 / liq0 - 1.0
+
+    s0 = _f(with_buyers[0].get("sellers")) or 0.0
+    s1 = _f(with_buyers[-1].get("sellers")) or 0.0
+    d_buy = max((b1 or 0.0) - (b0 or 0.0), 0.0)
+    d_sell = max(s1 - s0, 0.0)
+    if d_buy + d_sell > 0:
+        out["buy_share"] = d_buy / (d_buy + d_sell)
+
+    # An absolute floor as well as a rate. Going from 2 distinct buyers to 3 is
+    # +50% and means nothing; the rate alone would fire constantly on dust.
+    if b1 is not None and b1 < MIN_BUYERS_ABS:
+        out["why"].append("only %.0f distinct buyers (need %d) -- too few for a "
+                          "growth rate to mean anything" % (b1, MIN_BUYERS_ABS))
+        return out
+
+    buyers_ok = out["buyer_growth"] is not None and \
+        out["buyer_growth"] >= BUYER_GROWTH_MIN
+    liq_ok = out["liq_growth"] is not None and out["liq_growth"] >= LIQ_GROWTH_MIN
+    share_ok = out["buy_share"] is None or out["buy_share"] >= BUY_SHARE_MIN
+
+    if not (buyers_ok or liq_ok):
+        out["why"].append(
+            "no delta: distinct buyers %s (need +%.0f%%), liquidity %s (need +%.0f%%)"
+            % ("n/a" if out["buyer_growth"] is None
+               else "%+.0f%%" % (out["buyer_growth"] * 100), BUYER_GROWTH_MIN * 100,
+               "n/a" if out["liq_growth"] is None
+               else "%+.0f%%" % (out["liq_growth"] * 100), LIQ_GROWTH_MIN * 100))
+        return out
+
+    if not share_ok:
+        out["why"].append(
+            "net SELLER flow: only %.0f%% of new distinct wallets were buyers "
+            "(need %.0f%%)" % (out["buy_share"] * 100, BUY_SHARE_MIN * 100))
+        return out
+
+    parts = []
+    if buyers_ok:
+        parts.append("distinct buyers +%.0f%% to %.0f in %.0f min"
+                     % (out["buyer_growth"] * 100, b1, span_min))
+    if liq_ok:
+        parts.append("liquidity +%.0f%%" % (out["liq_growth"] * 100))
+    out["trigger"] = ", ".join(parts)
+    out["fired"] = True
+    return out
+
+
+# ── GeckoTerminal enrichment (unique wallets) ─────────────────────────────────
+
+_GT_MULTI = ("https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/%s")
+_GT_BATCH = 30
+
+
+def fetch_unique_wallets(pair_addresses: list) -> dict:
+    """{pair_address: {"buyers": n, "sellers": n}} from GeckoTerminal.
+
+    DexScreener publishes trade counts but not distinct-wallet counts, and its
+    `pairAddress` is the same AMM pool address GeckoTerminal keys on (verified
+    2026-08-09), so the two join directly with no mapping table.
+
+    Only gate-passing candidates are enriched -- typically a couple per tick --
+    so this adds about one call per radar tick on top of the cohort collector.
+    Failures return an empty dict: no unique-wallet data means v2 does not fire,
+    which is the correct conservative outcome, not a fallback to v1.
+    """
+    out: dict = {}
+    addrs = [a for a in dict.fromkeys(pair_addresses) if a]
+    for i in range(0, len(addrs), _GT_BATCH):
+        batch = addrs[i:i + _GT_BATCH]
+        try:
+            req = urllib.request.Request(
+                _GT_MULTI % ",".join(batch),
+                headers={"User-Agent": "crypto-bot-radar/1.0",
+                         "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as fh:
+                payload = json.load(fh)
+        except Exception as exc:
+            _say("  unique-wallet enrichment failed (%s) -- v2 will not fire "
+                 "this tick" % type(exc).__name__)
+            continue
+        for item in (payload.get("data") or []):
+            attrs = item.get("attributes") or {}
+            addr = attrs.get("address")
+            h24 = ((attrs.get("transactions") or {}).get("h24") or {})
+            if addr and ("buyers" in h24 or "sellers" in h24):
+                out[addr] = {"buyers": h24.get("buyers"),
+                             "sellers": h24.get("sellers")}
+    return out
+
+
 # ── telegram ──────────────────────────────────────────────────────────────────
 
 
@@ -505,6 +655,10 @@ def scan(args) -> int:
              "callouts will be recorded to the ledger but not sent.")
 
     scanned = passed = fired = sent = 0
+    # Pass 1 -- observe and screen everything, collecting the gate-passers.
+    # Enrichment is batched, so it cannot happen inline: one GeckoTerminal call
+    # covers up to 30 candidates, versus one call each if done in the loop.
+    candidates: list = []
     for rec in records:
         scanned += 1
         node = _observe(state, rec, now)
@@ -526,8 +680,25 @@ def scan(args) -> int:
                                              "; ".join(screen.get("reasons") or [])[:100]))
             continue
         passed += 1
+        candidates.append((rec, screen, node))
 
-        delta = evaluate_delta(node)
+    # Enrich only the survivors with unique-wallet counts, then patch this tick's
+    # poll so the history accumulates across runs.
+    if candidates:
+        wallets = fetch_unique_wallets(
+            [str(getattr(r, "pair_address", "") or "") for r, _, _ in candidates])
+        for rec, _, node in candidates:
+            w = wallets.get(str(getattr(rec, "pair_address", "") or ""))
+            if w and node.get("polls"):
+                node["polls"][-1]["buyers"] = w.get("buyers")
+                node["polls"][-1]["sellers"] = w.get("sellers")
+        if args.verbose:
+            _say("  enriched %d/%d candidate(s) with unique-wallet counts"
+                 % (len(wallets), len(candidates)))
+
+    # Pass 2 -- the delta decision, on unique buyers.
+    for rec, screen, node in candidates:
+        delta = evaluate_delta_buyers(node)
         if not delta["fired"]:
             if args.verbose:
                 _say("  %-12s PASS but quiet: %s"

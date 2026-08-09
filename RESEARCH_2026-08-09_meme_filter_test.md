@@ -109,6 +109,50 @@ research instrument and nothing is traded.
 - Reporting the mean when the median disagrees with it.
 - Quietly excluding untradeable control positions from the headline.
 
+---
+
+## Amendment 1 — 2026-08-09, same day, before any arm reached n=1
+
+**Change:** the live radar's delta trigger was switched from trade-count
+acceleration (v1) to unique-buyer growth (v2). Every paper position now records
+`delta_v1_fired` and `delta_v2_fired` as flags.
+
+**Why this does not invalidate the registration.** Arm assignment is unchanged —
+`pass` is still "cleared the gates AND **v1** fired". The three pre-registered
+comparisons therefore run on exactly the population they were registered
+against. v2 is recorded as metadata, not as a competing arm, so it does not
+change which pools land where and does not alter any threshold, the hold period,
+or the control rate.
+
+**Why v2 was adopted in the live radar without waiting for the read-out.** v1
+measures trade counts, which one wallet can inflate arbitrarily for the price of
+gas. This is not hypothetical: on the cohort, the p90 pool ran 5.7 trades per
+unique wallet and 3.5% ran above 10x. A constructed wash pattern — trades
+accelerating while distinct buyers stay flat — fires v1 and is correctly refused
+by v2. That is a defect fix, not an edge claim. **v2 being harder to fake is not
+evidence it selects better, and that claim is what the test below settles.**
+
+**Added comparison, declared now:**
+
+4. **v2 vs v1, within gate-passing positions only.** Among positions in the
+   `pass` + `gates` arms, compare median net return for `delta_v2_fired=True`
+   against `delta_v1_fired=True`. Requires n>=30 in each group.
+   - v2 is kept in the radar if its median net is **>= v1's minus 5 pts**
+     (i.e. it is not materially worse). The bar is deliberately asymmetric: v2's
+     justification is manipulation-resistance, so it earns its place by not
+     being worse, and only claims superiority if it beats v1 by >5 pts.
+   - If v2 is materially worse (>5 pts below v1), the radar reverts to v1 and the
+     wash-resistance argument is recorded as a loss — resistance to a
+     manipulation that turns out not to matter is not worth a worse signal.
+
+**Cost of the change:** v2 needs unique-wallet counts, which DexScreener does not
+publish. The radar now enriches gate-passing candidates only (typically ~2 per
+tick) from GeckoTerminal, whose pool address is the same as DexScreener's
+`pairAddress` — verified 2026-08-09. Roughly one extra API call per tick. When
+enrichment fails, v2 does not fire; it never silently falls back to v1.
+
+---
+
 ## Result
 
 *(to be completed at read-out — leave blank until then)*
