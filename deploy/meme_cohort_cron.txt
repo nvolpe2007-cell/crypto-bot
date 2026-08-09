@@ -1,0 +1,58 @@
+# Meme cohort collector — cron entries.
+#
+# Install alongside the existing trade_close_notifier / meme_radar entries.
+# This is a RESEARCH DATA LAYER, not a trading arm: it sends no Telegram alerts,
+# opens no positions, and makes no decisions. It only writes files.
+#
+# ── CADENCE, AND WHY THESE NUMBERS ───────────────────────────────────────────
+# Measured 2026-08-09 on the free GeckoTerminal tier:
+#   * Solana new-pool rate visible via the API: ~4 pools/min
+#   * new_pools returns 20 per page, so 5 pages = 100 pools = ~25 min of launches
+#   * a 429 arrives after ~3-4 unspaced calls; the collector self-throttles to
+#     ~20 calls/min with exponential backoff
+#   * median discovery lag achieved: ~98s from pool birth (p90 ~194s)
+#
+# The 10-minute discover interval with --pages 5 therefore carries ~2.5x
+# headroom over the observed launch rate. That headroom is not decoration: if
+# the feed ever rolls past us between polls, launches are missed silently, and
+# overflow clusters in launch-rate SPIKES — the exact periods a study of manias
+# would care about most.
+#
+# You do not have to trust the headroom, because it is measured. Run:
+#     python scripts/meme_cohort.py status
+# and read the "discover polls / overflowed" line. If the overflow rate climbs
+# above a few percent, raise --pages or shorten the interval.
+
+*/10 * * * * cd /opt/crypto-bot && ./venv/bin/python scripts/meme_cohort.py tick --pages 5 --budget 16 >> logs/meme_cohort.log 2>&1
+
+# OHLCV backfill — the expensive mode (one call per pool, ~180 bars each).
+# Runs hourly on a small budget so it fills in the background without
+# competing with the tick for rate limit. Prioritises pools already marked
+# `gone`, because their candle history stops being fetchable once the indexer
+# drops them — that data is perishable in a way the live pools' is not.
+17 * * * * cd /opt/crypto-bot && ./venv/bin/python scripts/meme_cohort.py backfill-ohlcv --budget 12 >> logs/meme_cohort.log 2>&1
+
+# ── GROWTH, AND WHEN THIS OUTGROWS THE FREE TIER ─────────────────────────────
+# At ~4 pools/min the registry gains ~5,800 pools/day. The age tiers keep the
+# refresh cost sub-linear (young pools every 15 min, everything past a week only
+# daily), but the daily bucket still grows without bound: expect roughly
+#   week 1   ~12 calls/min   comfortable
+#   month 1  ~15 calls/min   tight against the 20/min self-throttle
+#   month 3+ over budget
+#
+# It degrades safely rather than breaking. --budget caps calls per tick, and
+# selection is youngest-first, so when the budget binds it is always the OLDEST
+# pools that get skipped — never the newborns, where the mortality and the price
+# action live. Nothing is lost from the registry; those pools simply get sampled
+# less often.
+#
+# When month-3 arrives, the options in order of preference:
+#   1. lengthen the >7d tier from daily to every few days (edit TIERS)
+#   2. raise CALLS_PER_MIN toward the documented 30/min ceiling
+#   3. pay for an RPC/indexer tier — but only once the cohort has proved it is
+#      answering a question worth paying for
+#
+# ── DISK ─────────────────────────────────────────────────────────────────────
+# ~600 bytes per snapshot line; low GBs per year with tiering. snapshots-*.jsonl
+# are append-only daily files, safe to gzip once a day is complete — nothing
+# reads them back except studies you run deliberately.

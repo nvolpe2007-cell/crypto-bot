@@ -1,0 +1,50 @@
+# Meme radar + callout scorecard — cron entries.
+#
+# Install alongside the existing trade_close_notifier_cron.txt entry. Same shape:
+# source .env, use the venv python, append to a per-job log.
+#
+# WHAT EACH LINE DOES
+# -------------------
+# 1. RADAR (every 5 min). Polls the DexScreener boosted feed, accumulates the
+#    per-token history that makes delta detection possible, and fires a Telegram
+#    callout when a token both clears the risk gates AND shows liquidity/trade
+#    acceleration. A token is never alerted on its first sighting — the radar
+#    needs at least ~12 minutes of observation before any delta is trusted, so
+#    the 5-minute cadence is what makes the signal exist at all. Do not stretch
+#    it past ~10 min or the acceleration measurement loses its resolution.
+#
+#    Source is `boosted` rather than `new`: measured on 2026-08-08, 0 of 12 from
+#    the `new` feed cleared the gates (all sub-48h, sub-$50k liquidity, or
+#    pump.fun bonding curves with no modellable exit) while 2 of 20 boosted did.
+#    Note that `boosted` means somebody PAID for the placement — the screener
+#    treats that as a risk flag, not an endorsement, and it shows up in the
+#    alert's flag list.
+#
+# 2. MARKS (every 15 min). Updates forward marks on already-called tokens
+#    without scanning for new ones. Runs on its own tick so a 1h/4h/24h/72h
+#    horizon is hit close to on time even if the radar tick errors out.
+#
+# 3. DIGEST (daily, 09:00 UTC). Pushes the scorecard to Telegram: hit rate,
+#    median net return, and what taking every callout would have done in
+#    dollars. This is the line that tells you whether to keep the other two.
+#
+# 4. INGEST (every 30 min, OPTIONAL — commented out). Reads the alpha channels
+#    listed in TELEGRAM_INGEST_CHANNELS and scores who is actually early.
+#    Requires a one-time interactive login first:
+#        python scripts/telegram_ingest.py --login
+#    Leave it commented until that session file exists, or every tick will fail.
+
+*/5 * * * * cd /opt/crypto-bot && set -a && . ./.env && set +a && ./venv/bin/python scripts/meme_radar.py --ticket 100 --source boosted --limit 30 >> logs/meme_radar.log 2>&1
+
+*/15 * * * * cd /opt/crypto-bot && set -a && . ./.env && set +a && ./venv/bin/python scripts/meme_radar.py --marks-only >> logs/meme_radar.log 2>&1
+
+0 9 * * * cd /opt/crypto-bot && set -a && . ./.env && set +a && ./venv/bin/python scripts/callout_scorecard.py --horizon 24 --callers --telegram >> logs/callout_scorecard.log 2>&1
+
+# */30 * * * * cd /opt/crypto-bot && set -a && . ./.env && set +a && ./venv/bin/python scripts/telegram_ingest.py --lookback-h 1 --ticket 100 --early-window 2 >> logs/telegram_ingest.log 2>&1
+
+# ── TURNING IT OFF ────────────────────────────────────────────────────────────
+# The radar posts through the same TelegramNotifier as everything else, so
+# CRYPTO_TELEGRAM_MUTE=1 silences it along with every other crypto alert while
+# leaving the ledger accruing. To mute ONLY the radar, comment line 1 and keep
+# line 2 — marks keep updating, so the scorecard stays honest, and you just stop
+# getting pinged.

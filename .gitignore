@@ -22,3 +22,11 @@ archive/
 _swing_1y.jsonl
 _mr_test.jsonl
 .coverage
+
+# Telethon user session for scripts/telegram_ingest.py. Already covered by the
+# data/ rule above; listed explicitly because this file IS a live credential —
+# anyone holding it can read Telegram as you, with no password or 2FA prompt.
+# It must never be committed, even if data/ is ever un-ignored.
+*.session
+*.session-journal
+data/tg_ingest.session
