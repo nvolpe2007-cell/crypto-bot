@@ -401,44 +401,99 @@ def evaluate_delta_buyers(node: dict) -> dict:
 
 # ── GeckoTerminal enrichment (unique wallets) ─────────────────────────────────
 
-_GT_MULTI = ("https://api.geckoterminal.com/api/v2/networks/solana/pools/multi/%s")
+_GT_MULTI = "https://api.geckoterminal.com/api/v2/networks/%s/pools/multi/%s"
 _GT_BATCH = 30
 
+# DexScreener chainId -> GeckoTerminal network id. The two services do NOT use
+# the same identifiers, and the endpoint is network-scoped: querying a BSC pool
+# under /networks/solana/ returns an empty result set, not an error.
+#
+# Getting this wrong is silent and severe. The first version of this function
+# hardcoded "solana", so every non-Solana candidate failed enrichment, never
+# accumulated unique-wallet history, and could never fire v2 -- which would have
+# meant the radar quietly filtering on "is this token on Solana" rather than on
+# anything about the token. Measured on the boosted feed 2026-08-09: gate-passers
+# were 1 Solana + 1 BSC, so half the candidates were affected.
+_GT_NETWORK = {
+    "solana": "solana",
+    "ethereum": "eth",
+    "bsc": "bsc",
+    "base": "base",
+    "polygon": "polygon_pos",
+    "arbitrum": "arbitrum",
+    "avalanche": "avax",
+    "optimism": "optimism",
+    "blast": "blast",
+    "ton": "ton",
+    "tron": "tron",
+    "sui": "sui-network",
+    "abstract": "abstract",
+    "berachain": "berachain",
+    "hyperevm": "hyperevm",
+}
 
-def fetch_unique_wallets(pair_addresses: list) -> dict:
+
+def fetch_unique_wallets(candidates: list) -> dict:
     """{pair_address: {"buyers": n, "sellers": n}} from GeckoTerminal.
 
-    DexScreener publishes trade counts but not distinct-wallet counts, and its
-    `pairAddress` is the same AMM pool address GeckoTerminal keys on (verified
-    2026-08-09), so the two join directly with no mapping table.
+    `candidates` is a list of (chain, pair_address) pairs. DexScreener publishes
+    trade counts but not distinct-wallet counts, and its `pairAddress` is the
+    same AMM pool address GeckoTerminal keys on (verified 2026-08-09) -- but the
+    lookup is network-scoped, so the chain has to travel with the address.
 
-    Only gate-passing candidates are enriched -- typically a couple per tick --
-    so this adds about one call per radar tick on top of the cohort collector.
-    Failures return an empty dict: no unique-wallet data means v2 does not fire,
-    which is the correct conservative outcome, not a fallback to v1.
+    Only gate-passing candidates are enriched (typically a couple per tick), so
+    this costs about one call per chain represented, not per token. Failures
+    return nothing for the affected pools: no unique-wallet data means v2 does
+    not fire, which is the correct conservative outcome and deliberately NOT a
+    fallback to v1 -- falling back would reinstate the trade-count logic v2
+    exists to replace, at exactly the moment we cannot verify it.
     """
     out: dict = {}
-    addrs = [a for a in dict.fromkeys(pair_addresses) if a]
-    for i in range(0, len(addrs), _GT_BATCH):
-        batch = addrs[i:i + _GT_BATCH]
-        try:
-            req = urllib.request.Request(
-                _GT_MULTI % ",".join(batch),
-                headers={"User-Agent": "crypto-bot-radar/1.0",
-                         "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as fh:
-                payload = json.load(fh)
-        except Exception as exc:
-            _say("  unique-wallet enrichment failed (%s) -- v2 will not fire "
-                 "this tick" % type(exc).__name__)
+    by_net: dict[str, list] = {}
+    unmapped: set = set()
+    for chain, addr in candidates:
+        if not addr:
             continue
-        for item in (payload.get("data") or []):
-            attrs = item.get("attributes") or {}
-            addr = attrs.get("address")
-            h24 = ((attrs.get("transactions") or {}).get("h24") or {})
-            if addr and ("buyers" in h24 or "sellers" in h24):
-                out[addr] = {"buyers": h24.get("buyers"),
-                             "sellers": h24.get("sellers")}
+        net = _GT_NETWORK.get(str(chain or "").lower())
+        if net is None:
+            unmapped.add(str(chain or "?"))
+            continue
+        by_net.setdefault(net, []).append(str(addr))
+
+    if unmapped:
+        _say("  no GeckoTerminal network mapping for: %s -- those candidates "
+             "cannot be enriched and will not fire v2"
+             % ", ".join(sorted(unmapped)))
+
+    for net, addrs in by_net.items():
+        addrs = list(dict.fromkeys(addrs))
+        for i in range(0, len(addrs), _GT_BATCH):
+            batch = addrs[i:i + _GT_BATCH]
+            try:
+                req = urllib.request.Request(
+                    _GT_MULTI % (net, ",".join(batch)),
+                    headers={"User-Agent": "crypto-bot-radar/1.0",
+                             "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=20) as fh:
+                    payload = json.load(fh)
+            except Exception as exc:
+                _say("  unique-wallet enrichment failed on %s (%s) -- v2 will "
+                     "not fire for those this tick" % (net, type(exc).__name__))
+                continue
+            for item in (payload.get("data") or []):
+                attrs = item.get("attributes") or {}
+                addr = attrs.get("address")
+                h24 = ((attrs.get("transactions") or {}).get("h24") or {})
+                if addr and ("buyers" in h24 or "sellers" in h24):
+                    # Keyed lowercase. DexScreener returns EVM addresses
+                    # checksummed (0x630B9C...) and GeckoTerminal returns them
+                    # lowercased (0x630b9c...), so an exact-match lookup silently
+                    # misses EVERY EVM pool even when the fetch succeeded.
+                    # Solana addresses are base58 and case-significant, but
+                    # lowercasing both sides of the comparison is still safe:
+                    # the same string maps to the same key on both sides.
+                    out[str(addr).lower()] = {"buyers": h24.get("buyers"),
+                                              "sellers": h24.get("sellers")}
     return out
 
 
@@ -686,9 +741,10 @@ def scan(args) -> int:
     # poll so the history accumulates across runs.
     if candidates:
         wallets = fetch_unique_wallets(
-            [str(getattr(r, "pair_address", "") or "") for r, _, _ in candidates])
+            [(str(getattr(r, "chain", "") or ""),
+              str(getattr(r, "pair_address", "") or "")) for r, _, _ in candidates])
         for rec, _, node in candidates:
-            w = wallets.get(str(getattr(rec, "pair_address", "") or ""))
+            w = wallets.get(str(getattr(rec, "pair_address", "") or "").lower())
             if w and node.get("polls"):
                 node["polls"][-1]["buyers"] = w.get("buyers")
                 node["polls"][-1]["sellers"] = w.get("sellers")
