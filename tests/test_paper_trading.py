@@ -17,7 +17,11 @@ Covers:
 
 import pytest
 from datetime import datetime
-from src.paper_trading import PaperTrader, PaperPosition, _SubsystemFailureTracker
+from src.indicators import Signal
+from src.scientific_strategy import ScientificSignal
+from src.paper_trading import (
+    PaperTrader, PaperPosition, _SubsystemFailureTracker, _resolve_dual_direction,
+)
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -694,3 +698,87 @@ class TestSubsystemFailureTracker:
         # Both can alert again on a fresh failure streak
         assert t.record_failure("BTC/USD") is False   # only 1 failure so far
         assert t.record_failure("ETH/USD") is False
+
+
+# ── _resolve_dual_direction ─────────────────────────────────────────────────
+#
+# ScientificSignal.is_buy/is_sell are read-only properties derived from
+# .signal + .size_mult. The dual-direction probe used to assign straight to
+# sig.is_buy/sig.is_sell, which raised AttributeError (no setter) — silently
+# swallowed by the caller's broad except-Exception, so the flip/reject
+# verdict was logged but never actually applied. _resolve_dual_direction
+# fixes this by mutating sig.signal (a real field) instead.
+
+def _sci_signal(signal: Signal, size_mult: float = 1.0) -> ScientificSignal:
+    return ScientificSignal(
+        signal=signal, confidence=80.0, size_mult=size_mult,
+        ofi_score=0.0, lead_lag_score=0.0, regime_score=0.0,
+        rsi_score=0.0, technical_score=0.0, funding_score=0.0,
+        ofi=None, lead_lag_dir=None, regime='RANGING',
+        rsi=50.0, adx=20.0, atr=1.0, close=100.0,
+        ema_fast=100.0, ema_slow=100.0, volume_ratio=1.0, funding_rate=None,
+    )
+
+
+class TestResolveDualDirection:
+    def test_opposite_direction_clearly_wins_flips_buy_to_sell(self):
+        sig = _sci_signal(Signal.BUY)
+        verdict = _resolve_dual_direction(
+            sig, orig_buy=True, orig_p=0.50, opp_p=0.70,
+            orig_rejected=False, opp_rejected=False, dual_margin=0.05,
+        )
+        assert verdict == 'flip'
+        assert sig.is_sell is True
+        assert sig.is_buy is False
+
+    def test_opposite_direction_clearly_wins_flips_sell_to_buy(self):
+        sig = _sci_signal(Signal.SELL)
+        verdict = _resolve_dual_direction(
+            sig, orig_buy=False, orig_p=0.50, opp_p=0.70,
+            orig_rejected=False, opp_rejected=False, dual_margin=0.05,
+        )
+        assert verdict == 'flip'
+        assert sig.is_buy is True
+        assert sig.is_sell is False
+
+    def test_contradictory_edges_within_margin_rejects_both_directions(self):
+        sig = _sci_signal(Signal.BUY)
+        verdict = _resolve_dual_direction(
+            sig, orig_buy=True, orig_p=0.55, opp_p=0.58,
+            orig_rejected=False, opp_rejected=False, dual_margin=0.05,
+        )
+        assert verdict == 'reject'
+        assert sig.is_buy is False
+        assert sig.is_sell is False
+        assert sig.signal == Signal.HOLD
+
+    def test_original_leads_clearly_leaves_signal_unchanged(self):
+        sig = _sci_signal(Signal.BUY)
+        verdict = _resolve_dual_direction(
+            sig, orig_buy=True, orig_p=0.70, opp_p=0.50,
+            orig_rejected=False, opp_rejected=False, dual_margin=0.05,
+        )
+        assert verdict == 'unchanged'
+        assert sig.is_buy is True
+        assert sig.is_sell is False
+
+    def test_opposite_wins_but_was_itself_rejected_does_not_flip(self):
+        sig = _sci_signal(Signal.BUY)
+        verdict = _resolve_dual_direction(
+            sig, orig_buy=True, orig_p=0.50, opp_p=0.90,
+            orig_rejected=False, opp_rejected=True, dual_margin=0.05,
+        )
+        assert verdict == 'unchanged'
+        assert sig.is_buy is True
+
+    def test_mutates_signal_field_not_the_readonly_properties(self):
+        # Regression guard for the original bug: is_buy/is_sell have no setter,
+        # so a correct fix must go through .signal instead.
+        sig = _sci_signal(Signal.BUY)
+        with pytest.raises(AttributeError):
+            sig.is_buy = False
+        _resolve_dual_direction(
+            sig, orig_buy=True, orig_p=0.55, opp_p=0.58,
+            orig_rejected=False, opp_rejected=False, dual_margin=0.05,
+        )
+        assert sig.signal == Signal.HOLD
