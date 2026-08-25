@@ -21,6 +21,7 @@ What is tested (all without real network calls or real money):
 import sys
 import types
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -62,6 +63,7 @@ from src.live_trading import (
     _inject_live_price,
     _quick_diagnose,
     _update_chandelier_stop,
+    _warn_if_shorts_unimplemented,
     _kill_switch_engaged,
     _daily_loss_halted,
     _sltp_circuit_alert,
@@ -609,6 +611,21 @@ class TestUpdateChandelierStop:
         pos = self._pos(entry=50_000.0, sl=0.0, atr=400.0)
         _update_chandelier_stop(pos, 55_000.0)
         assert pos.stop_loss_price == pytest.approx(55_000.0 - ATR_TRAIL_MULT * 400.0)
+
+
+# ── ENABLE_SHORTS is read but not wired to any short-entry/exit path ─────────────
+
+class TestWarnIfShortsUnimplemented:
+    def test_warns_when_enabled(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.live_trading"):
+            _warn_if_shorts_unimplemented(True)
+        assert any("ENABLE_SHORTS" in r.message for r in caplog.records)
+        assert any("no effect" in r.message for r in caplog.records)
+
+    def test_silent_when_disabled(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.live_trading"):
+            _warn_if_shorts_unimplemented(False)
+        assert caplog.records == []
 
 
 # ── close_long ───────────────────────────────────────────────────────────────────
