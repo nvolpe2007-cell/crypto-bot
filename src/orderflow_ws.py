@@ -311,10 +311,14 @@ class OrderFlowWS:
 
             self._cvd_trades[sym].append((signed, ts))
             self._cvd_updated[sym] = ts
-            self._trade_sizes[sym].append(size)
 
-            # Whale detection
+            # Whale detection — snapshot prior history BEFORE appending the
+            # current trade, so the candidate trade isn't averaged into its
+            # own comparison baseline (that inflated the effective multiplier
+            # above _WHALE_MULT, worse the shallower the window — e.g. ~3.86×
+            # instead of 3× at the 10-trade floor).
             sizes = list(self._trade_sizes[sym])
+            self._trade_sizes[sym].append(size)
             if len(sizes) >= 10:
                 avg = sum(sizes) / len(sizes)
                 if avg > 0 and size >= _WHALE_MULT * avg:
