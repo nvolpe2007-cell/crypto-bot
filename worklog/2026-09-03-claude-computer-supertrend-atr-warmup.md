@@ -2,7 +2,7 @@
 date: 2026-09-03
 agent: claude-computer
 branch: fix/supertrend-atr-warmup-nan
-pr: TBD
+pr: 109
 lane: directional          # cross-lane — see note below
 files: [src/indicators.py, tests/test_indicators.py]
 ---
