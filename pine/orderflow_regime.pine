@@ -1,0 +1,281 @@
+//@version=6
+//
+// Order Flow — Delta / CVD / OI Regime
+// ───────────────────────────────────────────────────────────────────────────────
+// A MEASUREMENT indicator. It plots flow and classifies it; it emits no buy/sell
+// and draws no entries. That is deliberate — see "What this is not", below.
+//
+// WHAT PINE CAN AND CANNOT DO HERE
+//   Pine has no order book. There is no bid/ask depth, no L2, no quote stream.
+//   So the Cont-Kukanov-Stoikov OFI, multi-level OFI and book imbalance from
+//   src/orderflow_indicator.py CANNOT be reproduced on TradingView at all. This
+//   script implements the half that survives on bar data:
+//
+//     - volume delta          (from intrabar bars, or a close-location proxy)
+//     - CVD                   (cumulative volume delta)
+//     - z-scored flow         (comparable across symbols and regimes)
+//     - dOI %                 (open interest change, where TradingView has OI)
+//     - flow x OI regime      (fresh conviction vs forced liquidation)
+//     - CVD/price divergence
+//     - liquidation exhaustion detector
+//
+//   The regime classifier is the valuable part and it ports intact.
+//
+// THE MECHANISM THE REGIME CLASSIFIER EXISTS FOR
+//   A liquidation is a forced market order from the exchange's engine closing an
+//   over-leveraged position. In raw delta/CVD it is INDISTINGUISHABLE from
+//   informed flow — a burst of one-sided taker volume — but its implication is
+//   the opposite: it is exhausting forced supply, not expressing new conviction.
+//
+//   Open interest is the discriminator. Closing a position LOWERS OI; opening one
+//   RAISES it. So:
+//
+//     taker selling + OI rising   -> fresh shorts      (conviction)
+//     taker selling + OI falling  -> long liquidation  (forced)
+//     taker buying  + OI rising   -> fresh longs       (conviction)
+//     taker buying  + OI falling  -> short covering    (forced)
+//
+//   Identical footprint in flow alone. Opposite meaning. That distinction is the
+//   entire point of this script, which is why the regime is shown as a discrete
+//   labelled state and never averaged into a single score.
+//
+// WHAT THIS IS NOT
+//   Not a signal, and not a claim that any of this is profitable. The originating
+//   repo's measured record on buying weakness is uniformly negative: cross-
+//   sectional reversal -48% to -88%, RSI2 oversold-bounce -44% to -59%, Bollinger
+//   mean-reversion breakeven-gross-therefore-loss-net, and a liquidation-cascade
+//   study whose not-yet-stretched dip-buy half came in at t = -0.8 (dead) while
+//   the already-stretched continuation half read t = +3.7.
+//
+//   What makes the regime split worth LOOKING AT rather than assuming dead is
+//   that none of those tests could separate forced flow from conviction flow —
+//   none of them had open interest. That separation is new. It is a hypothesis,
+//   not a result, and this indicator exists to eyeball it, not to trade it.
+//
+// PLATFORM NOTES
+//   - Intrabar delta needs a lower timeframe than the chart. On a 1h chart, 5m is
+//     a reasonable default. Free plans cap intrabar history; if the lower-TF
+//     request returns nothing the script falls back to the close-location proxy
+//     automatically and the status table says which is in use.
+//   - OI is only published for some symbols (mostly perps). Where it is missing
+//     the regime reads "no OI" and everything else still works. If auto-detection
+//     picks the wrong OI symbol, override it in the inputs.
+//   - Uses only constructs available in Pine v5, so changing @version=6 to 5
+//     should work if needed.
+// ───────────────────────────────────────────────────────────────────────────────
+
+indicator("Order Flow — Delta / CVD / OI Regime", shorttitle="OF Regime",
+     overlay = false, max_labels_count = 500)
+
+// ── inputs ────────────────────────────────────────────────────────────────────
+
+var string GRP_FLOW = "Flow"
+var string GRP_OI   = "Open interest"
+var string GRP_SIG  = "Divergence & exhaustion"
+var string GRP_DISP = "Display"
+
+useLowerTf = input.bool(true, "Use intrabar volume delta", group = GRP_FLOW,
+     tooltip = "On: estimate buy/sell volume from lower-timeframe bars (more honest). " +
+               "Off: use the close-location proxy on the chart timeframe. " +
+               "Falls back to the proxy automatically if intrabar data is unavailable.")
+lowerTf    = input.timeframe("5", "Intrabar timeframe", group = GRP_FLOW,
+     tooltip = "Must be LOWER than the chart timeframe.")
+zLen       = input.int(50, "Z-score length", minval = 5, maxval = 500, group = GRP_FLOW)
+cvdReset   = input.string("Never", "Reset CVD", options = ["Never", "Daily", "Weekly"],
+     group = GRP_FLOW, tooltip = "CVD is a running total; resetting keeps it readable on long charts.")
+
+oiAuto     = input.bool(true, "Auto-detect OI symbol", group = GRP_OI)
+oiManual   = input.symbol("", "OI symbol override", group = GRP_OI,
+     tooltip = "Used when auto-detect is off or picks the wrong symbol. " +
+               "TradingView publishes open interest as <SYMBOL>_OI for most perps.")
+oiWin      = input.int(1, "dOI lookback (bars)", minval = 1, group = GRP_OI)
+minOiPct   = input.float(0.5, "Min |dOI| % to call a regime", minval = 0.0, step = 0.1,
+     group = GRP_OI, tooltip = "Below this, OI is moving too little to distinguish " +
+               "opening from closing — classified as 'churn' rather than forced into a regime.")
+
+divLb      = input.int(20, "Divergence lookback", minval = 2, group = GRP_SIG)
+extLb      = input.int(20, "Extreme lookback", minval = 2, group = GRP_SIG)
+decayLb    = input.int(5,  "Flow decay lookback", minval = 2, group = GRP_SIG)
+
+showCvd    = input.bool(true,  "Plot CVD",              group = GRP_DISP)
+showZ      = input.bool(false, "Plot flow z-score",     group = GRP_DISP)
+showBg     = input.bool(true,  "Shade regime",          group = GRP_DISP)
+showMarks  = input.bool(true,  "Mark divergence / exhaustion", group = GRP_DISP)
+showTable  = input.bool(true,  "Status table",          group = GRP_DISP)
+
+// ── volume delta ──────────────────────────────────────────────────────────────
+// Intrabar: classify each lower-TF bar by its own direction and sum. This is an
+// estimate — a bar closing up is treated as net buying — but it is a far better
+// one than judging the whole chart bar by its shape.
+
+intrabarSigned = close > open ? volume : close < open ? -volume : 0.0
+lowerArr = request.security_lower_tf(syminfo.tickerid, lowerTf, intrabarSigned,
+     ignore_invalid_timeframe = true)
+lowerOk  = not na(lowerArr) and array.size(lowerArr) > 0
+
+// Close-location-value proxy, used as fallback. ((C-L)-(H-C))/(H-L) in [-1,+1],
+// scaled by volume. A doji (H==L) carries no directional information -> 0, which
+// also avoids dividing by zero.
+span     = high - low
+clv      = span == 0 ? 0.0 : ((close - low) - (high - close)) / span
+proxyDelta = clv * volume
+
+usingIntrabar = useLowerTf and lowerOk
+delta = usingIntrabar ? array.sum(lowerArr) : proxyDelta
+delta := nz(delta)
+
+// ── CVD ───────────────────────────────────────────────────────────────────────
+
+newPeriod = cvdReset == "Daily"  ? timeframe.change("1D") :
+            cvdReset == "Weekly" ? timeframe.change("1W") : false
+
+var float cvd = 0.0
+cvd := (newPeriod ? 0.0 : nz(cvd[1])) + delta
+
+// ── z-score ───────────────────────────────────────────────────────────────────
+// A flat window scores 0 rather than dividing by zero: no variance carries no
+// information, and an infinity here would poison the plot's scale permanently.
+
+zOf(src, len) =>
+    m = ta.sma(src, len)
+    s = ta.stdev(src, len)
+    s > 0 ? (src - m) / s : 0.0
+
+deltaZ = zOf(delta, zLen)
+
+// ── open interest ─────────────────────────────────────────────────────────────
+
+oiSym = oiAuto ? syminfo.tickerid + "_OI" : oiManual
+oi = request.security(oiSym, timeframe.period, close,
+     ignore_invalid_symbol = true)
+
+oiPrev  = nz(oi[oiWin], na)
+hasOi   = not na(oi) and not na(oiPrev) and oiPrev > 0
+doiPct  = hasOi ? (oi - oiPrev) / oiPrev * 100.0 : na
+
+// ── regime classification ─────────────────────────────────────────────────────
+
+REG_NONE  = "no OI"
+REG_CHURN = "churn"
+REG_FL    = "fresh longs"
+REG_SC    = "short covering"
+REG_FS    = "fresh shorts"
+REG_LL    = "long liquidation"
+
+regime = REG_NONE
+if hasOi and delta != 0
+    if math.abs(doiPct) < minOiPct
+        regime := REG_CHURN
+    else if delta > 0 and doiPct > 0
+        regime := REG_FL
+    else if delta > 0 and doiPct < 0
+        regime := REG_SC
+    else if delta < 0 and doiPct > 0
+        regime := REG_FS
+    else if delta < 0 and doiPct < 0
+        regime := REG_LL
+
+isForced = regime == REG_LL or regime == REG_SC
+
+// ── CVD / price divergence ────────────────────────────────────────────────────
+// Reports a DISAGREEMENT between where price went and where cumulative flow went.
+// It does not claim the disagreement predicts anything.
+
+dp = math.sign(close - close[divLb])
+dc = math.sign(cvd - cvd[divLb])
+divergence = dp < 0 and dc > 0 ?  1 :   // price down, flow up   (absorption)
+             dp > 0 and dc < 0 ? -1 : 0 // price up,   flow down (distribution)
+
+// ── liquidation exhaustion ────────────────────────────────────────────────────
+// Both conditions compare against the PRIOR window, never one including the
+// current bar: a rolling extreme that contains the current bar can never be
+// exceeded by it, so a flat tape — the exact shape exhaustion looks like — would
+// never register. Non-strict comparison because re-testing a low without
+// breaking it IS "stopped making new lows".
+
+mag       = math.abs(delta)
+priorMag  = ta.sma(mag[1], decayLb)
+decaying  = not na(priorMag) and mag < priorMag
+
+priorMin  = ta.lowest(low[1], extLb)
+priorMax  = ta.highest(high[1], extLb)
+noNewLow  = not na(priorMin) and low  >= priorMin
+noNewHigh = not na(priorMax) and high <= priorMax
+
+exhaustion = (regime == REG_LL and decaying and noNewLow) or
+             (regime == REG_SC and decaying and noNewHigh)
+
+// ── plots ─────────────────────────────────────────────────────────────────────
+
+cUp     = color.new(#26a69a, 0)
+cDn     = color.new(#ef5350, 0)
+cCvd    = color.new(#42a5f5, 0)
+cZ      = color.new(#ab47bc, 0)
+
+plot(delta, "Delta", style = plot.style_columns,
+     color = delta >= 0 ? color.new(cUp, 45) : color.new(cDn, 45))
+plot(showCvd ? cvd : na, "CVD", color = cCvd, linewidth = 2)
+plot(showZ  ? deltaZ : na, "Delta z-score", color = cZ, linewidth = 1)
+hline(0, "Zero", color = color.new(color.gray, 60), linestyle = hline.style_dotted)
+
+// Regime shading. Forced regimes are the loud ones by design — they are the
+// states where the naive reading of the flow is backwards.
+regimeColor = regime == REG_LL ? color.new(#ef5350, 82) :
+              regime == REG_SC ? color.new(#26a69a, 82) :
+              regime == REG_FS ? color.new(#ef5350, 93) :
+              regime == REG_FL ? color.new(#26a69a, 93) : na
+bgcolor(showBg ? regimeColor : na, title = "Regime")
+
+plotshape(showMarks and exhaustion, "Exhaustion", shape.diamond, location.bottom,
+     color = color.new(#ffa726, 0), size = size.tiny)
+plotshape(showMarks and divergence ==  1, "Bullish divergence", shape.triangleup,
+     location.bottom, color = color.new(#26a69a, 0), size = size.tiny)
+plotshape(showMarks and divergence == -1, "Bearish divergence", shape.triangledown,
+     location.top, color = color.new(#ef5350, 0), size = size.tiny)
+
+// ── status table ──────────────────────────────────────────────────────────────
+
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 2, 7,
+         frame_color = color.new(color.gray, 70), frame_width = 1,
+         border_color = color.new(color.gray, 80), border_width = 1)
+
+    txt = color.new(color.gray, 0)
+    val = color.new(#b2b5be, 0)  // literal rather than chart.fg_color, to avoid
+                                 // depending on a newer built-in than necessary
+
+    table.cell(t, 0, 0, "source", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 0, usingIntrabar ? lowerTf + " intrabar" : "bar proxy",
+         text_color = usingIntrabar ? val : color.new(#ffa726, 0), text_size = size.tiny)
+
+    table.cell(t, 0, 1, "delta", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 1, str.tostring(delta, format.volume),
+         text_color = delta >= 0 ? cUp : cDn, text_size = size.tiny)
+
+    table.cell(t, 0, 2, "delta z", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 2, str.tostring(deltaZ, "#.00"), text_color = val, text_size = size.tiny)
+
+    table.cell(t, 0, 3, "CVD", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 3, str.tostring(cvd, format.volume), text_color = val, text_size = size.tiny)
+
+    table.cell(t, 0, 4, "dOI %", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 4, hasOi ? str.tostring(doiPct, "#.###") + "%" : "n/a",
+         text_color = hasOi ? val : color.new(#ffa726, 0), text_size = size.tiny)
+
+    table.cell(t, 0, 5, "regime", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 5, regime,
+         text_color = isForced ? color.new(#ffa726, 0) : val, text_size = size.tiny)
+
+    table.cell(t, 0, 6, "exhaustion", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 6, exhaustion ? "yes" : "no",
+         text_color = exhaustion ? color.new(#ffa726, 0) : val, text_size = size.tiny)
+
+// ── alerts ────────────────────────────────────────────────────────────────────
+// Alerts on STATE, deliberately not on "entries".
+
+alertcondition(regime == REG_LL, "Long liquidation regime",
+     "Taker selling with open interest falling — forced flow, not conviction.")
+alertcondition(regime == REG_SC, "Short covering regime",
+     "Taker buying with open interest falling — forced flow, not conviction.")
+alertcondition(exhaustion, "Forced-flow exhaustion",
+     "Forced flow decaying while price stopped making new extremes.")
