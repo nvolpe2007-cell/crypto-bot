@@ -4,7 +4,7 @@ agent: claude-computer
 branch: feat/orderflow-indicator
 pr: 110
 lane: directional          # cross-lane — see note below
-files: [src/orderflow_indicator.py, tests/test_orderflow_indicator.py]
+files: [src/orderflow_indicator.py, tests/test_orderflow_indicator.py, research/hypothesis_registry.yaml]
 ---
 
 # Offline order-flow indicators — a measurement instrument, not a signal
@@ -86,3 +86,26 @@ as today's `src/indicators.py` PR.
 
 **Explicitly not claimed:** that any of this predicts anything. The repo's record
 says it doesn't, at this cost level. This is the instrument, not a result.
+
+## Registry follow-up (owner-approved, added after the initial PR)
+
+Recorded the "unmeasurable" finding against `scalper-microstructure-ofi-v2` in
+`research/hypothesis_registry.yaml`, per ledger rule 4 and `schema.yaml`
+("New measurements are appended as an additional item in that entry's `evidence`
+list"; "'unmeasurable' [is a] valid result and must be written down rather than
+left blank").
+
+- **Appended** a third evidence item dated 2026-09-03. The two existing items are
+  byte-for-byte untouched.
+- **Added** `deployment_gate.blocked_by` — the gate was previously unevaluated
+  with nothing recording why.
+- **Extended** `notes` with a DO NOT RE-PROPOSE list naming the two specific bad
+  arguments this entry now refutes: (a) another order-flow directional trigger,
+  which the 2026-04-29 evidence already prices, and (b) reading "unmeasurable" as
+  a hint that an edge is hiding rather than as a statement that the question has
+  never been asked of data.
+- `status` unchanged at `paper-only` — status is a consequence of evidence against
+  the gate, and no new measurement was made.
+
+Validated by parsing the file with `yaml.safe_load`: 15 entries, this entry now
+carries 3 evidence items dated 2026-04-29 / 2026-05-22 onwards / 2026-09-03.
