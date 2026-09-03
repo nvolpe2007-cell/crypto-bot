@@ -18,9 +18,41 @@ from src.orderflow_indicator import (
     cumulative_volume_delta,
     book_imbalance,
     ofi_from_books,
+    multi_level_ofi,
+    level_weights,
     rolling_zscore,
     cvd_price_divergence,
+    oi_delta_pct,
+    flow_oi_regime,
+    liquidation_exhaustion,
+    REGIMES,
 )
+
+
+def _reference_cks(prev_bid_px, prev_bid_sz, prev_ask_px, prev_ask_sz,
+                   curr_bid_px, curr_bid_sz, curr_ask_px, curr_ask_sz):
+    """
+    The CKS event contribution in explicit three-case form — an independent
+    transcription of the published definition, deliberately NOT sharing code with
+    the implementation under test. `ofi_from_books` uses the indicator-function
+    form instead, so agreeing here is a real cross-check of the sign conventions
+    rather than a tautology.
+    """
+    if curr_bid_px > prev_bid_px:
+        e_bid = curr_bid_sz
+    elif curr_bid_px == prev_bid_px:
+        e_bid = curr_bid_sz - prev_bid_sz
+    else:
+        e_bid = -prev_bid_sz
+
+    if curr_ask_px < prev_ask_px:
+        e_ask = curr_ask_sz
+    elif curr_ask_px == prev_ask_px:
+        e_ask = curr_ask_sz - prev_ask_sz
+    else:
+        e_ask = -prev_ask_sz
+
+    return e_bid - e_ask
 
 
 # ── tick_rule_side ────────────────────────────────────────────────────────────
@@ -253,6 +285,284 @@ class TestOfiFromBooks:
 
     def test_empty_input(self):
         assert ofi_from_books([], [], [], []).empty
+
+
+class TestOfiMatchesIndependentCksTranscription:
+    """
+    Property test over all nine (bid-case x ask-case) combinations. The coarse
+    integer price grid is deliberate: it makes the FLAT cases occur often, which
+    is where two formulations of CKS most easily diverge.
+    """
+
+    def test_agrees_on_many_random_transitions(self):
+        rng = np.random.default_rng(20260903)
+        n = 20_000
+        pb_prev = rng.integers(98, 103, n).astype(float)
+        pb_curr = rng.integers(98, 103, n).astype(float)
+        pa_prev = rng.integers(103, 108, n).astype(float)
+        pa_curr = rng.integers(103, 108, n).astype(float)
+        qb_prev = rng.integers(0, 50, n).astype(float)
+        qb_curr = rng.integers(0, 50, n).astype(float)
+        qa_prev = rng.integers(0, 50, n).astype(float)
+        qa_curr = rng.integers(0, 50, n).astype(float)
+
+        expected = np.array([
+            _reference_cks(pb_prev[i], qb_prev[i], pa_prev[i], qa_prev[i],
+                           pb_curr[i], qb_curr[i], pa_curr[i], qa_curr[i])
+            for i in range(n)
+        ])
+        # Vectorised equivalent of running ofi_from_books on each pair.
+        got = np.array([
+            ofi_from_books([pb_prev[i], pb_curr[i]], [qb_prev[i], qb_curr[i]],
+                           [pa_prev[i], pa_curr[i]], [qa_prev[i], qa_curr[i]]).iloc[1]
+            for i in range(n)
+        ])
+        assert np.allclose(expected, got)
+
+    def test_all_nine_case_combinations_are_exercised(self):
+        # Guards the test above from silently covering only a subset.
+        seen = set()
+        for pb in (99.0, 100.0, 101.0):
+            for pa in (104.0, 105.0, 106.0):
+                bcase = "up" if pb > 100.0 else ("flat" if pb == 100.0 else "down")
+                acase = "down" if pa < 105.0 else ("flat" if pa == 105.0 else "up")
+                seen.add((bcase, acase))
+                expected = _reference_cks(100.0, 4.0, 105.0, 6.0, pb, 7.0, pa, 9.0)
+                got = ofi_from_books([100.0, pb], [4.0, 7.0], [105.0, pa], [6.0, 9.0])
+                assert got.iloc[1] == pytest.approx(expected)
+        assert len(seen) == 9
+
+
+# ── multi_level_ofi ───────────────────────────────────────────────────────────
+
+class TestLevelWeights:
+    def test_inverse_scheme(self):
+        assert level_weights(3, "inverse").tolist() == pytest.approx([1.0, 0.5, 1 / 3])
+
+    def test_exponential_first_level_is_one(self):
+        w = level_weights(4, "exponential", lam=0.5)
+        assert w[0] == pytest.approx(1.0)
+        assert (np.diff(w) < 0).all()
+
+    def test_flat_scheme(self):
+        assert level_weights(3, "flat").tolist() == [1.0, 1.0, 1.0]
+
+    def test_unknown_scheme_raises(self):
+        with pytest.raises(ValueError, match="unknown scheme"):
+            level_weights(3, "nonsense")
+
+    def test_zero_levels_raises(self):
+        with pytest.raises(ValueError, match="levels must be"):
+            level_weights(0)
+
+
+class TestMultiLevelOfi:
+    def test_single_level_reduces_to_top_of_book(self):
+        pb = [[100.0], [101.0], [101.0], [100.0]]
+        qb = [[5.0], [7.0], [4.0], [4.0]]
+        pa = [[102.0], [102.0], [101.0], [101.0]]
+        qa = [[6.0], [6.0], [9.0], [9.0]]
+        multi = multi_level_ofi(pb, qb, pa, qa)
+        top = ofi_from_books([r[0] for r in pb], [r[0] for r in qb],
+                             [r[0] for r in pa], [r[0] for r in qa])
+        assert multi.tolist() == pytest.approx(top.tolist())
+
+    def test_first_row_is_zero(self):
+        out = multi_level_ofi([[100.0, 99.0]], [[1.0, 1.0]],
+                              [[101.0, 102.0]], [[1.0, 1.0]])
+        assert out.iloc[0] == 0.0
+
+    def test_deeper_levels_are_downweighted(self):
+        # Identical size change at level 1 vs level 2; the level-1 version must
+        # move the indicator more under an inverse-weight scheme.
+        pb = [[100.0, 99.0], [100.0, 99.0]]
+        pa = [[101.0, 102.0], [101.0, 102.0]]
+        qa = [[5.0, 5.0], [5.0, 5.0]]
+
+        lvl1 = multi_level_ofi(pb, [[5.0, 5.0], [15.0, 5.0]], pa, qa)
+        lvl2 = multi_level_ofi(pb, [[5.0, 5.0], [5.0, 15.0]], pa, qa)
+        assert lvl1.iloc[1] > lvl2.iloc[1] > 0
+
+    def test_spoof_at_top_is_partly_offset_by_depth(self):
+        # A fake +20 at the bid's level 1 while levels 2-3 genuinely shrink.
+        pb = [[100.0, 99.0, 98.0], [100.0, 99.0, 98.0]]
+        pa = [[101.0, 102.0, 103.0], [101.0, 102.0, 103.0]]
+        qa = [[5.0, 5.0, 5.0], [5.0, 5.0, 5.0]]
+        qb = [[5.0, 10.0, 10.0], [25.0, 2.0, 2.0]]
+
+        top_only = ofi_from_books([100.0, 100.0], [5.0, 25.0],
+                                  [101.0, 101.0], [5.0, 5.0])
+        deep = multi_level_ofi(pb, qb, pa, qa, scheme="inverse")
+        assert deep.iloc[1] < top_only.iloc[1]
+
+    def test_explicit_weights_accepted(self):
+        pb = [[100.0, 99.0], [100.0, 99.0]]
+        qb = [[5.0, 5.0], [9.0, 9.0]]
+        pa = [[101.0, 102.0], [101.0, 102.0]]
+        qa = [[5.0, 5.0], [5.0, 5.0]]
+        out = multi_level_ofi(pb, qb, pa, qa, weights=[1.0, 1.0])
+        # both levels added +4 of bid size, ask unchanged
+        assert out.iloc[1] == pytest.approx(8.0)
+
+    def test_wrong_weight_length_raises(self):
+        with pytest.raises(ValueError, match="one entry per level"):
+            multi_level_ofi([[100.0, 99.0]], [[1.0, 1.0]],
+                            [[101.0, 102.0]], [[1.0, 1.0]], weights=[1.0])
+
+    def test_shape_mismatch_raises(self):
+        with pytest.raises(ValueError, match="share shape"):
+            multi_level_ofi([[100.0, 99.0]], [[1.0]],
+                            [[101.0, 102.0]], [[1.0, 1.0]])
+
+    def test_static_book_is_zero(self):
+        pb = [[100.0, 99.0]] * 4
+        qb = [[5.0, 5.0]] * 4
+        pa = [[101.0, 102.0]] * 4
+        qa = [[5.0, 5.0]] * 4
+        assert (multi_level_ofi(pb, qb, pa, qa) == 0.0).all()
+
+
+# ── oi_delta_pct ──────────────────────────────────────────────────────────────
+
+class TestOiDeltaPct:
+    def test_percentage_of_prior_oi(self):
+        out = oi_delta_pct(pd.Series([1000.0, 1100.0]))
+        assert out.iloc[1] == pytest.approx(10.0)
+
+    def test_negative_change(self):
+        out = oi_delta_pct(pd.Series([1000.0, 900.0]))
+        assert out.iloc[1] == pytest.approx(-10.0)
+
+    def test_first_observation_is_nan(self):
+        assert pd.isna(oi_delta_pct(pd.Series([1000.0, 1100.0])).iloc[0])
+
+    def test_zero_prior_oi_is_nan_not_inf(self):
+        out = oi_delta_pct(pd.Series([0.0, 100.0]))
+        assert pd.isna(out.iloc[1])
+
+    def test_window_longer_than_one(self):
+        out = oi_delta_pct(pd.Series([100.0, 110.0, 120.0]), window=2)
+        assert out.iloc[2] == pytest.approx(20.0)
+
+
+# ── flow_oi_regime — the four-regime table ────────────────────────────────────
+
+class TestFlowOiRegime:
+    @staticmethod
+    def _one(flow_val, oi_prev, oi_now, min_oi_pct=0.5):
+        return flow_oi_regime(
+            pd.Series([0.0, flow_val]),
+            pd.Series([oi_prev, oi_now]),
+            min_oi_pct=min_oi_pct,
+        ).iloc[1]
+
+    def test_buying_with_rising_oi_is_fresh_longs(self):
+        assert self._one(+100.0, 1000.0, 1100.0) == "fresh_longs"
+
+    def test_buying_with_falling_oi_is_short_covering(self):
+        assert self._one(+100.0, 1000.0, 900.0) == "short_covering"
+
+    def test_selling_with_rising_oi_is_fresh_shorts(self):
+        assert self._one(-100.0, 1000.0, 1100.0) == "fresh_shorts"
+
+    def test_selling_with_falling_oi_is_long_liquidation(self):
+        assert self._one(-100.0, 1000.0, 900.0) == "long_liquidation"
+
+    def test_identical_flow_opposite_meaning_is_the_whole_point(self):
+        # Same taker selling; only OI differs. The classifier must split them.
+        liq = self._one(-100.0, 1000.0, 900.0)
+        conviction = self._one(-100.0, 1000.0, 1100.0)
+        assert liq == "long_liquidation"
+        assert conviction == "fresh_shorts"
+        assert liq != conviction
+
+    def test_small_oi_move_is_churn(self):
+        # 0.1% change, below the 0.5% default threshold
+        assert self._one(+100.0, 1000.0, 1001.0) == "churn"
+
+    def test_threshold_is_configurable(self):
+        assert self._one(+100.0, 1000.0, 1001.0, min_oi_pct=0.05) == "fresh_longs"
+
+    def test_zero_flow_is_none(self):
+        assert self._one(0.0, 1000.0, 1100.0) == "none"
+
+    def test_missing_oi_is_none(self):
+        out = flow_oi_regime(pd.Series([1.0, 1.0]), pd.Series([np.nan, np.nan]))
+        assert (out == "none").all()
+
+    def test_only_known_labels_emitted(self):
+        rng = np.random.default_rng(11)
+        flow = pd.Series(rng.normal(0, 10, 500))
+        oi = pd.Series(1000 + np.cumsum(rng.normal(0, 20, 500)))
+        out = flow_oi_regime(flow, oi)
+        assert set(out.unique()) <= set(REGIMES)
+
+
+# ── liquidation_exhaustion ────────────────────────────────────────────────────
+
+class TestLiquidationExhaustion:
+    def test_flags_when_flow_decays_and_price_stops_falling(self):
+        # A realistic exhaustion shape: price crashes then stabilises, while the
+        # sell flow FADES GRADUALLY rather than switching off. (An instant drop
+        # followed by a long quiet stretch is not exhaustion — it is just a quiet
+        # market, and the detector should not be judged on that.)
+        n = 40
+        price = pd.Series(list(np.linspace(100, 80, 25))
+                          + list(np.linspace(80.2, 82.0, 15)))
+        flow = pd.Series([-50.0] * 25 + list(np.linspace(-40.0, -1.0, 15)))
+        regime = pd.Series(["long_liquidation"] * n)
+        out = liquidation_exhaustion(price, flow, regime,
+                                     extreme_lookback=10, decay_lookback=5)
+        assert out.iloc[25:].any(), "expected a flag during the fade"
+        assert not out.iloc[:25].any(), "must not flag while the crash is running"
+
+    def test_does_not_flag_while_price_still_making_new_lows(self):
+        n = 40
+        price = pd.Series(np.linspace(100, 60, n))  # never stops falling
+        flow = pd.Series([-50.0] * 20 + [-1.0] * 20)
+        regime = pd.Series(["long_liquidation"] * n)
+        out = liquidation_exhaustion(price, flow, regime,
+                                     extreme_lookback=10, decay_lookback=5)
+        assert not out.iloc[-1]
+
+    def test_does_not_flag_while_flow_still_intense(self):
+        n = 40
+        price = pd.Series(list(np.linspace(100, 80, 25)) + [80.5] * 15)
+        flow = pd.Series([-50.0] * n)  # no decay
+        regime = pd.Series(["long_liquidation"] * n)
+        out = liquidation_exhaustion(price, flow, regime,
+                                     extreme_lookback=10, decay_lookback=5)
+        assert not out.iloc[-1]
+
+    def test_inactive_outside_forced_regimes(self):
+        n = 40
+        price = pd.Series(list(np.linspace(100, 80, 25)) + [80.5] * 15)
+        flow = pd.Series([-50.0] * 25 + [-1.0] * 15)
+        regime = pd.Series(["fresh_shorts"] * n)
+        out = liquidation_exhaustion(price, flow, regime,
+                                     extreme_lookback=10, decay_lookback=5)
+        assert not out.any()
+
+    def test_short_covering_mirror_case(self):
+        n = 40
+        price = pd.Series(list(np.linspace(80, 100, 25))
+                          + list(np.linspace(99.8, 98.0, 15)))
+        flow = pd.Series([50.0] * 25 + list(np.linspace(40.0, 1.0, 15)))
+        regime = pd.Series(["short_covering"] * n)
+        out = liquidation_exhaustion(price, flow, regime,
+                                     extreme_lookback=10, decay_lookback=5)
+        assert out.iloc[25:].any()
+        assert not out.iloc[:25].any()
+
+    def test_returns_bool_and_never_nan(self):
+        n = 30
+        out = liquidation_exhaustion(
+            pd.Series(np.linspace(100, 90, n)),
+            pd.Series([-5.0] * n),
+            pd.Series(["long_liquidation"] * n),
+        )
+        assert out.dtype == bool
+        assert out.notna().all()
 
 
 # ── rolling_zscore ────────────────────────────────────────────────────────────

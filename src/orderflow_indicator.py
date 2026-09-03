@@ -63,8 +63,14 @@ __all__ = [
     "cumulative_volume_delta",
     "book_imbalance",
     "ofi_from_books",
+    "multi_level_ofi",
+    "level_weights",
     "rolling_zscore",
     "cvd_price_divergence",
+    "oi_delta_pct",
+    "flow_oi_regime",
+    "liquidation_exhaustion",
+    "REGIMES",
 ]
 
 
@@ -224,6 +230,229 @@ def ofi_from_books(
     e[1:] = (bid_up * qb[1:] - bid_dn * qb[:-1]
              - ask_dn * qa[1:] + ask_up * qa[:-1])
     return pd.Series(e, name="ofi")
+
+
+def level_weights(levels: int, scheme: str = "inverse",
+                  lam: float = 0.5) -> np.ndarray:
+    """
+    Depth weights for `multi_level_ofi`, for levels 1..N.
+
+      'inverse'      w_i = 1/i
+      'exponential'  w_i = exp(-lam * (i-1))   (w_1 = 1)
+      'flat'         w_i = 1
+
+    Deliberately NOT normalised to sum to 1. Multi-level OFI has no natural
+    absolute scale anyway — it is compared against its own trailing distribution
+    (see `rolling_zscore`), and silently rescaling by depth would make series
+    computed at different N incomparable for no gain.
+    """
+    if levels < 1:
+        raise ValueError(f"levels must be >= 1, got {levels}")
+    i = np.arange(1, levels + 1, dtype=float)
+    if scheme == "inverse":
+        return 1.0 / i
+    if scheme == "exponential":
+        return np.exp(-lam * (i - 1.0))
+    if scheme == "flat":
+        return np.ones(levels, dtype=float)
+    raise ValueError(f"unknown scheme {scheme!r}; expected inverse/exponential/flat")
+
+
+def multi_level_ofi(
+    bid_prices, bid_sizes, ask_prices, ask_sizes,
+    weights=None, scheme: str = "inverse", lam: float = 0.5,
+) -> pd.Series:
+    """
+    Depth-weighted OFI across the top N book levels.
+
+    Inputs are 2-D array-likes of shape (T, N): T snapshots, N levels ordered
+    best-first. The CKS event logic is applied per level index, then combined as
+    ``sum_i w_i * (E_bid_i - E_ask_i)``.
+
+    Rationale (why depth helps): a single spoofed order at level 1 is partly
+    offset by genuine depth behind it, so moving the signal requires faking the
+    whole stack — more expensive and more detectable than faking the top.
+
+    Caveat worth stating plainly: **"level i" is not a stable object.** When the
+    book shifts, the price sitting at index 2 is a different price level than it
+    was a snapshot ago, so per-index differencing is an approximation, not an
+    exact generalisation of the top-of-book case. The published multi-level OFI
+    work computes it this way regardless; the approximation is accepted, not
+    unnoticed.
+
+    At N=1 with any weight scheme this reduces exactly to `ofi_from_books`.
+    """
+    pb = np.atleast_2d(np.asarray(bid_prices, dtype=float))
+    qb = np.atleast_2d(np.asarray(bid_sizes, dtype=float))
+    pa = np.atleast_2d(np.asarray(ask_prices, dtype=float))
+    qa = np.atleast_2d(np.asarray(ask_sizes, dtype=float))
+
+    if not (pb.shape == qb.shape == pa.shape == qa.shape):
+        raise ValueError(
+            f"book arrays must share shape, got bid_prices={pb.shape} "
+            f"bid_sizes={qb.shape} ask_prices={pa.shape} ask_sizes={qa.shape}"
+        )
+
+    n_rows, n_levels = pb.shape
+    if weights is None:
+        w = level_weights(n_levels, scheme=scheme, lam=lam)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if w.shape != (n_levels,):
+            raise ValueError(
+                f"weights must have one entry per level ({n_levels}), got {w.shape}"
+            )
+
+    out = np.zeros(n_rows, dtype=float)
+    if n_rows < 2:
+        return pd.Series(out, name="multi_level_ofi")
+
+    # Per-level CKS, in the explicit three-case form.
+    pb_prev, pb_curr = pb[:-1], pb[1:]
+    qb_prev, qb_curr = qb[:-1], qb[1:]
+    pa_prev, pa_curr = pa[:-1], pa[1:]
+    qa_prev, qa_curr = qa[:-1], qa[1:]
+
+    e_bid = np.where(
+        pb_curr > pb_prev, qb_curr,
+        np.where(pb_curr == pb_prev, qb_curr - qb_prev, -qb_prev),
+    )
+    e_ask = np.where(
+        pa_curr < pa_prev, qa_curr,
+        np.where(pa_curr == pa_prev, qa_curr - qa_prev, -qa_prev),
+    )
+
+    out[1:] = ((e_bid - e_ask) * w).sum(axis=1)
+    return pd.Series(out, name="multi_level_ofi")
+
+
+# ── open-interest regime classification ───────────────────────────────────────
+
+#: The four flow x OI regimes, plus the two "no call" states. Kept as explicit
+#: labels rather than folded into a numeric score: a consumer must be able to
+#: branch on liquidation-vs-conviction, and averaging that into one number is
+#: exactly the distinction that gets destroyed.
+REGIMES = (
+    "fresh_longs",        # taker buying + OI rising  -> new long conviction
+    "short_covering",     # taker buying + OI falling -> forced/again-closing buys
+    "fresh_shorts",       # taker selling + OI rising -> new short conviction
+    "long_liquidation",   # taker selling + OI falling -> forced sells
+    "churn",              # |dOI| below the noise threshold: positions changing hands
+    "none",               # no directional flow, or insufficient data
+)
+
+
+def oi_delta_pct(open_interest: pd.Series, window: int = 1) -> pd.Series:
+    """
+    Open-interest change over `window` observations, as a percentage of the OI at
+    the start of the window.
+
+    Percentage rather than absolute so the threshold means the same thing across
+    tokens of wildly different size. A zero or missing prior OI yields NaN, not
+    an infinite percentage.
+    """
+    oi = pd.Series(open_interest).astype(float)
+    prev = oi.shift(window)
+    return ((oi - prev) / prev.where(prev > 0, np.nan) * 100.0).rename("oi_delta_pct")
+
+
+def flow_oi_regime(
+    flow: pd.Series,
+    open_interest: pd.Series,
+    window: int = 1,
+    min_oi_pct: float = 0.5,
+) -> pd.Series:
+    """
+    Classify each observation into one of `REGIMES` by the SIGN OF FLOW crossed
+    with the SIGN OF THE OI CHANGE.
+
+    The mechanism this exists to separate: a liquidation is a forced market order
+    from the exchange's engine closing an over-leveraged position. In raw
+    OFI/CVD it is indistinguishable from informed flow — a burst of one-sided
+    taker volume — but its implication is the opposite. It exhausts forced
+    supply rather than expressing new conviction.
+
+    Open interest is the discriminator. Closing a position lowers OI; opening one
+    raises it. So taker selling with OI FALLING is forced liquidation, while
+    taker selling with OI RISING is fresh short conviction — same footprint in
+    flow alone, opposite meaning.
+
+    `min_oi_pct` guards against routine churn: an OI move smaller than this (in
+    %) is classified "churn" rather than forced into a directional regime, since
+    positions merely changing hands between existing holders moves OI barely at
+    all.
+
+    This function CLASSIFIES. It does not say what to do about any regime, and
+    it is not a signal.
+    """
+    f = pd.Series(flow).astype(float)
+    doi = oi_delta_pct(open_interest, window=window).reindex(f.index)
+
+    out = pd.Series("none", index=f.index, dtype=object)
+
+    known = f.notna() & doi.notna() & (f != 0.0)
+    quiet = known & (doi.abs() < float(min_oi_pct))
+    live = known & ~quiet
+
+    out[quiet] = "churn"
+    out[live & (f > 0) & (doi > 0)] = "fresh_longs"
+    out[live & (f > 0) & (doi < 0)] = "short_covering"
+    out[live & (f < 0) & (doi > 0)] = "fresh_shorts"
+    out[live & (f < 0) & (doi < 0)] = "long_liquidation"
+    return out.rename("flow_oi_regime")
+
+
+def liquidation_exhaustion(
+    price: pd.Series,
+    flow: pd.Series,
+    regime: pd.Series,
+    extreme_lookback: int = 20,
+    decay_lookback: int = 5,
+) -> pd.Series:
+    """
+    Flag observations where a forced-flow move shows both exhaustion conditions:
+
+      (a) flow magnitude is DECAYING — |flow| now below its mean over the prior
+          `decay_lookback` observations; and
+      (b) price is NO LONGER MAKING NEW EXTREMES over `extreme_lookback` — no new
+          low while longs are being liquidated, no new high while shorts cover.
+
+    Evaluated only inside the two forced regimes (`long_liquidation`,
+    `short_covering`); everything else is False.
+
+    This is a DETECTOR, not an entry rule and not a claim that fading here is
+    profitable. The repo's record on buying weakness is uniformly negative
+    (cross-sectional reversal -48% to -88%, RSI2 -44% to -59%, Bollinger MR
+    breakeven-gross-therefore-loss-net, and the liquidation-cascade study's own
+    finding that the not-yet-stretched dip-buy half was dead at t=-0.8). What
+    makes this worth MEASURING rather than assuming dead is that none of those
+    tests could separate forced flow from conviction flow — they had no OI. That
+    separation is the new thing here, and it is a hypothesis, not a result.
+    """
+    p = pd.Series(price).astype(float)
+    f = pd.Series(flow).astype(float).reindex(p.index)
+    r = pd.Series(regime).reindex(p.index)
+
+    # (a) flow decaying relative to its own recent magnitude. Compared against
+    #     the PRIOR window (shift(1)) so the current observation is not part of
+    #     the baseline it is being judged against.
+    mag = f.abs()
+    prior_mag = mag.shift(1).rolling(decay_lookback, min_periods=decay_lookback).mean()
+    decaying = mag < prior_mag
+
+    # (b) price no longer extending. Also compared against the PRIOR window: a
+    #     rolling min that includes the current bar can never be strictly
+    #     exceeded by it, so a flat series — the exact shape exhaustion looks
+    #     like — would never register. Non-strict (>=) because re-testing a low
+    #     without breaking it is precisely "stopped making NEW lows".
+    prior_min = p.shift(1).rolling(extreme_lookback, min_periods=extreme_lookback).min()
+    prior_max = p.shift(1).rolling(extreme_lookback, min_periods=extreme_lookback).max()
+    no_new_low = p >= prior_min
+    no_new_high = p <= prior_max
+
+    longs_done = (r == "long_liquidation") & decaying & no_new_low
+    shorts_done = (r == "short_covering") & decaying & no_new_high
+    return (longs_done | shorts_done).fillna(False).rename("liquidation_exhaustion")
 
 
 # ── shaping helpers ───────────────────────────────────────────────────────────
