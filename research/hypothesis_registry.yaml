@@ -250,12 +250,52 @@ hypotheses:
           Strategy gates now reject the trades it used to take (atr_alive +
           ProbabilityGate + cost-expectancy fix). Zero trades since fix
           deployed; the bot is correctly idle in current low-vol tape.
+      - date: 2026-09-03
+        script: none — code audit, no measurement performed
+        method: >
+          Audit of every order-flow surface in the repo while adding
+          src/orderflow_indicator.py (PR #110), plus an inventory of data/.
+          No strategy run, no backtest, no parameter touched.
+        result: >
+          UNMEASURABLE, and structurally so — the reason is infrastructure, not
+          signal quality. Every order-flow component is stateful and
+          live-feed-shaped (order_flow.OrderFlowImbalance, ofi_v2.OFICalculatorV2,
+          cvd_tracker.CVDTracker/TickCVDTracker, orderflow_ws.obi_from_book): each
+          takes an exchange handle or streaming updates, holds internal deques and
+          returns only the latest scalar. None can be run over a historical frame.
+          data/ contains NO recorded trade tape and NO book snapshots (largest
+          files are backtest decision logs and research caches). So every
+          order-flow number this strategy has ever computed was built in memory and
+          discarded. The OOS evidence this entry's gate demands has therefore never
+          been recordable — which is why the gate has sat unevaluated since
+          2026-05-22 rather than because the tape has been quiet. No claim is made
+          here about whether an edge exists; the point is that the question has
+          never actually been asked of data.
     deployment_gate:
       requires: positive OOS edge from non-loosened gates on fresh data
+      blocked_by: >
+        No persisted order-flow data exists to evaluate the gate against (see the
+        2026-09-03 evidence item). Unblocking needs a capture layer that records
+        trades and book snapshots to disk; src/orderflow_indicator.py (PR #110)
+        supplies the offline scoring functions but deliberately ships no recorder.
     status: paper-only
     notes: |
       Gate needs tick-level WS data but gets 2s REST snapshots, so it ~never
       fires — by design until WS pipeline is fully wired.
+
+      2026-09-03 follow-up: the binding constraint is narrower than "the WS
+      pipeline isn't wired". Even with a live WS feed, nothing persists what it
+      computes, so no amount of runtime produces an OOS record. Capture is the
+      prerequisite; scoring functions now exist (src/orderflow_indicator.py).
+
+      DO NOT RE-PROPOSE without new evidence:
+        - A new order-flow / OFI / CVD directional TRIGGER. The 2026-04-29
+          evidence block prices that: 228 trades, 0.9% win, -$20.14, 73.6% fee
+          drag. Memory `market_structure_signals_verdict` reaches the same verdict
+          independently — intraday order flow dies at the cost wall.
+        - Reading "unmeasurable" above as encouraging. It is not a hint that an
+          edge is hiding; it is a statement that this entry's evidence column
+          cannot be filled until capture exists.
 
   - id: regime-conditional-sizing
     name: Regime-aware position sizing
