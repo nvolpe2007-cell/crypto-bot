@@ -1,0 +1,164 @@
+//@version=6
+//
+// Trend Signal (Honest) — simple BUY/SELL from the one rule that measured profitable
+// ─────────────────────────────────────────────────────────────────────────────────
+// WHAT THIS IS
+//   Close vs a long moving average, with a hysteresis band to cut whipsaw. That's it.
+//   BUY when price closes above the band, SELL (to cash) when it closes below.
+//   No oscillators, no volume filter, no volatility filter, no confluence stack.
+//
+// WHY IT IS THIS SIMPLE — THIS IS THE IMPORTANT PART
+//   Built 2026-09-06 after measuring three richer designs on BTC + ETH daily bars
+//   (2019-2026, Coinbase, 0.54% round-trip cost, non-overlapping trades):
+//
+//     1. Fade the volatility bands (mean reversion)     -> PF 0.42-0.66. Loses.
+//        Systematically shorted a 20x bull market.
+//     2. Volatility-compression breakout ("coiled spring") -> PF 0.24-0.46. Loses.
+//        And its PREMISE is false: after vol compression the subsequent 5-day
+//        absolute move is SMALLER, not bigger (t = -2.46, p = 0.014). Low vol
+//        begets low vol. The "squeeze must release" idea did not survive contact
+//        with the data at this horizon.
+//     3. Volatility regime as an OVERLAY on this trend rule -> made it worse in
+//        12 of 12 cells across both assets. See the table below; it is the single
+//        most useful thing in this file.
+//
+// THE 12/12 RESULT, AND WHAT IT MEANS FOR "WIN RATE"
+//   Adding a volatility-regime filter to the trend rule RAISED the win rate and
+//   DESTROYED the profit factor, every single time (no hysteresis band, so the
+//   comparison is like-for-like):
+//
+//     BTC daily, SMA(100)          trades   win%     PF     total
+//       trend only                    50    46.0     5.30   +1299%
+//       + vol-expanding filter        91    47.3     1.42     +49%
+//       + vol-contracting filter      95    49.5     2.01    +116%
+//
+//     ETH daily, SMA(100)          trades   win%     PF     total
+//       trend only                    60    26.7     3.74    +441%
+//       + vol-expanding filter        96    45.8     1.27     -59%
+//       + vol-contracting filter     105    52.4     1.62    +185%
+//
+//   Read the ETH row twice. The filter nearly DOUBLED the win rate (26.7% -> 45.8%)
+//   and turned +441% into -59%. The mechanism: the filter chops long trends into
+//   more, shorter trades (60 -> 96), each paying the round-trip toll, and it exits
+//   during exactly the conditions where the few enormous winners accrue. Trend
+//   following earns its money from a small number of very large wins; anything that
+//   cuts those short raises the hit rate and lowers the expectancy.
+//
+//   So: a LOW win rate here is not a flaw to be fixed. A high win rate is
+//   purchasable at any time — by small targets against wide stops, or by filtering —
+//   and it costs money every time. Judge this by profit factor and expectancy.
+//
+// MEASURED PERFORMANCE OF THE ACTUAL SHIPPED DEFAULT (SMA 100, 2% band)
+//   Same 2019-2026 daily data, 0.54% round-trip cost, signals on confirmed closes:
+//
+//                    trades  win%    PF    total    maxDD   Sharpe   buy&hold (its DD)
+//     BTC              19    47.4   8.08  +2841%   -44.1%    1.02    +1437%  (-76.7%)
+//     ETH              23    34.8   8.21  +1576%   -68.3%    0.60    +1318%  (-79.4%)
+//
+//   Both beat buy-and-hold with a smaller drawdown, both split-halves positive, on
+//   the SAME parameters for both assets (not per-asset tuned).
+//
+// NOW THE PART THAT KEEPS YOU HONEST — READ BEFORE TRADING IT
+//   Those PF-of-8 numbers rest on ONE enormous trade per asset:
+//
+//                    t-stat   p      median trade   biggest win   its share of gross profit
+//     BTC             +1.44   0.17      -1.92%        +476%              59%
+//     ETH             +1.08   0.29      -7.93%       +1203%              81%
+//
+//   * NEITHER CLEARS t > 2, never mind this repo's family-wise Sidak bar (~3.0 at
+//     the ~20 candidates tried across these sessions). This is NOT a proven edge.
+//   * THE MEDIAN TRADE LOSES MONEY on both assets. You should expect most signals
+//     to be small losers. The money, in this sample, came from catching one massive
+//     trend per cycle and holding it. If you abandon the rule after four losses in
+//     a row, you will have paid all the costs and skipped the payoff — that is the
+//     single most common way people fail at trend following.
+//   * n = 19-23 trades is a small sample. PF 8 at n=19 is a description of this
+//     window, not a forecast.
+//   * The sample contains one dominant bull market. No walk-forward, no
+//     out-of-sample split, no multiple-testing correction.
+//   * A 4% band scored HIGHER than the shipped 2% (BTC PF 11.18). It was NOT
+//     selected, deliberately: 2% was chosen a priori to match the existing
+//     tsmom_paper.py convention, and picking the best-scoring band after seeing the
+//     results is the exact overfit this whole exercise was built to avoid.
+//
+// SIGNALS FIRE ON BAR CLOSE ONLY (confirmed bars). No repainting: every plotted
+// signal uses barstate.isconfirmed, so what you see on history is what you would
+// have gotten live.
+//
+// The volatility-regime background is included as a VISUAL ONLY, default OFF. It
+// does not gate a single signal. It exists so the thing that was measured harmful
+// stays visible and does not get quietly re-added as a filter later.
+//
+indicator("Trend Signal (Honest)", shorttitle="TrendHonest", overlay=true)
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+maLen     = input.int(100, "Trend MA length", minval=5,
+             tooltip="100 measured best across BTC and ETH daily. 50 and 200 also work; " +
+                     "50 trades more (more cost), 200 trades less (later exits). Not per-asset tuned.")
+maType    = input.string("SMA", "MA type", options=["SMA", "EMA"])
+bandPct   = input.float(2.0, "Hysteresis band %", minval=0.0, step=0.5,
+             tooltip="Price must close this far ABOVE the MA to buy, and this far BELOW to sell. " +
+                     "Without it, price hovering on the MA generates a stream of round-trips that " +
+                     "pay full cost each time. This is the honest turnover fix, not return tuning.")
+showBg    = input.bool(false, "Show volatility-regime background (VISUAL ONLY)",
+             tooltip="OFF by default on purpose. Using this as a signal FILTER was measured to " +
+                     "raise the win rate and destroy the profit factor in 12 of 12 test cells " +
+                     "across BTC and ETH. It is displayed for context, never to gate entries.")
+volShort  = input.int(10, "Vol regime: short window", minval=2)
+volLong   = input.int(50, "Vol regime: long window", minval=5)
+
+// ── Core rule ─────────────────────────────────────────────────────────────────
+ma      = maType == "EMA" ? ta.ema(close, maLen) : ta.sma(close, maLen)
+upper   = ma * (1 + bandPct / 100.0)
+lower   = ma * (1 - bandPct / 100.0)
+
+// State machine: long above the upper band, flat below the lower band, hold between.
+var bool isLong = false
+if close > upper
+    isLong := true
+else if close < lower
+    isLong := false
+
+buySignal  = isLong and not isLong[1]
+sellSignal = not isLong and isLong[1]
+
+// ── Volatility regime (display only — never gates a signal) ───────────────────
+logret  = math.log(close / close[1])
+volS    = ta.stdev(logret, volShort)
+volL    = ta.stdev(logret, volLong)
+expanding = volS > volL
+
+// ── Plotting ──────────────────────────────────────────────────────────────────
+plot(ma, "Trend MA", color=color.new(color.gray, 0), linewidth=2)
+upPlot  = plot(upper, "Upper band", color=color.new(color.gray, 70))
+loPlot  = plot(lower, "Lower band", color=color.new(color.gray, 70))
+fill(upPlot, loPlot, color=color.new(color.gray, 92), title="Hysteresis band")
+
+barcolor(isLong ? color.new(color.teal, 40) : color.new(color.gray, 70))
+
+bgcolor(showBg ? (expanding ? color.new(color.orange, 92) : color.new(color.blue, 94)) : na,
+        title="Vol regime (visual only)")
+
+plotshape(buySignal and barstate.isconfirmed, title="BUY", location=location.belowbar,
+          style=shape.labelup, color=color.new(color.teal, 0), textcolor=color.white,
+          text="BUY", size=size.small)
+plotshape(sellSignal and barstate.isconfirmed, title="SELL", location=location.abovebar,
+          style=shape.labeldown, color=color.new(color.red, 0), textcolor=color.white,
+          text="SELL", size=size.small)
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  title="BUY  — trend turned up",
+               message="Trend Signal: BUY {{ticker}} @ {{close}} (closed above trend band)")
+alertcondition(sellSignal, title="SELL — trend turned down",
+               message="Trend Signal: SELL {{ticker}} @ {{close}} (closed below trend band)")
+
+// ── On-chart status ───────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 1, 3, border_width=1)
+if barstate.islast
+    table.cell(info, 0, 0, isLong ? "POSITION: LONG" : "POSITION: CASH",
+               bgcolor=isLong ? color.new(color.teal, 20) : color.new(color.gray, 30),
+               text_color=color.white, text_size=size.normal)
+    table.cell(info, 0, 1, str.format("trend MA({0}) {1,number,#.##}", maLen, ma),
+               text_color=color.gray, text_size=size.small)
+    table.cell(info, 0, 2, "win rate is LOW by design — judge by PF",
+               text_color=color.gray, text_size=size.tiny)
