@@ -203,6 +203,33 @@ _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# ── Attribution ledger: never let a test write to the REAL P&L database ───────
+# src/attribution.record() writes through a PROCESS-WIDE SINGLETON whose db_path
+# defaults to data/attribution.db -- the live ledger behind the dashboard and the
+# daily Telegram P&L scorecard. regime_arm.py and arbitrage/funding_arb_paper.py
+# call record() directly, so merely exercising those code paths in a test appended
+# rows to production. Measured 2026-09-06: one `pytest tests/` run added 6 rows,
+# and 94 accumulated rows carried reason='test' with a hardcoded net_pnl of 10.0,
+# which made the regime_intraday arm read as a 100%-win-rate, +$942 strategy.
+#
+# The singleton is "first call wins the db_path", so claiming it HERE -- before any
+# test imports a module that records -- redirects every write to a throwaway file.
+# This changes no production behaviour; it only binds the singleton inside pytest.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+
+_attrib_tmpdir = _tempfile.mkdtemp(prefix="pytest-attribution-")
+_atexit.register(_shutil.rmtree, _attrib_tmpdir, True)
+
+import src.attribution as _attribution  # noqa: E402
+
+_attribution.get_ledger(_os.path.join(_attrib_tmpdir, "attribution.db"))
+assert _attribution.get_ledger().db_path.startswith(_attrib_tmpdir), (
+    "attribution ledger singleton was claimed before conftest could redirect it; "
+    "a test would write to the production data/attribution.db"
+)
+
 # Pre-import modules that test_live_trading.py would otherwise replace with
 # MagicMock stubs (via _ensure_stub).  Importing here — after all stubs above
 # are installed — caches the real implementations in sys.modules so that
