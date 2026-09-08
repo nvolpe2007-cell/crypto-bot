@@ -74,8 +74,38 @@
 //     single most common way people fail at trend following.
 //   * n = 19-23 trades is a small sample. PF 8 at n=19 is a description of this
 //     window, not a forecast.
-//   * The sample contains one dominant bull market. No walk-forward, no
-//     out-of-sample split, no multiple-testing correction.
+//   * The sample contains one dominant bull market.
+//
+// WALK-FORWARD — ADDED 2026-09-08, AND IT IS THE REASON TO TRUST THIS AT ALL
+//   The bullet above used to read "no walk-forward". It has now been run
+//   (scripts/walkforward_trust.py): 5 folds, 10 Coinbase assets, parameters
+//   chosen ONLY on data before each test window, results concatenated. Nothing
+//   below was fitted with the answer visible.
+//
+//     the FIXED (untuned) rule beat buy-and-hold on ...... 8 of 10 assets
+//     RE-TUNING each fold beat the fixed rule on .......... 2 of 10 assets
+//     the "best" parameter CHANGED between folds .......... 54% of the time
+//
+//   Read the second and third lines together: tuning this rule is NOISE. The
+//   optimal setting is unstable, and chasing it lost to just leaving it alone on
+//   8 of 10 assets. That is the strongest argument for the fixed defaults here,
+//   and the reason you should not sweep them.
+//
+//   EQUAL-WEIGHT BASKET of those 10, walk-forward test period only:
+//                          growth    maxDD   Sharpe
+//       rule on basket      1.50x   -38.4%    0.44
+//       hold the basket     1.10x   -65.7%    0.34
+//   Better on all three. This is the single most trustworthy result behind this
+//   script -- and note it is the BASKET, not any one chart.
+//
+//   ON STOCKS THE SAME TEST SAYS THE OPPOSITE: across 70 US tickers the rule beat
+//   buy-and-hold on only 4 of 70, and the 70-asset basket returned 2.55x against
+//   holding's 4.98x (drawdown -14.6% vs -33.6%, Sharpe 1.36 vs 1.28). On equities
+//   this is a RISK tool, not a return tool -- use pine/trend_signal_stocks.pine,
+//   which says so on its face.
+//
+//   Still no multiple-testing correction on the headline PF figures, and n is
+//   still small. Walk-forward raises confidence; it does not make this proven.
 //   * A 4% band scored HIGHER than the shipped 2% (BTC PF 11.18). It was NOT
 //     selected, deliberately: 2% was chosen a priori to match the existing
 //     tsmom_paper.py convention, and picking the best-scoring band after seeing the
@@ -160,14 +190,19 @@ volLong   = input.int(50, "Vol regime: long window", minval=5)
 // -17.8%. This panel exists so you can see, on one chart, which of your basket
 // is currently LONG and which is in CASH — it changes no signal on this symbol.
 showPanel = input.bool(true, "Show multi-asset portfolio panel", group="Portfolio")
-s1 = input.symbol("BINANCE:BTCUSDT",  "Asset 1", group="Portfolio")
-s2 = input.symbol("BINANCE:ETHUSDT",  "Asset 2", group="Portfolio")
-s3 = input.symbol("AMEX:SPY",         "Asset 3", group="Portfolio")
-s4 = input.symbol("NASDAQ:QQQ",       "Asset 4", group="Portfolio")
-s5 = input.symbol("NASDAQ:NVDA",      "Asset 5", group="Portfolio")
-s6 = input.symbol("AMEX:GLD",         "Asset 6", group="Portfolio")
-s7 = input.symbol("NASDAQ:TLT",       "Asset 7", group="Portfolio")
-s8 = input.symbol("AMEX:EEM",         "Asset 8", group="Portfolio")
+// Defaults are the walk-forward-tested crypto basket. The 8 slots are filled by
+// LONGEST COINBASE HISTORY -- a performance-blind criterion, chosen so this is not
+// the best-8-of-10. For the record the tested basket was 10 and included ATOM and
+// SOL; ALGO and ATOM both LOST money outright over the test period and the basket
+// still beat holding. Swap any of these freely; the panel changes no signal.
+s1 = input.symbol("COINBASE:BTCUSD",  "Asset 1", group="Portfolio")
+s2 = input.symbol("COINBASE:ETHUSD",  "Asset 2", group="Portfolio")
+s3 = input.symbol("COINBASE:LTCUSD",  "Asset 3", group="Portfolio")
+s4 = input.symbol("COINBASE:BCHUSD",  "Asset 4", group="Portfolio")
+s5 = input.symbol("COINBASE:ETCUSD",  "Asset 5", group="Portfolio")
+s6 = input.symbol("COINBASE:XLMUSD",  "Asset 6", group="Portfolio")
+s7 = input.symbol("COINBASE:LINKUSD", "Asset 7", group="Portfolio")
+s8 = input.symbol("COINBASE:ALGOUSD", "Asset 8", group="Portfolio")
 
 // ── Core rule ─────────────────────────────────────────────────────────────────
 // Stateless equivalent of "long above the upper band, flat below the lower band,
