@@ -250,12 +250,52 @@ hypotheses:
           Strategy gates now reject the trades it used to take (atr_alive +
           ProbabilityGate + cost-expectancy fix). Zero trades since fix
           deployed; the bot is correctly idle in current low-vol tape.
+      - date: 2026-09-03
+        script: none — code audit, no measurement performed
+        method: >
+          Audit of every order-flow surface in the repo while adding
+          src/orderflow_indicator.py (PR #110), plus an inventory of data/.
+          No strategy run, no backtest, no parameter touched.
+        result: >
+          UNMEASURABLE, and structurally so — the reason is infrastructure, not
+          signal quality. Every order-flow component is stateful and
+          live-feed-shaped (order_flow.OrderFlowImbalance, ofi_v2.OFICalculatorV2,
+          cvd_tracker.CVDTracker/TickCVDTracker, orderflow_ws.obi_from_book): each
+          takes an exchange handle or streaming updates, holds internal deques and
+          returns only the latest scalar. None can be run over a historical frame.
+          data/ contains NO recorded trade tape and NO book snapshots (largest
+          files are backtest decision logs and research caches). So every
+          order-flow number this strategy has ever computed was built in memory and
+          discarded. The OOS evidence this entry's gate demands has therefore never
+          been recordable — which is why the gate has sat unevaluated since
+          2026-05-22 rather than because the tape has been quiet. No claim is made
+          here about whether an edge exists; the point is that the question has
+          never actually been asked of data.
     deployment_gate:
       requires: positive OOS edge from non-loosened gates on fresh data
+      blocked_by: >
+        No persisted order-flow data exists to evaluate the gate against (see the
+        2026-09-03 evidence item). Unblocking needs a capture layer that records
+        trades and book snapshots to disk; src/orderflow_indicator.py (PR #110)
+        supplies the offline scoring functions but deliberately ships no recorder.
     status: paper-only
     notes: |
       Gate needs tick-level WS data but gets 2s REST snapshots, so it ~never
       fires — by design until WS pipeline is fully wired.
+
+      2026-09-03 follow-up: the binding constraint is narrower than "the WS
+      pipeline isn't wired". Even with a live WS feed, nothing persists what it
+      computes, so no amount of runtime produces an OOS record. Capture is the
+      prerequisite; scoring functions now exist (src/orderflow_indicator.py).
+
+      DO NOT RE-PROPOSE without new evidence:
+        - A new order-flow / OFI / CVD directional TRIGGER. The 2026-04-29
+          evidence block prices that: 228 trades, 0.9% win, -$20.14, 73.6% fee
+          drag. Memory `market_structure_signals_verdict` reaches the same verdict
+          independently — intraday order flow dies at the cost wall.
+        - Reading "unmeasurable" above as encouraging. It is not a hint that an
+          edge is hiding; it is a statement that this entry's evidence column
+          cannot be filled until capture exists.
 
   - id: regime-conditional-sizing
     name: Regime-aware position sizing
@@ -502,3 +542,827 @@ hypotheses:
       methodological fix made before the full run — sweeping the smoothing window
       to chase a better number would NOT have been legitimate.
       Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
+
+  - id: altcoin-cross-venue-arb
+    name: Cross-exchange altcoin arbitrage
+    family: arb
+    hypothesis: >
+      A cross-exchange price spread on liquid altcoins, once found, can be
+      captured net of round-trip costs and transfer risk.
+    code: live cross-venue spread survey (no arm shipped)
+    evidence:
+      - date: 2026-08-04
+        result: >
+          Live simultaneous snapshot, 10 altcoins (XRP, ADA, LINK, DOT, AVAX,
+          LTC, BCH, DOGE, ATOM, ALGO) across 5 exchanges (Kraken, Coinbase,
+          OKX, Bitstamp, KuCoin). Best cross-exchange spreads found: 2-11bps
+          (DOGE 10.7bps, AVAX 7.9bps, ADA 6.8bps) against this repo's own
+          15-54bps round-trip cost model for a single leg — the cost exceeds
+          the entire spread before counting withdrawal time, transfer risk,
+          or slippage on real size.
+    deployment_gate:
+      requires: a spread exceeding the round-trip cost floor on real size
+      blocked_by: best live spread 2-11bps against a 15-54bps cost floor —
+        dead before transfer risk is counted
+    status: sit-out
+    notes: |
+      Structural, not a venue-pair or speed problem — more venues or more
+      coins do not move the cost floor. Revisit only under a materially
+      different fee tier or venue access, which would be a different
+      hypothesis about costs.
+      Source doc: RESEARCH_2026-08-04_altcoin_pairs_and_arb.md.
+
+  - id: altcoin-triangular-arb
+    name: Single-venue triangular arbitrage extended to altcoins
+    family: arb
+    hypothesis: >
+      Extending the existing (disabled) BTC/ETH/SOL triangular-arb scanner to
+      altcoin/BTC crosses finds cycles that clear the 3-leg taker fee floor.
+    code: src/triangular_arb.py (TRIARB_ENABLED=0), extended to 11 alt/BTC
+      crosses
+    evidence:
+      - date: 2026-08-04
+        result: >
+          Live order-book snapshot, both cycle directions, on 11 altcoin/BTC
+          cross-pairs on Kraken (all exist except AVAX/BTC). Every single
+          altcoin cycle priced at -118bps to -137bps, dominated by the 3-leg
+          taker fee floor (3 x 0.40% = 120bps) with essentially zero real
+          spread on top. ETH, the tightest cycle available, still -117.6bps.
+    deployment_gate:
+      requires: a cycle clearing the 3-leg taker fee floor
+      blocked_by: every altcoin cycle prices at -118 to -137bps against a
+        120bps fee floor
+    status: sit-out
+    notes: |
+      Extending to alts does not change the existing disabled verdict; the
+      scanner stays off. More cycles or coins cannot fix a fee-floor problem.
+      Revisit only under a maker-fee or rebate structure that changes the
+      120bps floor.
+      Source doc: RESEARCH_2026-08-04_altcoin_pairs_and_arb.md.
+
+  - id: altcoin-pairs-cointegration
+    name: Cointegrated altcoin pairs (Engle-Granger discovery) — RETRACTED
+    family: pairs
+    hypothesis: >
+      A proper Engle-Granger cointegration test (OLS hedge ratio + ADF on the
+      residual) across a 10-coin altcoin universe finds pairs whose spread
+      reverts tradeably, net of cost, out of sample.
+    code: backtest_altcoin_pairs.py, pairs_altcoin_paper.py (RETRACTED — do
+      not deploy)
+    evidence:
+      - date: 2026-08-04
+        result: >
+          Cointegration test on the first half of 5 years of hourly data
+          found 10 of 45 pairs (C(10,2) on a 10-coin universe) passing ADF
+          p<0.05. Backtest on the held-out second half, split again into two
+          sub-periods requiring independent agreement, found 4 pairs clearing
+          every bar: LINK/SOL (n=288, 73.6% WR, +$1,343), ETH/AVAX (n=263,
+          66.5% WR, +$968), ETH/XRP (n=276, 70.3% WR, +$704), ETH/BCH (n=282,
+          66.0% WR, +$878). Survived a 4-fold walk-forward and a
+          correlation-regime sizing refinement.
+      - date: 2026-08-07
+        result: >
+          RETRACTED. Root-cause check found 37% of all 2,226 backtested
+          trades entered at exactly hour 0 UTC — a data-artifact signature.
+          backtest_altcoin_pairs.py::load_hourly() fetched genuine hourly
+          data only for BTC/ETH/SOL; every other coin (including the alt leg
+          of all four validated pairs) used daily closes forward-filled to
+          hourly, which manufactures an artificially smooth,
+          "mean-reverting" spread by construction. Re-run with genuine
+          hourly data on every leg: every fold of every pair is now negative
+          or indistinguishable from noise (e.g. ETH/AVAX -$127/-$148/-$67
+          across 3 folds, t=-1.17 to -1.93; LINK/SOL best fold +$12 at
+          t=+0.14, noise). None of the apparent robustness (train/test
+          split, 4-fold walk-forward, sub-period agreement) was evidence of
+          anything, because the same artifact was present in every window
+          tested.
+    deployment_gate:
+      requires: n >= 30 forward paper trades — never reached; the backtest
+        itself was invalid
+      blocked_by: RETRACTED — the alt leg of every validated pair used daily
+        closes forward-filled to hourly
+    status: killed
+    notes: |
+      The strongest, most-validated result this repo ever produced, and it
+      was entirely a data-pipeline artifact. Kept in full because how it
+      fooled a careful process is more valuable than the finding would have
+      been.
+
+      STANDING METHODOLOGICAL LESSON: whenever mixing data sources of
+      different native resolution, verify the finer series is genuinely
+      finer — not resampled or filled from the coarser one — BEFORE trusting
+      any backtest built on it. Robustness checks (train/test splits,
+      walk-forward, sub-period agreement) cannot detect a flaw uniformly
+      present in the input; data-fidelity checks are a different class of
+      test than overfitting checks, and passing one says nothing about the
+      other.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Deploying the 4 pairs, or PR #93 in its shipped form.
+        - Any pairs result computed on the daily-ffill cache. Re-discovery
+          would need 100% genuine hourly data from the start.
+      The arm mechanics (imported from pairs_paper.py) and the regime-sizing
+      methodology are fine; the specific pairs have no demonstrated edge.
+      Source doc: RESEARCH_2026-08-04_altcoin_pairs_and_arb.md (PR #93 —
+      should NOT be merged).
+
+  - id: btc-intraday-and-leverage
+    name: BTC intraday patterns, and the leverage/volatility-drag result
+    family: directional
+    hypothesis: >
+      BTC intraday session structure (Asia range, US-open volatility,
+      breakout timing) contains tradeable directional patterns, and fixed
+      leverage on a positive-EV multi-day signal scales returns
+      proportionally.
+    code: session-scratch scripts (methods documented); consequences shipped
+      on branch lev-perp-risk-controls
+    evidence:
+      - date: 2026-07-01
+        result: >
+          410 days of BTC-USD hourly candles (Coinbase, 2025-05-15 to
+          2026-07-02, a -42% period). Structural intraday patterns confirmed
+          but not directional: US-open volatility spike (avg hourly range
+          ~doubles 13:00-15:00 UTC), Asia range breaks during EU/US hours 95%
+          of days (31% break both sides). Every intraday directional variant
+          tested died to costs after realistic fees: Asia breakout ~30% WR
+          negative EV; failed-break fade (9 variants) roughly breakeven
+          pre-fee, negative at 0.10% round-trip; evening drift long
+          +0.10%/trade pre-fee but fees consume it; candle-based market
+          making -43% to -190%; US-open fade 48% WR negative. What survived:
+          multi-day TSMOM (7d/14d long-short, MA 10/40 cross, Donchian 20d),
+          edge ~+0.06%/day, real but thin and streaky (see
+          tsmom-multiday-majors).
+
+          Leverage result (same TSMOM-14 signal, compound equity, realistic
+          fees/funding, liquidation checked against actual intraday wicks):
+          Sharpe is IDENTICAL (~0.25) from 1x to 5x fixed leverage — leverage
+          added zero risk-adjusted return, only amplified volatility drag
+          (grows with the square of moves). At BTC's ~2%/day vol, drag at 2x
+          already exceeds a 0.06%/day edge, so ~2x is where profit
+          mathematically flips to loss for an edge this size. Fixed
+          leverage: 1x +2%/-32%DD, 2x -14%/-56%DD, 3x -41%/-73%DD, 5x
+          -85%/-92%DD, 10x -99%/-99%DD, 20x liquidated in ~25 days.
+          Vol-targeted sizing (2%/day target / realized 20d vol, cap 2-5x)
+          chose ~1.1x average and returned +8-9% at -38% maxDD — BTC's own
+          volatility is the binding constraint, not the exchange's max
+          leverage.
+    deployment_gate:
+      requires: none — intraday taker on candles is closed; the leverage
+        result is infrastructure, already applied
+      blocked_by: every intraday variant tested died to costs; leverage
+        above ~2x is negative-EV by construction at this edge size
+    status: sit-out
+    notes: |
+      Two separable results kept in one entry: an intraday-strategy
+      graveyard (closed, no gate to clear), and the leverage/volatility-drag
+      math, which is now standing law in this repo. Consequences already
+      applied on branch lev-perp-risk-controls: hard 5% stop, vol-targeted
+      effective leverage (3x became a ceiling, vol picks ~1.1-1.2x),
+      correlation-capped margin (BTC/ETH/SOL same-direction is ~one bet),
+      news-halt entry gate.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Intraday taker strategies on candles — breakouts, fades, session
+          drift, open-fades all died to costs.
+        - Fixed leverage >= 2x on a <= 0.1%/day edge — negative-EV by
+          construction from the drag math, regardless of win rate.
+        - Candle-based market making, in any variant.
+      Source doc: RESEARCH_2026-07-01_btc_patterns_and_leverage.md.
+
+  - id: lev-perp-macross-universe
+    name: MA10/40-cross entry x 8-coin universe x v1 fixed-TP exit
+    family: directional
+    hypothesis: >
+      Replacing v1's close-vs-SMA50 entry with an MA10/40 cross, on the same
+      8-coin universe and fixed-TP exit, produces a distinguishable and
+      better-performing entry signal.
+    code: scripts/lev_perp_v1_macross_universe_research.py
+    evidence:
+      - date: 2026-08-07
+        result: >
+          Pre-registered at k=1 (named before data was touched). Control
+          (v1's SMA-50 arm) reproduced PR #87's published numbers exactly:
+          n=856, 52.8% win, +$0.161 expectancy, t(sym)=1.21, DSR(sym)=0.887.
+          Candidate (MA10/40-cross) n=858, 53.1% win, +$0.181 expectancy,
+          t(sym)=1.20, DSR(sym)=0.885 — indistinguishable from control,
+          marginally worse DSR under symbol clustering. NULL: the two entry
+          signals agree on 87.9% of bars (12,025/13,676; 84.1-89.6% per
+          symbol) once production's RSI/trend-age/volume/ADX filters gate
+          the rest — ADA and DOT produce identical net P&L in both arms.
+          Separately, discovered that PR #87's symbol-clustering (design
+          effect 1.00, i.e. no deflation) understated uncertainty:
+          week-clustering (design effect 2.19-2.27, since crypto correlates
+          across coins in the same week, not within one coin's sequential
+          trades) drops the control from DSR 0.887 to 0.793. Both arms also
+          fail the split-half gate (first half negative in both: -$10.2
+          control, -$0.5 candidate; DOT alone is 53% of the candidate's
+          net). Power calc: clearing t=2.00 needs per-trade Sharpe ~0.103
+          (control) — a 2.2x improvement on the observed 0.0415-0.0464 — and
+          would take ~26-31 years of 8-coin daily trades at the live forward
+          rate, or 39-48 simultaneously liquid majors with 5 years of
+          history, which do not exist.
+    deployment_gate:
+      requires: DSR > 0.95 and t >= 2.00 at k=1
+      blocked_by: mechanical null — the two entry signals agree on 87.9% of
+        bars
+    status: killed
+    notes: |
+      Closes the universe-widening line of research. The binding constraint
+      is per-trade Sharpe, not trade count or universe breadth — 16 coins
+      already scored worse than 8 (PR #85), and widening further cannot fix
+      a signal problem.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Varying the fast/slow MA lengths to chase 0.95 — converts a
+          pre-registered k=1 into a sweep; at k=10 the t-bar rises to 2.80.
+        - Widening the universe past 8 — tested twice; even 39 coins only
+          reaches t=2.00 at the current Sharpe.
+        - Citing DSR 0.887 as "nearly proven" — it is 0.793-0.815 under
+          time clustering.
+        - Treating the live 73%-WR / n=11 window as informative — refuted
+          separately (real long-run rate is ~51-53%).
+      Standing follow-on: the only lever with the right sign is raising
+      per-trade Sharpe ~2.2x, which means changing what the arm IS (exit
+      mechanics, sizing, or a genuinely uncorrelated entry) — see
+      lev-perp-asymmetric-payoff for the exit-mechanics attempt.
+      Source doc: RESEARCH_2026-08-07_lev_perp_v1_macross_universe.md.
+
+  - id: lev-perp-fixed-tp-vs-trailed
+    name: lev_perp exits — fixed take-profit versus ATR-trailed chandelier
+      (5-year replay)
+    family: directional
+    hypothesis: >
+      Replaying the actual production code of both lev_perp exit designs (v1
+      fixed +5%TP/-5%SL, v2 ATR(14)x2 chandelier trail) over a full 5-year
+      cycle, rather than a short window, resolves which exit mechanic is
+      real.
+    code: lev_perp_paper.py + lev_perp_v2_paper.py replayed over Coinbase
+      daily bars
+    evidence:
+      - date: 2026-07-02
+        result: >
+          5-year replay (2021-06 to 2026-07, two bulls + 2022 crash + 2023-24
+          chop), $1k book, $333 fixed margin per position, actual production
+          code (not a reimplementation). v1 fixed-TP: -0.5% return, -16%
+          maxDD, 323 trades, 51% WR, 0 liqs (aggressive risk: -0.8%, -24%
+          maxDD). v2 ATR chandelier: +22.8% return, -24% maxDD, 129 trades,
+          38% WR, 0 liqs (aggressive risk: +34.3%, -33% maxDD). v1's own
+          21-month replay had shown +29.6% — that was window selection; the
+          5-year number is -0.5%, a full-cycle wash (323 trades at 51% WR
+          with wins capped at +5% donates every trend's tail, and choppy
+          years eat the rest). v2's best year was the 2022 crash (+$205,
+          shorts ridden down where v1 kept cashing out at +5%); its cost is
+          2023-24 chop (-$315 over two years) — a real but streaky trend
+          profile, ~4%/yr at base risk, two consecutive losing years.
+          Leverage confirmed as amplify-only: v1 at 5x is still ~zero with
+          deeper drawdown; combined with the 2026-07-01 findings (fixed 10x
+          on this replay = 18 liquidations, book touched -97%).
+    deployment_gate:
+      requires: forward proof-scorecard verdict at n >= 30 on the
+        pre-specified 2x2
+      blocked_by: v1 fixed-TP is a full-cycle wash (-0.5% over 5 years); v2
+        is real but thin and streaky
+    status: sit-out
+    notes: |
+      Companion to btc-intraday-and-leverage. Window selection is the
+      dominant backtest error this repo keeps catching: 21 months said v1
+      +29.6%, 60 months said -0.5%. Any future arm evaluation should replay
+      the longest window the data source allows.
+
+      Sharpened hypothesis, written before forward data: v1 fails its proof
+      bar at both risk levels, v2 survives, base-vs-aggressive resolves as a
+      drawdown-preference tie on risk-adjusted terms. The forward 2x2
+      (deploy/lev_perp_arms_cron.txt) runs as pre-specified; proof_scorecard
+      is the judge.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Fixed-TP exits on this arm family — measured as a full-cycle wash.
+        - Any leverage claim framed as a return lever — Sharpe is identical
+          1x to 5x.
+        - Short-window backtests as evidence — the 21-month v1 result is the
+          standing cautionary example.
+      Caveats: daily bars cannot resolve intrabar TP-vs-stop ordering
+      (scored conservatively, same as production); one asset class, one
+      venue's prices; funding modelled as constant drag; SOL history starts
+      2021-06.
+      Source doc: RESEARCH_2026-07-02_lev_perp_5yr_replay.md.
+
+  - id: lev-perp-asymmetric-payoff
+    name: lev_perp asymmetric payoff — take-profit widened to 3x the stop
+    family: directional
+    hypothesis: >
+      Widening only the take-profit to 3x the stop (keeping the fixed exit's
+      high re-entry frequency) restores the positive skew a trend-following
+      system needs, without the chandelier's trade-count collapse.
+    code: scripts/lev_perp_asymmetric_payoff_research.py
+    evidence:
+      - date: 2026-08-07
+        result: >
+          Second pre-registered test of the day (single value, 3:1 chosen
+          from trend-following theory, not swept). BASELINE (5%/5%): n=856,
+          52.8% win, +$0.161 expectancy, Sharpe +0.0415, skew -0.087,
+          t(week)=0.82, split halves -10.2/+147.7. CANDIDATE (15%/5%): n=562,
+          28.6% win, +$0.447 expectancy, Sharpe +0.0735, skew +1.407,
+          t(week)=1.23, split halves +87.4/+163.6 — the first lev_perp
+          config in this repo's history with both split-halves positive.
+          Every predicted effect appeared: skew flipped sign, Sharpe +77%,
+          expectancy +178%, win rate collapsed 52.8%->28.6% exactly as
+          predicted (close reasons shifted 451 TP/391 SL to 155 TP/376 SL).
+          Pooling ALL 20 candidates ever tried in this line before computing
+          sr0 (per the lev-perp-regime-entry-search lesson): Šidák t-bar at
+          k=20 is 3.02, sr0=0.0953. Candidate Sharpe 0.0735 is BELOW sr0 —
+          indistinguishable from the luckiest of 20 attempts. t(week) 1.23
+          vs 3.02 bar: FAIL. DSR 0.351 vs 0.95 bar: FAIL. Clearing t=3.02 at
+          n=562 (week design-effect 2.01) would need per-trade Sharpe >=
+          0.1806, a ~1.8x improvement on the best-ever 0.0980 across all 20
+          candidates.
+    deployment_gate:
+      requires: "DSR > 0.95 and t >= 3.02 (Sidak bar at pooled k=20)"
+      blocked_by: candidate sharpe 0.0735 is BELOW sr0 0.0953 —
+        indistinguishable from the luckiest of 20 attempts
+    status: paper-only
+    notes: |
+      The hypothesis was CONFIRMED (every predicted mechanism appeared) but
+      the bar was still NOT cleared — these are different claims, kept
+      apart. Not proven edge; the allocator should keep lev_perp benched. It
+      IS a better-motivated configuration than production: both 5%/5% and
+      15%/5% are unproven, but 15%/5% dominates on every robustness measure
+      available (skew, both split-halves, expectancy/trade) and rests on an
+      economic argument rather than a fitted parameter — switching the
+      paper arm's TP to 15%/5% is a defensible choice about which unproven
+      config to gather forward evidence on. Cost: n drops ~35% slower
+      (856->562 trades over the same window).
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Sweeping the payoff ratio (2:1, 4:1, 5:1, ...) — 3:1 was
+          pre-registered and run once precisely so it stayed k=1; more
+          ratios push pooled k past 20 and raise the bar for every candidate
+          including this one.
+        - Claiming 15%/5% as an edge because skew/split-halves improved —
+          those are robustness diagnostics, not significance; pooled DSR is
+          0.351.
+        - Any further lev_perp variant judged at k=1 — the honest
+          cumulative count is now 20.
+      Standing follow-on: per-trade Sharpe must roughly double (0.098
+      best-ever to ~0.18 needed). Nothing in the price-derived, daily-bar,
+      8-liquid-major search space has produced that in 20 attempts across
+      four sessions. Any future attempt should come from a structurally
+      different information source (order flow, funding, cross-sectional
+      rank), not another function of the same daily closes.
+      Source doc: RESEARCH_2026-08-07_lev_perp_asymmetric_payoff.md.
+
+  - id: tick-ofi-cvd-standalone
+    name: Tick-level OFI/CVD as a standalone entry signal
+    family: microstructure
+    hypothesis: >
+      Raw tick-level order-flow imbalance and cumulative volume delta,
+      tested directly against real tick data rather than the live paper
+      record, contain a tradeable directional edge net of cost.
+    code: fetch_ticks.py + tick OFI/CVD grid sweep
+    evidence:
+      - date: 2026-07-21
+        result: >
+          Real Kraken tick-by-tick trades (BTC/USD 149,471 ticks, ETH/USD
+          61,398 ticks, 2026-07-18 to 07-21), built onto a continuous
+          1-second grid, OFI = rolling sum of signed trade volume z-scored
+          against its own trailing 1-hour mean/std. Step 1 (signal is real):
+          300s OFI window to 900s forward return, |z|>1.5, mean +1.46bps,
+          t=16.15, n=33,330 overlapping windows. Step 2 (expectancy is not,
+          on non-overlapping trades): strongest single-day cell (BTC, 300s
+          window, z>2.5, 900s hold) = 67 trades, gross +5.65bps/trade, 10.4%
+          win rate; net -20.35bps at Kraken taker round-trip (26bps),
+          -10.35bps even assuming a free maker fill (16bps round-trip). Step
+          3 (full grid): both symbols x OFI windows {30,60,300,600}s x holds
+          {60,300,900,1800}s x entry z {1.5,2.0,2.5} = 96 cells — zero net
+          positive against even the maker cost model. Best case across the
+          entire grid (BTC, 300s, z>2.5, 30-min hold): 6.14bps gross vs
+          15.96bps maker cost = -9.86bps net. ETH corroborates independently
+          at ~-10.5bps.
+    deployment_gate:
+      requires: a net-positive cell against the maker cost model — zero of
+        96 cells achieved it
+      blocked_by: raw OFI edge is 1-6bps; maker round-trip alone is 16bps.
+        The gap is 2-3x, not a tuning distance
+    status: killed
+    notes: |
+      OFI carries real, statistically robust predictive signal (t>16 on the
+      gross number) but the signal (1-6bps) is 2-3x too small to clear cost
+      (16bps maker round-trip) at any window, horizon or threshold tested.
+      Distinct from the production scalper (scalper-microstructure-ofi-v2)
+      — this tested raw tick data rather than the live paper record, and
+      reaches the same verdict independently. Also closes the "balls
+      indicator" question (Bookmap-style order-flow bubbles are a
+      visualization of the same signed-trade-volume data OFI/CVD already
+      compute — no new information).
+
+      Implication for the 90-day maker-only microstructure re-test: even a
+      perfect maker fill costs ~3x the raw OFI edge, so for that re-test to
+      succeed, the act of resting (not just avoiding the spread) would have
+      to add several bps on top of raw OFI by filling only on favourable
+      adverse-selection draws — a different and unproven hypothesis. Treat
+      that re-test's bar as genuinely hard to clear, not a formality.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Tick-level OFI/CVD as a standalone entry signal at this size and
+          cost structure.
+        - Any variant justified by the t=16 gross number — that statistic
+          is about predictiveness, not profitability.
+      Cheapest next checks if ever revisited: CVD divergence (price vs CVD
+      disagreement) as a distinct signal, and a multi-week rather than
+      3-day sample. Caveats: 3-day sample, one volatility regime; 1-second
+      aggregation loses true tick timing.
+      Source doc: RESEARCH_2026-07-21_tick_ofi_cvd.md.
+
+  - id: liq-cascade-continuation
+    name: Liquidation-cascade continuation (stretched cascades, 48h time
+      exit)
+    family: directional
+    hypothesis: >
+      Momentum after a liquidation cascade continues in the cascade's
+      direction, particularly when the cascade occurs in an
+      already-stretched market — do externally-claimed "Regime-Switch
+      Cascade" / "Swing-Proximity Cascade" strategies (+1,312% / +1,100%
+      claimed elsewhere) survive our data and cost model?
+    code: backtest_liq_cascade.py
+    evidence:
+      - date: 2026-07-17
+        result: >
+          1h OKX bars, BTC/ETH/SOL, 2021-07 to 2026-07 (43,800 bars each). No
+          historical liquidation feed available, so cascades proxied
+          (|return z|>2.5 against rolling 200-bar sigma AND volume z>2.0,
+          ~1.4% of bars, ~1,900 events). Costs: lev_perp production (0.15%
+          notional round-trip + 10% APY funding drag). Result 1: the
+          externally-claimed strategies die here with a 2xATR chandelier
+          trail — with_cascade -$9,216 (1474 trades, 26% WR), fade_cascade
+          -$13,369, regime_switch (claim #1) -$12,207, swing_prox (claim #2)
+          -$7,381; cause is the exit (tight trail sits inside the
+          post-cascade whipsaw zone, ~75% of trades stop out within hours).
+          Result 2: raw continuation drift is real on time-exits — 12h
+          +0.21% (t=2.2), 24h +0.33% (t=2.6), 48h +0.58% (t=3.4), gross, all
+          ~1,877 events. Result 3: the stretch filter works backwards from
+          the external claim — at 24h, not-stretched cascades -0.19%
+          (t=-0.8, dead), already-stretched (|close-SMA50|>=3xATR) +0.59%
+          (t=+3.7). Best surviving shape (stretched-cascade continuation,
+          48h time exit, net of full costs): 681 trades, 50.5% WR, +$4,572
+          on $1k notional/trade (+0.67%/trade), maxDD -$939, positive every
+          year, both sides positive, day-clustered t=+2.18 over 438
+          trade-days. NOT deployable as proven: (1) selection bias — the
+          stretch split and 48h horizon were found post-hoc on the same
+          sample after the primary hypothesis failed; t=2.18 does not clear
+          the family-wise bar for the number of cells examined. (2) Edge
+          decay by year: 2021 +$745, 2022 +$1,090, 2023 +$2,048, 2024 +$610,
+          2025 +$48, 2026H1 +$30 — a 2021-23 phenomenon (SOL alone = $2.6k
+          of $4.6k), flat for 18 months. (3) Proxy risk — return/volume
+          z-scores approximate liquidations; a real feed may select
+          different events.
+    deployment_gate:
+      requires: family-wise t-bar for the number of cells examined, on a
+        sample not used to find the split
+      blocked_by: selection bias (split found post-hoc) and visible edge
+        decay — 2025-26 is flat
+    status: sit-out
+    notes: |
+      The externally-claimed strategies' numbers are in-sample agent-search
+      survivors on someone else's data; on ours the same shapes lose money.
+      Do not chase them. If pursued: a cascade_cont_paper arm
+      (stretched-cascade continuation, 48h hold, $333 margin at 3x, same
+      scorecard bar as every other arm) — given the 2025-26 decay, the
+      honest expectation is a flat forward test. Also: start recording the
+      real Binance forceOrder feed now so a genuine liquidation-based
+      version becomes testable later (specified 2026-09-03, not yet built —
+      see the orderflow capture-schema follow-up on
+      scalper-microstructure-ofi-v2).
+      Consistent with standing conclusions: intraday taker dies to costs
+      (Result 1); the only edges that survive are multi-day and
+      momentum-shaped (rhymes with tsmom-multiday-majors).
+      Source doc: RESEARCH_2026-07-17_liquidation_cascade.md.
+
+  - id: xs-relative-strength-momentum
+    name: Cross-sectional relative-strength momentum (top-3 of 16, weekly
+      rebalance)
+    family: directional
+    hypothesis: >
+      Ranking a 16-coin universe by trailing 30-day return, holding the top
+      3 equal-weighted, rebalancing weekly, produces positive risk-adjusted
+      returns without a crash-control overlay.
+    code: 4-fold walk-forward on the 16-coin universe (survey, no arm
+      shipped)
+    evidence:
+      - date: 2026-08-04
+        result: >
+          4-fold walk-forward, textbook pre-specified parameters, not
+          swept. Fold 0 (2021-08 to 2022-10): -78.6% return, -84.5% maxDD.
+          Fold 1 (2022-11 to 2024-01): +24.4%, -46.1% maxDD. Fold 2
+          (2024-01 to 2025-04): +11.5%, -62.2% maxDD. Fold 3 (2025-04 to
+          2026-07): -67.2%, -82.0% maxDD. Two of four folds catastrophic
+          with ~83% drawdowns — the classic momentum-crash failure mode
+          where a concentrated momentum portfolio is wiped out on regime
+          reversal. No parameter tuning was attempted.
+    deployment_gate:
+      requires: positive return across all walk-forward folds without
+        catastrophic drawdown
+      blocked_by: 2 of 4 folds catastrophic (-78.6%, -67.2%) with ~83%
+        drawdowns — momentum-crash failure mode
+    status: sit-out
+    notes: |
+      Independently reconfirms, with real walk-forward on this data, the
+      earlier exhaustive 320-strategy search finding that cross-sectional
+      and dual momentum had zero survivors. Contrast with
+      tsmom-multiday-majors (time-series momentum, each asset judged
+      against its own history, positions taken or not independently —
+      degrades to cash in a bad regime) vs this (cross-sectional, assets
+      judged against each other, forcing concentration into whatever just
+      ran — maximally exposed at exactly the wrong moment). The distinction
+      is the whole result.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Tuning the lookback, holding count, or rebalance period to
+          rescue the two bad folds — that is fitting to the folds.
+        - Any concentrated top-N crypto momentum basket without an
+          explicit crash control, and with the drawdown stated in dollars
+          up front.
+      Source doc: RESEARCH_2026-08-04_altcoin_pairs_and_arb.md.
+
+  - id: tsmom-multiday-majors
+    name: Multi-day time-series momentum on majors — the only surviving
+      directional shape
+    family: directional
+    hypothesis: >
+      Multi-day time-series momentum (each major judged against its own
+      trailing return, independently) survives realistic transaction costs
+      where every shorter-horizon or cross-sectional variant has died.
+    code: scripts/trend_research.py, tsmom_paper.py, tsmom_ls_paper.py
+    evidence:
+      - date: 2026-06-13
+        result: >
+          Move/cost ratio by timeframe (median move / ~0.5% round-trip
+          cost, live data via timeframe_edge.py): 1m 0.1x (unwinnable), 15m
+          0.6x (unwinnable), 1h 1.9x (marginal), 4h 2.8x (marginal), 1d 8.2x
+          (winnable). 2026-06-13 edge search (trend_research.py): 7 of 12
+          (coin, lookback) cells beat buy-and-hold; works on BTC and ETH,
+          fails on SOL; the live SMA200 is the worst lookback tested — N=50
+          and N=100 both score better.
+      - date: 2026-07-01
+        result: >
+          Daily bars, 0.10%/flip cost, over a period where buy-and-hold
+          lost 44%: TSMOM 7d long/short +27% (-46% maxDD, Sharpe ~0.58),
+          TSMOM 14d long/short +25% (-36% maxDD, Sharpe ~0.54), MA 10/40
+          cross long/short +19%, Donchian 20d +6%. Edge ~+0.06%/day: real,
+          thin, streak-delivered (split-half shows one losing half, one
+          winning half) — consistent with published crypto-momentum
+          literature, not a private discovery. A vol-targeting overlay was
+          tested alongside it: robust at portfolio level (3 of 4 lookbacks
+          improve Sharpe, all 4 cut maxDD 7-10pp) but the implementable
+          per-symbol version fails (1 of 4) — not shipped; sizing shape
+          instead comes from btc-intraday-and-leverage (vol-targeted, never
+          fixed leverage).
+    deployment_gate:
+      requires: forward proof-scorecard verdict — n >= 30 forward trades at
+        the family-wise t-bar
+      blocked_by: needs a sustained uptrend to accumulate forward sample —
+        correctly idle in chop
+    status: paper-only
+    notes: |
+      The only non-dead executable directional approach this repo has
+      found — survived two independent search sessions that killed
+      everything around it. Fragile candidate, not proven edge: it needs a
+      bull market to accumulate forward sample. Sitting in cash through
+      bear and chop IS the strategy working (capital preservation, not
+      failure); proof_scorecard judges it forward once trades arrive.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Cherry-picking the lookback — that killed the swing edge once
+          already. If SMA200 is replaced, it must be pre-registered and
+          judged forward.
+        - Adding leverage to "improve" it — at ~0.06%/day, volatility drag
+          flips this negative somewhere near 2x.
+        - Concentrated cross-sectional momentum as a substitute —
+          separately tested and catastrophic; see
+          xs-relative-strength-momentum.
+      What would change the picture: a sustained uptrend, so the forward
+      test accumulates. Nothing else needs to change; the mechanism is
+      already wired and running.
+      Source doc: RESEARCH_2026-06-13_edge_search.md.
+
+  - id: meme-filter-selectivity
+    name: Do the meme screener filters have selective power?
+    family: meme
+    hypothesis: >
+      The screener_risk gates, and the meme_radar delta triggers on top of
+      them, select pools that behave differently (median net return, net of
+      cost) from the ones they reject.
+    code: scripts/meme_paper.py over data/meme_cohort/
+    evidence:
+      - date: 2026-08-09
+        result: >
+          OPEN pre-registration — the decision rule fixed before any arm
+          reached n=1. Three arms: pass (cleared risk gates AND delta
+          triggers fired), gates (cleared risk gates, delta did not fire),
+          control (failed risk gates, deterministic 10% sample of rejects
+          keyed on a SHA-256 of the pool address with a fixed seed, so it
+          cannot be re-rolled to taste). $100 notional per position uniform;
+          primary exit fixed 24h hold with MFE/MAE recorded so exit rules
+          can be evaluated later without re-running; a pool going
+          gone/drained closes at -100% (never dropped); positions with no
+          modellable exit flagged tradeable=False and the control arm
+          reported both ways. Primary metric: median net return per arm,
+          net of round-trip cost.
+    deployment_gate:
+      requires: read out only when all three arms have n >= 30 closed
+        scored positions
+      blocked_by: "OPEN — collecting; earliest realistic read-out
+        2026-08-23"
+    status: paper-only
+    notes: |
+      The only OPEN pre-registration filed this way in the ledger at the
+      time it was written. This document exists so the decision rule is
+      fixed in advance: every candidate edge this repo has killed was
+      killed by a rule written before the data came in; the ones that
+      looked alive longest were the ones where the rule moved. Do not read
+      partial results, and do not adjust the arms, the control rate, the
+      hold period or the metric before the read-out.
+
+      NOTE (added on promotion 2026-09-05): the earliest realistic
+      read-out date above (2026-08-23) has passed as of this filing. Check
+      scripts/callout_scorecard.py / the vault note before treating this as
+      still purely open — the read-out may be overdue rather than not yet
+      due.
+      Source doc: RESEARCH_2026-08-09_meme_filter_test.md.
+
+  - id: stablecoin-basis-stress-signal
+    name: Stablecoin peg-basis as a leading cross-asset risk-off/risk-on
+      signal
+    family: directional
+    hypothesis: >
+      The basis of one major stablecoin against another (e.g. USDC/USDT
+      market price minus 1.0000, sampled hourly) predicts BTC forward
+      returns over the following 4-24h in two separable ways: stress onset
+      (basis exceeds a calibrated threshold, sustained N bars) predicts
+      negative forward returns; stress resolution (basis reverts inside the
+      normal band) predicts positive forward returns.
+    code: scripts/stablecoin_basis_research.py +
+      scripts/stablecoin_basis_crisis_check.py
+    evidence:
+      - date: 2026-09-05
+        result: >
+          Exploratory pass (CoinGecko free data, USDC/USD, USDT/USD,
+          BTC/USD; hourly x ~89 days and daily x ~364 days — neither window
+          contained a known stress event). Basis deviations tiny and
+          roughly symmetric (USDC/USD mean -1.7 to -2.7bps, stdev 3.6bps;
+          USDC/USDT cross mean +1.3 to +4.1bps, stdev 3.5-5.8bps) —
+          confirms the regime sampled was calm. Lead-lag cross-correlation:
+          hourly shows no structure (|corr| <0.035 everywhere); daily shows
+          a real relationship but it peaks at lag 0 (contemporaneous, corr
+          -0.156), not at a leading lag — the mechanism, if real, may be
+          more coincident than leading in a calm regime. Exploratory
+          forward-return grid (NOT pre-registered, reported for direction
+          only): hourly onset at 4h +0.334% vs +0.024% baseline (t=+2.65)
+          but OPPOSITE sign from the hypothesis, fades by 12-48h, one cell
+          of a ~20-cell grid with no multiple-testing correction; daily
+          onset directionally consistent (-0.51%/-0.75%/-2.51% at 1/3/7
+          days) but n=21-22, none clears t=2. Net: no signal survives once
+          accounting for small-magnitude deviations, contemporaneous
+          correlation, and grid snooping.
+      - date: 2026-09-05
+        result: >
+          Second pass, crisis-window sanity check (unblocked via Coinbase
+          Exchange candles; implied USDT/USD =
+          price(BTC-USD)/price(BTC-USDT)). Three pre-named windows:
+          Terra/UST (2022-05), FTX (2022-11), SVB/USDC (2023-03). Finding 1:
+          the detector's magnitude claim is confirmed on real data — peak
+          deviation 38-82x the calm-regime stdev in all three (Terra
+          -286bps, FTX -135bps, SVB +147bps, vs ~3.5bps calm baseline); a
+          threshold detector would fire on real stress. Finding 2 (the
+          important negative result): direction is NOT simply
+          "discount=sell, premium=buy". Terra (USDT discount) -> BTC
+          -3.9%/-6.4%/-9.8%/-1.1%/-7.4% at 4h/12h/24h/48h/72h, matching the
+          hypothesis. FTX (USDT discount, same sign of stress) -> BTC
+          +2.1%/+8.2%/+3.5%/+1.8%/+2.4% — rallied, likely because the crash
+          had already happened by the time the detector fired (a
+          local-bottom catch, not a leading warning). SVB (USDT PREMIUM —
+          opposite polarity, capital fled depegging USDC into USDT) -> BTC
+          +2.9%/-0.1%/+1.6%/+8.5%/+20.5%, a large rally because the
+          crisis's second-order effect (emergency Fed liquidity) was
+          bullish. n=3 is a qualitative read, not a statistic, but the
+          pattern is coherent: three real episodes produced three different
+          signs and lead/lag timings because "stablecoin stress" is not one
+          mechanism (a stablecoin-specific run, an exchange-contagion
+          panic, and a banking-sector shock are different animals with no
+          shared tradeable direction). The original hypothesis's implicit
+          assumption of one consistent sign looks wrong as stated.
+    deployment_gate:
+      requires: read out only once stress-onset and stress-resolution each
+        have n >= 30 non-overlapping episodes IN A WINDOW CONTAINING AT
+        LEAST ONE GENUINE STRESS EVENT, family-wise corrected against every
+        other directional entry already in the registry
+      blocked_by: "n=3 known crises is nowhere near n>=30 -- the
+        crisis-window run is a qualitative sanity check, not a statistical
+        readout. Needs either many more real crisis episodes (rare by
+        definition) or a validated proxy that also fires on smaller,
+        non-headline stress -- neither exists yet"
+    status: paper-only
+    notes: |
+      OPEN, not sit-out, and materially advanced from a pure
+      pre-registration. The magnitude mechanism is confirmed on real data;
+      the naive directional trading rule as originally specified looks
+      wrong, not merely unproven. The next version is not "tune the
+      threshold" — it is "classify stress type before assigning direction,"
+      a different and more specific claim than the one this entry opened
+      with.
+
+      New and distinct from everything else in this repo: not a
+      price-pattern signal (momentum/mean-reversion/OFI), not a rate-carry
+      signal (funding arb trades the funding rate, not the peg), not a
+      cross-sectional signal (pairs/xsec momentum) — a liquidity-stress
+      signal, closer in kind to a TED spread or LIBOR-OIS spread in TradFi.
+      Source doc: none — proposed fresh 2026-09-05, not ported from an
+      external doc.
+
+  - id: ultra-indicator-adaptive-ensemble
+    name: UltraIndicator — adaptive-weighting signal ensemble
+    family: infrastructure
+    hypothesis: >
+      An adaptive-weighting ensemble (StateStore, AdaptiveWeighter,
+      TradeOutcomeTracker, MetaWatchdog, ShadowSignalTester, UltraIndicator)
+      that shadow-tests candidate signals, promotes ones with real
+      predictive power, and adapts their live weights by regime, produces
+      better risk-adjusted returns than a static signal set.
+    code: not yet implemented — reviewed against owner-supplied spec;
+      scripts/ultra_indicator_review_sim.py
+    evidence:
+      - date: 2026-09-03
+        script: scripts/ultra_indicator_review_sim.py
+        method: code/design review with a Monte-Carlo simulation of the
+          spec's own statistical machinery, before any of it was built
+        result: >
+          Finding 1 (promotion gate is a coin flip): ShadowSignalTester
+          promotes at abs(ic)>0.03 after 500 observations. A pure-noise
+          signal (rng.normal(0,1), zero information), run 4,000 times under
+          the spec's own parameters, got promoted 52.0% of the time (sd of
+          IC under the null = 0.0459; the threshold sits at 0.65 sd, not
+          the ~3 sd needed for a 5% false rate). With k candidates,
+          1-(1-0.52)^k reaches 97.5% at k=5, and there is no
+          multiple-testing correction; abs(ic) also promotes
+          anti-predictive signals (IC=-0.4 clears the gate) which then get
+          pinned to zero weight downstream. Finding 2 (sample counts
+          inflated ~300x): record_trade fires every tick against a 300s
+          forward return, so consecutive observations share 299/300
+          seconds and are not independent; at the spec's "full confidence"
+          point of 100 logged samples, effective sample size is 0.3.
+          Reaching 2 SE from zero at IC=0.03 needs ~4,444 independent
+          observations = 1.33M logged ticks = 15.4 continuous days per
+          (signal, regime) cell, and the spec has 28 such cells, some
+          populated only ~10% of the time (~154 days to fill). Finding 3
+          (watchdog cries wolf): MetaWatchdog flags "degraded" at 30-trade
+          rolling Sharpe < 0.5x baseline; on stationary, non-degrading
+          synthetic P&L this fires 30-34% of the time at every tested
+          history length, while the mirror "critical" threshold never
+          fires (would also miss real collapses). Finding 4 (objective is
+          the one this repo already disproved): the scoring function is
+          sign(signal)*sign(realized_return) — pure directional hit rate,
+          blind to magnitude and cost. This repo's own record
+          (inverted_signal_test: flipping 228 real trades' signs cut the
+          loss from -$20.14 to -$9.50 but stayed red; cost measured at
+          18.6x the predicted move; zero-cost replay of the same journal
+          still lost -$5.33) shows direction was never the problem — a
+          signal right 70% of the time on moves smaller than the 0.52%
+          round-trip cost is a losing signal, and this weighter would rank
+          it top. Also found: a VPIN toxicity dampener that can flip sign
+          if fed a 0-100 scale instead of 0-1; weights and IC history
+          restored from two inconsistent stores (SQLite vs pickle);
+          promoted signals not persisted across restart; SQLite reads
+          unguarded under concurrency; an unindexed unbounded
+          trade_outcomes table; pickle used for durable state.
+    deployment_gate:
+      requires: learned weights beat equal-weight and frozen-initial-weight
+        control arms, same signals/costs, judged by proof_scorecard
+      blocked_by: promotion gate is a coin flip, sample counts inflated
+        ~300x, watchdog false-alarms ~1/3 of the time, objective optimises
+        hit-rate not cost-adjusted return
+    status: infrastructure
+    notes: |
+      Not disqualified — redirected. The engineering is sound (persistence
+      first, atomic snapshot writes, recording the full signal fingerprint
+      at entry, shadow-testing separated from live weighting, a meta-layer
+      that watches the strategy itself); the statistics fail in the
+      direction that manufactures false confidence. Four of the seven
+      listed signals (ofi, oi_liq_regime, lead_lag, absorption) also need
+      order-book/open-interest data this system does not record — see
+      scalper-microstructure-ofi-v2's 2026-09-03 follow-up; the capture
+      layer, not the adaptive layer, is the actual prerequisite. Sequencing:
+      capture -> measure -> only then adapt.
+
+      Recommended redesign before building: sample non-overlapping (or
+      correct overlapping variance via Newey-West/block bootstrap); set the
+      promotion threshold from the null distribution at N_eff with a Šidák
+      correction (reuse proof_scorecard._family_t_bar); promote on signed
+      IC, not abs(ic); learn on net-of-cost, magnitude-aware returns
+      (sign(signal)*(realized_return-round_trip_cost)) — the single
+      highest-value change; shrink hard toward 1/N across the 28 cells
+      (DeMiguel/Garlappi/Uppal 2009); pool regimes by default and split
+      only once a cell has the independent sample count to justify it
+      (PersistentRegime already exists for regime whipsaw); replace the
+      watchdog with a CUSUM/SPRT tuned to a stated false-alarm rate; add a
+      frozen-weights/equal-weights control arm judged by proof_scorecard
+      before trusting adaptation adds value over variance.
+      Source doc: RESEARCH_2026-09-03_ultra_indicator_review.md.
