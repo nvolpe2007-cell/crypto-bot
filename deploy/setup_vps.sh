@@ -57,6 +57,13 @@ install_cron deploy/stablecoin_arb_cron.txt stablecoin_arb.py stablecoin_arb
 install_cron deploy/dex_arb_cron.txt dex_arb.py dex_arb
 install_cron deploy/dex_flash_arb_cron.txt dex_flash_arb_paper.py dex_flash_arb
 install_cron deploy/pattern_flow_cron.txt pattern_flow_paper.py pattern_flow
+# GEX dealer-exposure SNAPSHOT LOGGER. Not a strategy and not wired to trading --
+# it accumulates the options-chain data that the daily-OHLC edge search concluded
+# was the only way past its boundary. It was built 2026-09-05 and had logged ONE
+# row by 2026-09-08 because it had no cron. See deploy/gex_cron.txt for the
+# pre-registered question and kill criteria.
+install_cron deploy/gex_cron.txt gex_paper.py gex
+
 # Centralized Telegram trade-close alerts (per-arm win/loss + running total).
 install_cron deploy/trade_close_notifier_cron.txt trade_close_notifier.py trade_close_notifier
 
