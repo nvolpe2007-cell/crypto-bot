@@ -66,6 +66,31 @@ per symbol per day** on a breakout — a market entry with a **server-side brack
 and posts the day's P&L to Telegram. **Fail-safe:** no keys / no `alpaca-py` → it
 no-ops (no orders). **Verify everything in your Alpaca paper dashboard.**
 
+## Interactive Telegram setup alerts (long-only, chart + trade-or-not buttons)
+Same ORB engine as `live_paper`, but instead of auto-trading it posts a chart and
+lets you decide per-setup:
+```bash
+pip install matplotlib               # optional: chart image; falls back to text without it
+export STOCKBOT_TELEGRAM=1  TELEGRAM_BOT_TOKEN=...  STOCKBOT_TELEGRAM_CHAT_ID=...
+export STOCKBOT_SYMBOLS=SPY,QQQ  STOCKBOT_DIR=long  STOCKBOT_NOTIONAL=2000
+# also export ALPACA_API_KEY/ALPACA_API_SECRET if you want "trade for me" to work
+# run on a schedule during market hours (e.g. cron every 5 min, 9:30–16:00 ET):
+python -m stockbot.orb_alerts
+```
+On a fresh breakout it posts one chart per symbol per day (opening range, entry,
+stop, target marked) with two buttons:
+- **🤖 Trade for me (paper)** — places the same Alpaca paper bracket order
+  `live_paper.py` would have. No Alpaca keys configured → replies saying so
+  instead of silently doing nothing.
+- **👤 I'll take it myself** — just acknowledges; you trade it on your own.
+
+Each scheduled run does two things: looks for new breakouts to alert on, and
+polls Telegram for button presses on alerts still awaiting a decision. State
+(which symbols were alerted today, which alerts are pending/resolved) lives in
+`data/stockbot_alert_state.json` (override via `STOCKBOT_ALERT_STATE_FILE`).
+Fail-safe throughout: no Telegram creds → idle; no matplotlib → text-only alert;
+no Alpaca keys → "trade for me" tells you instead of erroring.
+
 ## Choose params HONESTLY: walk-forward + robustness
 Don't sweep `--or-minutes`/`--target-r` until a backtest looks good — that's how you
 fool yourself. Instead:
