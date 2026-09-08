@@ -210,3 +210,35 @@ def test_pine_signals_are_confirmed_close_only():
 def test_pine_has_both_alerts():
     src = PINE.read_text(encoding='utf-8')
     assert src.count('alertcondition(') == 2
+
+
+# -- panel honesty (bug found 2026-09-08 by watching the script run live) ------
+
+def test_panel_can_report_worse_on_both():
+    """On a 10-minute SPY chart the rule was worse on BOTH return and drawdown,
+    and the panel still said 'less pain, less money'. A panel that cannot report
+    the bad case is advertising, not measurement."""
+    src = PINE.read_text(encoding='utf-8')
+    assert 'WORSE ON BOTH here' in src
+    assert 'betterDD  = ddRule > ddHold' in src
+    # all four quadrants must be reachable
+    for phrase in ('better on both (rare)', 'more money, more pain',
+                   'less pain, less money', 'WORSE ON BOTH here'):
+        assert phrase in src, phrase
+
+
+def test_panel_warns_when_not_on_a_daily_chart():
+    """Every number in the header is daily-bar evidence."""
+    src = PINE.read_text(encoding='utf-8')
+    assert 'timeframe.isdaily' in src
+    assert 'NOT DAILY - untested' in src
+
+
+def test_panel_table_has_room_for_every_row():
+    """The verdict + timeframe rows need 7, not 6 -- an off-by-one here silently
+    drops the timeframe warning, which is the row that matters most."""
+    src = PINE.read_text(encoding='utf-8')
+    assert 'table.new(position.top_right, 2, 7' in src
+    rows = {int(l.split('table.cell(t,')[1].split(',')[1])
+            for l in src.splitlines() if 'table.cell(t,' in l}
+    assert max(rows) <= 6, f'row index {max(rows)} exceeds the declared 7 rows'

@@ -141,7 +141,7 @@ alertcondition(sellSignal, title="SELL — trend turned down",
 // ── Panel ─────────────────────────────────────────────────────────────────────
 // Deliberately reports RETURN alongside drawdown. A panel that showed only the
 // drawdown saving would be selling the tool on its good half.
-var table t = table.new(position.top_right, 2, 6, border_width=1)
+var table t = table.new(position.top_right, 2, 7, border_width=1)
 if showDD and barstate.islast
     table.cell(t, 0, 0, "Trend Signal (Stocks)", bgcolor=color.new(color.gray, 80),
                text_color=color.gray, text_size=size.small)
@@ -163,7 +163,25 @@ if showDD and barstate.islast
     table.cell(t, 1, 4, str.tostring(nz(eqHold, 1.0), "#.##") + "x",
                text_color=color.gray, text_size=size.tiny)
 
-    table.cell(t, 0, 5, "what this is for", text_color=color.gray, text_size=size.tiny)
-    table.cell(t, 1, 5, nz(eqRule, 1.0) > nz(eqHold, 1.0) ? "beat B&H here (4% of 70 do)"
-                        : "less pain, less money",
-               text_color=color.orange, text_size=size.tiny)
+    // THREE honest cases, not two. The old fallback asserted "less pain" without
+    // checking drawdown -- caught 2026-09-08 by watching this run on a 10-minute
+    // SPY chart, where the rule was worse on BOTH return (1.02x vs 1.21x) AND
+    // drawdown (-12.5% vs -9.7%) and the panel still claimed less pain. A panel
+    // that cannot say "worse on both" is advertising, not measurement.
+    betterRet = nz(eqRule, 1.0) > nz(eqHold, 1.0)
+    betterDD  = ddRule > ddHold          // both <= 0, so greater means shallower
+    verdict = betterRet and betterDD ? "better on both (rare)" :
+              betterRet             ? "more money, more pain"  :
+              betterDD              ? "less pain, less money"  :
+                                      "WORSE ON BOTH here"
+    table.cell(t, 0, 5, "on this chart", text_color=color.gray, text_size=size.tiny)
+    table.cell(t, 1, 5, verdict,
+               text_color=betterDD ? color.orange : color.red, text_size=size.tiny)
+
+    // Every number in this script's header is DAILY-BAR evidence. On any other
+    // timeframe this is an untested rule wearing a tested rule's name, so say so.
+    table.cell(t, 0, 6, "timeframe", text_color=color.gray, text_size=size.tiny)
+    table.cell(t, 1, 6, timeframe.isdaily ? "daily (as measured)"
+                                          : "NOT DAILY - untested",
+               text_color=timeframe.isdaily ? color.gray : color.red,
+               text_size=size.tiny)
