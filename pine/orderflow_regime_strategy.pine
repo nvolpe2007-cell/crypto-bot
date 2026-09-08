@@ -1,0 +1,232 @@
+//@version=6
+//
+// Order Flow Regime — STRATEGY (buy/sell on chart + backtest)
+// ───────────────────────────────────────────────────────────────────────────────
+// Strategy version of pine/orderflow_regime.pine. Plots entries and exits on the
+// price chart and runs through TradingView's backtester so you can see the
+// measured result, not just the shapes.
+//
+// TWO MODES, AND COMPARING THEM IS THE POINT
+//   Exhaustion   — fade forced flow. Buy when a long-liquidation cascade is
+//                  exhausting (flow decaying, price no longer making new lows).
+//                  This is the "catch the bottom" idea.
+//   Continuation — follow conviction flow. Buy fresh-longs (taker buying with OI
+//                  RISING), short fresh-shorts. This is momentum.
+//
+//   Run both on the same symbol and compare. The originating repo's liquidation-
+//   cascade study measured exactly this split and found the continuation half
+//   at t = +3.7 while the not-yet-stretched dip-buy half came in at t = -0.8
+//   (dead). If that holds on your chart too, Continuation should beat Exhaustion.
+//   If Exhaustion wins here, that is interesting and worth a closer look — the
+//   difference is that this version has OPEN INTEREST to identify forced flow,
+//   which that study did not.
+//
+// COSTS ARE ON BY DEFAULT AND YOU SHOULD LEAVE THEM ON
+//   commission defaults to 0.26% per side (Kraken taker) and slippage to 2 ticks.
+//   Round-tripping is therefore ~0.52%, which is the wall every strategy in this
+//   project has died against. A backtest run at zero commission will look
+//   dramatically better and will be fiction. If the edge only exists at zero
+//   cost, it does not exist.
+//
+// HONEST FRAMING
+//   This is a hypothesis you can now SEE, not a validated edge. TradingView's
+//   backtester reports in-sample results on whatever range the chart happens to
+//   show, with no walk-forward, no multiple-testing correction, and a bar-close
+//   fill model that is kinder than reality. A good-looking curve here is a
+//   reason to test properly, never a reason to deploy money.
+// ───────────────────────────────────────────────────────────────────────────────
+
+strategy("Order Flow Regime — Strategy", shorttitle = "OF Regime ST",
+     overlay                 = true,
+     initial_capital         = 1000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 100,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.26,
+     slippage                = 2,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true,
+     max_labels_count        = 500)
+
+// ── inputs ────────────────────────────────────────────────────────────────────
+
+var string GRP_MODE = "Mode"
+var string GRP_FLOW = "Flow"
+var string GRP_OI   = "Open interest"
+var string GRP_SIG  = "Entry conditions"
+var string GRP_EXIT = "Exit"
+
+mode = input.string("Continuation", "Signal mode",
+     options = ["Continuation", "Exhaustion", "Both"], group = GRP_MODE,
+     tooltip = "Continuation = follow conviction flow (momentum). " +
+               "Exhaustion = fade forced flow (bottom-catching). Compare them.")
+allowLong  = input.bool(true,  "Allow longs",  group = GRP_MODE)
+allowShort = input.bool(false, "Allow shorts", group = GRP_MODE,
+     tooltip = "Off by default: this account is Kraken-spot, which cannot short.")
+
+useLowerTf = input.bool(true, "Use intrabar volume delta", group = GRP_FLOW)
+lowerTf    = input.timeframe("5", "Intrabar timeframe", group = GRP_FLOW,
+     tooltip = "Must be LOWER than the chart timeframe.")
+zLen       = input.int(50, "Z-score length", minval = 5, group = GRP_FLOW)
+
+oiAuto   = input.bool(true, "Auto-detect OI symbol", group = GRP_OI)
+oiManual = input.symbol("", "OI symbol override", group = GRP_OI)
+oiWin    = input.int(1, "dOI lookback (bars)", minval = 1, group = GRP_OI)
+minOiPct = input.float(0.5, "Min |dOI| % to call a regime", minval = 0.0,
+     step = 0.1, group = GRP_OI)
+
+zThresh = input.float(1.0, "Min |delta z| to act", minval = 0.0, step = 0.25,
+     group = GRP_SIG, tooltip = "Ignores ordinary flow. Raising this trades less " +
+     "and is the correct direction to move if results are marginal — never lower " +
+     "it to force more trades.")
+extLb   = input.int(20, "Extreme lookback", minval = 2, group = GRP_SIG)
+decayLb = input.int(5,  "Flow decay lookback", minval = 2, group = GRP_SIG)
+
+holdBars = input.int(48, "Time exit (bars)", minval = 1, group = GRP_EXIT,
+     tooltip = "48 on a 1h chart = 48h. The cascade study found tight ATR trails " +
+     "in post-cascade conditions were whipsaw harvesters (~75% stopped out within " +
+     "hours); letting the move breathe on a time exit is what worked.")
+useStop  = input.bool(true, "Use ATR stop", group = GRP_EXIT)
+atrLen   = input.int(14, "ATR length", minval = 1, group = GRP_EXIT)
+atrMult  = input.float(3.0, "ATR stop multiple", minval = 0.5, step = 0.5,
+     group = GRP_EXIT, tooltip = "Deliberately wide. A tight stop here harvests " +
+     "whipsaw rather than protecting anything.")
+
+// ── volume delta ──────────────────────────────────────────────────────────────
+
+intrabarSigned = close > open ? volume : close < open ? -volume : 0.0
+lowerArr = request.security_lower_tf(syminfo.tickerid, lowerTf, intrabarSigned,
+     ignore_invalid_timeframe = true)
+lowerOk  = not na(lowerArr) and array.size(lowerArr) > 0
+
+span  = high - low
+clv   = span == 0 ? 0.0 : ((close - low) - (high - close)) / span
+proxy = clv * volume
+
+usingIntrabar = useLowerTf and lowerOk
+delta = nz(usingIntrabar ? array.sum(lowerArr) : proxy)
+
+var float cvd = 0.0
+cvd := nz(cvd[1]) + delta
+
+zOf(src, len) =>
+    m = ta.sma(src, len)
+    s = ta.stdev(src, len)
+    s > 0 ? (src - m) / s : 0.0
+
+deltaZ = zOf(delta, zLen)
+
+// ── open interest & regime ────────────────────────────────────────────────────
+
+oiSym  = oiAuto ? syminfo.tickerid + "_OI" : oiManual
+oi     = request.security(oiSym, timeframe.period, close, ignore_invalid_symbol = true)
+oiPrev = nz(oi[oiWin], na)
+hasOi  = not na(oi) and not na(oiPrev) and oiPrev > 0
+doiPct = hasOi ? (oi - oiPrev) / oiPrev * 100.0 : na
+
+REG_NONE  = "no OI"
+REG_CHURN = "churn"
+REG_FL    = "fresh longs"
+REG_SC    = "short covering"
+REG_FS    = "fresh shorts"
+REG_LL    = "long liquidation"
+
+regime = REG_NONE
+if hasOi and delta != 0
+    if math.abs(doiPct) < minOiPct
+        regime := REG_CHURN
+    else if delta > 0 and doiPct > 0
+        regime := REG_FL
+    else if delta > 0 and doiPct < 0
+        regime := REG_SC
+    else if delta < 0 and doiPct > 0
+        regime := REG_FS
+    else if delta < 0 and doiPct < 0
+        regime := REG_LL
+
+// ── exhaustion ────────────────────────────────────────────────────────────────
+// Both conditions compare against the PRIOR window, never one including the
+// current bar: a rolling extreme containing the current bar can never be
+// exceeded by it, so a flat tape — exactly what exhaustion looks like — would
+// never register.
+
+mag       = math.abs(delta)
+priorMag  = ta.sma(mag[1], decayLb)
+decaying  = not na(priorMag) and mag < priorMag
+priorMin  = ta.lowest(low[1], extLb)
+priorMax  = ta.highest(high[1], extLb)
+noNewLow  = not na(priorMin) and low  >= priorMin
+noNewHigh = not na(priorMax) and high <= priorMax
+
+exhaustLong  = regime == REG_LL and decaying and noNewLow
+exhaustShort = regime == REG_SC and decaying and noNewHigh
+
+// ── entry conditions ──────────────────────────────────────────────────────────
+
+strongFlow = math.abs(deltaZ) >= zThresh
+wantCont = mode == "Continuation" or mode == "Both"
+wantExh  = mode == "Exhaustion"   or mode == "Both"
+
+contLong  = wantCont and regime == REG_FL and deltaZ >=  zThresh
+contShort = wantCont and regime == REG_FS and deltaZ <= -zThresh
+exhLong   = wantExh  and exhaustLong  and strongFlow
+exhShort  = wantExh  and exhaustShort and strongFlow
+
+longSignal  = allowLong  and (contLong  or exhLong)
+shortSignal = allowShort and (contShort or exhShort)
+
+// ── execution ─────────────────────────────────────────────────────────────────
+
+atr = ta.atr(atrLen)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+// Time exit, counted from the bar the position opened on.
+barsHeld = strategy.position_size != 0 ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+if strategy.position_size != 0 and barsHeld >= holdBars
+    strategy.close_all(comment = "time")
+
+if useStop and strategy.position_size > 0
+    strategy.exit("Long stop", from_entry = "Long",
+         stop = strategy.position_avg_price - atrMult * atr)
+if useStop and strategy.position_size < 0
+    strategy.exit("Short stop", from_entry = "Short",
+         stop = strategy.position_avg_price + atrMult * atr)
+
+// ── chart markers ─────────────────────────────────────────────────────────────
+
+plotshape(longSignal  and strategy.position_size == 0, "BUY", shape.labelup,
+     location.belowbar, color.new(#26a69a, 0), text = "BUY",
+     textcolor = color.white, size = size.small)
+plotshape(shortSignal and strategy.position_size == 0, "SELL", shape.labeldown,
+     location.abovebar, color.new(#ef5350, 0), text = "SELL",
+     textcolor = color.white, size = size.small)
+
+bgcolor(regime == REG_LL ? color.new(#ef5350, 90) :
+        regime == REG_SC ? color.new(#26a69a, 90) : na, title = "Forced regime")
+
+// ── status table ──────────────────────────────────────────────────────────────
+
+if barstate.islast
+    var table t = table.new(position.top_right, 2, 5,
+         frame_color = color.new(color.gray, 70), frame_width = 1)
+    txt = color.new(color.gray, 0)
+    val = color.new(#b2b5be, 0)
+    warn = color.new(#ffa726, 0)
+
+    table.cell(t, 0, 0, "source",  text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 0, usingIntrabar ? lowerTf + " intrabar" : "bar proxy",
+         text_color = usingIntrabar ? val : warn, text_size = size.tiny)
+    table.cell(t, 0, 1, "mode",    text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 1, mode, text_color = val, text_size = size.tiny)
+    table.cell(t, 0, 2, "delta z", text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 2, str.tostring(deltaZ, "#.00"), text_color = val, text_size = size.tiny)
+    table.cell(t, 0, 3, "dOI %",   text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 3, hasOi ? str.tostring(doiPct, "#.###") + "%" : "n/a",
+         text_color = hasOi ? val : warn, text_size = size.tiny)
+    table.cell(t, 0, 4, "regime",  text_color = txt, text_size = size.tiny)
+    table.cell(t, 1, 4, regime, text_color = val, text_size = size.tiny)
