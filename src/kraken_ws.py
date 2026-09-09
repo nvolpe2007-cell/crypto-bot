@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -34,6 +35,23 @@ _TOKEN_REST = "https://api.kraken.com/0/private/GetWebSocketsToken"
 
 _RECONNECT_DELAY_MIN = 5    # initial reconnect wait (seconds)
 _RECONNECT_DELAY_MAX = 60   # maximum reconnect wait after repeated failures
+
+
+# ── Session factory ───────────────────────────────────────────────────────────────────────
+# aiohttp picks `AsyncResolver` (c-ares) whenever aiodns is installed. That resolver talks
+# UDP to the nameservers directly, bypassing the OS resolver — so it ignores /etc/hosts,
+# systemd-resolved, VPN split-DNS and container DNS policy, and fails with a bare
+# "Could not contact DNS servers" in any environment where only the OS resolver is
+# reachable. Every Kraken host here resolves fine through getaddrinfo, so use the threaded
+# resolver (which is getaddrinfo in a thread pool) and stay consistent with the rest of the
+# process. Set KRAKEN_WS_ASYNC_DNS=1 to restore aiohttp's default.
+def _new_session(**kw) -> aiohttp.ClientSession:
+    """An aiohttp session that resolves the way the rest of the OS does."""
+    if os.getenv("KRAKEN_WS_ASYNC_DNS", "0") == "1":
+        return aiohttp.ClientSession(**kw)
+    connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+    return aiohttp.ClientSession(connector=connector, **kw)
+
 
 
 # ── Data types ────────────────────────────────────────────────────────────────────────────
@@ -85,7 +103,7 @@ async def _fetch_ws_token(api_key: str, api_secret: str) -> Optional[str]:
         "Content-Type": "application/x-www-form-urlencoded",
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with _new_session() as session:
             async with session.post(
                 _TOKEN_REST, headers=headers,
                 data=urllib.parse.urlencode(data),
@@ -153,7 +171,7 @@ class KrakenPublicWS:
 
     async def _connect(self):
         logger.info(f"[PublicWS] connecting to {_PUBLIC_WS}")
-        async with aiohttp.ClientSession() as session:
+        async with _new_session() as session:
             async with session.ws_connect(
                 _PUBLIC_WS, heartbeat=30,
                 timeout=aiohttp.ClientTimeout(total=30),
@@ -283,7 +301,7 @@ class KrakenPrivateWS:
 
     async def _connect(self):
         logger.info(f"[PrivateWS] connecting to {_PRIVATE_WS}")
-        async with aiohttp.ClientSession() as session:
+        async with _new_session() as session:
             async with session.ws_connect(
                 _PRIVATE_WS, heartbeat=30,
                 timeout=aiohttp.ClientTimeout(total=30),
@@ -416,7 +434,7 @@ class KrakenBookFeed:
 
     async def _connect(self):
         logger.info(f"[BookFeed] connecting to {_PUBLIC_WS} (depth={self._depth})")
-        async with aiohttp.ClientSession() as session:
+        async with _new_session() as session:
             async with session.ws_connect(
                 _PUBLIC_WS, heartbeat=30,
                 timeout=aiohttp.ClientTimeout(total=30),
@@ -524,7 +542,7 @@ class KrakenTradeFeed:
 
     async def _connect(self):
         logger.info(f"[TradeFeed] connecting to {_PUBLIC_WS}")
-        async with aiohttp.ClientSession() as session:
+        async with _new_session() as session:
             async with session.ws_connect(
                 _PUBLIC_WS, heartbeat=30,
                 timeout=aiohttp.ClientTimeout(total=30),
