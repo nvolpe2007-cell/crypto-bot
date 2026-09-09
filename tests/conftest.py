@@ -185,16 +185,28 @@ class _FakeResponse:
     async def __aexit__(self, *_a): pass
 
 class _FakeSession:
+    def __init__(self, *_a, **_kw): pass
     def get(self, *_a, **_kw):   return _FakeResponse()
     def post(self, *_a, **_kw):  return _FakeResponse()
     def ws_connect(self, *_a, **_kw): return _FakeResponse()
     async def __aenter__(self): return self
     async def __aexit__(self, *_a): pass
 
+# kraken_ws builds its sessions on an explicit connector + resolver (see
+# `_new_session` there — aiodns bypasses the OS resolver), so the stub has to
+# carry those names too or every session site dies on an AttributeError.
+class _ThreadedResolver:
+    def __init__(self, *_a, **_kw): pass
+
+class _TCPConnector:
+    def __init__(self, *_a, **_kw): pass
+
 _aiohttp = types.ModuleType("aiohttp")
-_aiohttp.ClientSession = _FakeSession
-_aiohttp.ClientTimeout = _ClientTimeout
-_aiohttp.WSMsgType     = _WSMsgType
+_aiohttp.ClientSession    = _FakeSession
+_aiohttp.ClientTimeout    = _ClientTimeout
+_aiohttp.WSMsgType        = _WSMsgType
+_aiohttp.TCPConnector     = _TCPConnector
+_aiohttp.ThreadedResolver = _ThreadedResolver
 sys.modules["aiohttp"] = _aiohttp
 
 # Ensure the project root is on sys.path for `from src.xxx import` lookups
