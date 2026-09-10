@@ -38,6 +38,35 @@
 //   clear the family-wise bar of 2.80 given 10 configurations were tried. That is
 //   a real backtest LEAD, not proof.
 //
+// INSTRUMENTS — WHICH CHART TO PUT THIS ON, AND WHY IT IS SPOT
+//   Counter-intuitive but load-bearing: although this arm SIMULATES perps, the
+//   runner prices it off Kraken SPOT daily bars (it calls
+//   api.kraken.com/0/public/OHLC at INTERVAL_DAILY). So the chart that matches
+//   the runner is Kraken spot on the DAILY timeframe:
+//
+//        KRAKEN:XBTUSD     KRAKEN:ETHUSD     KRAKEN:SOLUSD     <- production v1
+//
+//   Putting this on a Kraken Futures / perp chart would NOT reproduce the runner:
+//   different series, different bar times, and a basis the runner never sees.
+//   The leverage, liquidation and funding drag are all modelled in the script;
+//   the price feed is spot. The guard below warns if the chart is off-spec.
+//
+// THE 8-COIN WIDE UNIVERSE — THE STRONGEST SINGLE LEVER IN THE REPO'S SEARCH
+//   RESEARCH_2026-07-26_lev_perp_v1_frequency.md found that widening v1's
+//   universe from 3 to 8 coins, with the SAME unchanged entry signal and filters,
+//   moved DSR from 0.538 to 0.887 — the biggest single improvement in this
+//   project's entire search history, and it came from breadth rather than from
+//   any new signal. The extra five:
+//
+//        KRAKEN:ADAUSD  KRAKEN:XRPUSD  KRAKEN:DOTUSD  KRAKEN:AVAXUSD  KRAKEN:LINKUSD
+//
+//   In the runner these are reachable ONLY via an explicit LEV_PERP_SYMBOLS
+//   override, so that the production v1 default and both aggregate twins stay
+//   byte-for-byte unaffected. Here, switch the Universe input to "wide (8)" and
+//   run the script on each of the eight charts. Note what the finding actually
+//   is: more INDEPENDENT setups, not a better rule. One chart cannot show it —
+//   it only appears across the whole set.
+//
 // PAPER ONLY. US Kraken-spot cannot trade perps or leverage with real funds today,
 //   and Kraken US perps (Bitnomial) are not integrated in the bot.
 //
@@ -60,6 +89,21 @@ exitMode = input.string("ATR chandelier  [v2, EMA]", "Exit engine",
 
 useEma  = sigMode == "EMA(21/55) cross  [EMA arm]"
 useTrail = exitMode == "ATR chandelier  [v2, EMA]"
+
+// ── universe guard ────────────────────────────────────────────────────────────
+universe = input.string("production v1 (3): BTC ETH SOL", "Universe",
+     options = ["production v1 (3): BTC ETH SOL",
+                "wide (8): + ADA XRP DOT AVAX LINK",
+                "off-spec (silence the guard)"], group = "Instruments",
+     tooltip = "The runner reaches the extra five coins only via an explicit LEV_PERP_SYMBOLS override. Widening 3->8 moved DSR 0.538->0.887 with the rule unchanged.")
+warnOffSpec = input.bool(true, "Warn when the chart is off-spec", group = "Instruments")
+
+tkr = str.upper(syminfo.ticker)
+isCore = tkr == "XBTUSD" or tkr == "BTCUSD" or tkr == "ETHUSD" or tkr == "SOLUSD"
+isWide = tkr == "ADAUSD" or tkr == "XRPUSD" or tkr == "DOTUSD" or tkr == "AVAXUSD" or tkr == "LINKUSD"
+symOk  = universe == "off-spec (silence the guard)" ? true : universe == "wide (8): + ADA XRP DOT AVAX LINK" ? (isCore or isWide) : isCore
+tfOk   = timeframe.isdaily
+venueOk = str.upper(syminfo.prefix) == "KRAKEN"
 
 // ── signal inputs ─────────────────────────────────────────────────────────────
 smaN    = input.int(50, "SMA length  (LEV_PERP_SMA)", minval = 2, group = "Signal")
@@ -234,6 +278,20 @@ if barstate.islast
     table.cell(t, 0, 4, "effective leverage", text_color = color.gray, text_size = size.tiny)
     table.cell(t, 1, 4, str.tostring(effLev, "#.##") + "x", text_color = color.gray, text_size = size.tiny)
     table.cell(t, 0, 5, "equity NET of funding", text_color = color.gray, text_size = size.tiny)
+    // (warning banner is drawn below the table)
     table.cell(t, 1, 5, "$" + str.tostring(strategy.equity - cumFunding, "#.##"),
          text_color = (strategy.equity - cumFunding) >= strategy.initial_capital ? color.teal : color.maroon,
          text_size = size.tiny)
+
+// ── off-spec banner ───────────────────────────────────────────────────────────
+// The runner reads Kraken SPOT daily bars. A chart that is not that is measuring
+// something else, and the Strategy Tester will not tell you so.
+var label warnLbl = na
+if barstate.islast and warnOffSpec and (not symOk or not tfOk or not venueOk)
+    msg = "OFF-SPEC CHART"
+    msg := msg + (venueOk ? "" : "\n- venue is " + syminfo.prefix + ", runner uses KRAKEN spot")
+    msg := msg + (tfOk    ? "" : "\n- timeframe is " + timeframe.period + ", runner uses DAILY")
+    msg := msg + (symOk   ? "" : "\n- " + syminfo.ticker + " is not in the selected universe")
+    label.delete(warnLbl)
+    warnLbl := label.new(bar_index, high, msg, style = label.style_label_down,
+         color = color.new(color.orange, 10), textcolor = color.white, size = size.small)

@@ -21,7 +21,7 @@ verdict.
 | `regime_intraday.pine` | `regime_arm.py` | strategy | Promising, not proven. The ATR cost gate is the point — don't loosen it. |
 | `swing_4h_majors.pine` | `src/swing_strategy.py` | strategy | **Killed by the 1-year backtest** (−$0.47/trade, t=−0.98). Ported for inspection. |
 | `lev_perp.pine` | `lev_perp_paper.py` (+v2, +ema) | strategy | Leverage is settled-dangerous. Runs all three variants via two dropdowns. |
-| `pairs_market_neutral.pine` | `pairs_paper.py` | indicator | Cost wall is brutal; cointegration pairs broke OOS in the 320-strategy search. |
+| `pairs_market_neutral.pine` | `pairs_paper.py` | indicator | Pinned to the runner's 3 Kraken pairs. Cost wall is brutal; cointegration pairs broke OOS in the 320-strategy search. |
 | `rebalance_allocation.pine` | `rebalance_paper.py` | indicator | The **one** positive prediction-free result. Downside protection, not alpha. |
 | `trend_signal_honest.pine` | — | indicator | Pre-existing. The SMA100+2% BUY/SELL viewer. |
 | `micro_cvd_cost_wall.pine` | — | indicator | Pre-existing. CVD + cost-wall viewer. |
@@ -44,6 +44,44 @@ oversight — if you go looking for them, they are absent on purpose.
   per-exchange perpetual funding rates and a delta-neutral spot+perp position.
   TradingView does not carry the funding feed, and Pine cannot hold two
   instruments at once.
+
+## Which chart to put each one on
+
+Every runner in this repo prices itself off **Kraken spot** (`api.kraken.com/0/public/OHLC`).
+That includes the perp arms — they *simulate* leverage and funding, but the price
+series underneath is spot. So a Kraken Futures / perp chart is the **wrong** chart
+for `lev_perp.pine`: different series, different bar times, and a basis the runner
+never sees.
+
+| Script | Chart | Timeframe |
+|---|---|---|
+| `lev_perp.pine` | `KRAKEN:XBTUSD`, `KRAKEN:ETHUSD`, `KRAKEN:SOLUSD` (one at a time) | Daily |
+| `pairs_market_neutral.pine` | any — it fetches both legs by name | set by its own input (60m) |
+| `tsmom_sma200_band`, `conf_trend_momo`, `trend_ensemble_2of3`, `kelly_trend_compounding`, `tsmom_ls_sma50` | `KRAKEN:XBTUSD` / `ETHUSD` / `SOLUSD` | Daily |
+| `swing_4h_majors` | the 6 majors: `XBTUSD ETHUSD SOLUSD LTCUSD BCHUSD XRPUSD` | 4h |
+| `regime_intraday` | `KRAKEN:XBTUSD` / `ETHUSD` / `SOLUSD` | 1h or 4h |
+| `rebalance_allocation` | any — it fetches all 11 by name | Daily |
+
+`lev_perp.pine` carries a guard that draws an orange banner when the chart's
+venue, timeframe or symbol is off-spec. `pairs_market_neutral.pine` needs no
+guard: the pair is a dropdown and both legs are fetched by name, so it reads the
+same series regardless of what chart it sits on.
+
+**Pair orientation is not cosmetic.** The runner builds its three pairs with
+`sorted(combinations(...))`, which fixes leg A as the alphabetically-first coin:
+`(BTC,ETH)`, `(BTC,SOL)`, `(ETH,SOL)`. The spread is `ln(P_a) − ln(P_b)`, so
+swapping the legs flips the sign of z and inverts every long/short instruction.
+That is why the pair is a dropdown rather than two symbol boxes.
+
+**The 8-coin note on `lev_perp`.** `RESEARCH_2026-07-26_lev_perp_v1_frequency.md`
+found that widening v1's universe from 3 to 8 coins — same entry signal, same
+filters, nothing else changed — moved DSR from 0.538 to 0.887, the largest single
+improvement in this project's search history. The extra five are `ADAUSD XRPUSD
+DOTUSD AVAXUSD LINKUSD`. The finding is about **breadth (more independent
+setups)**, not about a better rule, so a single chart cannot show it; it only
+appears across the whole set. In the runner these are reachable only via an
+explicit `LEV_PERP_SYMBOLS` override, which is why the script's Universe input
+defaults to the 3-coin production set.
 
 ## Things to know before you read a Strategy Tester result
 
