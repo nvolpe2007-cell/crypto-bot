@@ -1,0 +1,135 @@
+//@version=6
+//
+// Market-neutral PAIRS — ratio z-score signal  (indicator, not a strategy)
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: pairs_paper.py (state: data/pairs_paper_state.json, judged by
+//          proof_scorecard._pairs_forward)
+//
+// WHY THIS ONE IS AN INDICATOR AND NOT A strategy()
+//   The trade is DOLLAR-NEUTRAL and has TWO legs: long the cheap one, short the
+//   rich one, in equal dollar size. A Pine strategy can only send orders for the
+//   ONE instrument the chart is showing, so it physically cannot hold both legs,
+//   and any strategy() version of this would be quietly backtesting something
+//   other than the strategy. Rather than fake it, this script computes the exact
+//   signal the runner uses and tells you which leg to take on which side.
+//
+//   Useful trick: you can chart the spread itself by typing a ratio symbol into
+//   TradingView, e.g. KRAKEN:ETHUSD/KRAKEN:XBTUSD. This indicator does the
+//   z-scoring for you and marks the thresholds.
+//
+// THE SPEC (pre-specified in the runner, not swept)
+//   spread s = ln(P_a) - ln(P_b), z-scored over a rolling window (default 168
+//              bars = 7 days of hourly).
+//   ENTRY  |z| >= 2.0    z > 0 (a rich vs b) -> SHORT a + LONG b
+//                        z < 0               -> LONG  a + SHORT b
+//   EXIT   |z| <= 0.5    convergence captured
+//   STOP   |z| >= 3.5    the spread broke down; it is not mean-reverting
+//   TIME   held > 168 bars
+//   Universe: all pairs of BTC / ETH / SOL — liquid and highly correlated.
+//
+// THE COST WALL IS BRUTAL HERE, AND THAT IS THE WHOLE QUESTION
+//   A pair round-trip pays FOUR legs of fees (in and out, twice), plus a funding
+//   drag on the short leg. The spread must converge by more than all of that to
+//   make a cent. Nothing in the research says it does — the forward test exists
+//   precisely to find out. No edge is assumed.
+//
+// ⚠ AND A WARNING FROM THE SEARCH THAT ALREADY RAN
+//   The 2026-07-13 exhaustive search put ~320 strategies through a Monte-Carlo +
+//   multiple-testing + OOS gauntlet and got ZERO survivors. Cointegration pairs
+//   were among them, and the pairs near-miss "was luck — it breaks OOS."
+//   See memory exhaustive_search_320_zero. Treat a good-looking z-score chart
+//   with the suspicion it has earned.
+//
+// The short leg is a PAPER perp. US Kraken-spot cannot short.
+//
+indicator("Market-neutral pairs — ratio z-score", overlay = false)
+
+symB     = input.symbol("KRAKEN:XBTUSD", "Leg B symbol  (chart symbol is leg A)",
+     tooltip = "Spread is ln(A) - ln(B) where A is whatever this chart is showing.")
+lookback = input.int(168, "Z-score lookback, bars  (PAIRS_LOOKBACK)", minval = 5,
+     tooltip = "168 = 7 days of hourly bars, the runner default.")
+entryZ   = input.float(2.0, "Entry |z|  (PAIRS_ENTRY_Z)", minval = 0.1, step = 0.1)
+exitZ    = input.float(0.5, "Exit |z|  (PAIRS_EXIT_Z)",  minval = 0.0, step = 0.1)
+stopZ    = input.float(3.5, "Stop |z|  (PAIRS_STOP_Z)",  minval = 0.1, step = 0.1)
+maxHold  = input.int(168, "Max hold, bars  (PAIRS_MAX_HOLD_BARS)", minval = 1)
+
+pb = request.security(symB, timeframe.period, close, lookahead = barmerge.lookahead_off)
+
+spread = math.log(close) - math.log(pb)
+mu     = ta.sma(spread, lookback)
+sd     = ta.stdev(spread, lookback)
+z      = not na(sd) and sd > 0 ? (spread - mu) / sd : na
+
+// ── position state machine, mirroring the runner ──────────────────────────────
+// +1 = LONG A / SHORT B      -1 = SHORT A / LONG B      0 = flat
+var int   pairPos  = 0
+var int   heldBars = 0
+var float entryZv  = na
+
+opened = false
+closed = false
+closeWhy = ""
+
+if not na(z)
+    if pairPos != 0
+        heldBars += 1
+        if math.abs(z) <= exitZ
+            pairPos  := 0
+            closed   := true
+            closeWhy := "converged"
+        else if math.abs(z) >= stopZ
+            pairPos  := 0
+            closed   := true
+            closeWhy := "spread broke down"
+        else if heldBars >= maxHold
+            pairPos  := 0
+            closed   := true
+            closeWhy := "time stop"
+    else
+        if z >= entryZ
+            pairPos  := -1            // A is rich -> short A, long B
+            heldBars := 0
+            entryZv  := z
+            opened   := true
+        else if z <= -entryZ
+            pairPos  := 1             // A is cheap -> long A, short B
+            heldBars := 0
+            entryZv  := z
+            opened   := true
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+zc = pairPos == 1 ? color.teal : pairPos == -1 ? color.red : color.gray
+plot(z, "z-score", color = color.new(zc, 0), linewidth = 2)
+hline(0, "mean", color = color.new(color.gray, 50))
+hline(entryZ,  "entry +", color = color.new(color.orange, 30), linestyle = hline.style_dashed)
+hline(-entryZ, "entry -", color = color.new(color.orange, 30), linestyle = hline.style_dashed)
+hline(exitZ,  "exit +",  color = color.new(color.teal, 50), linestyle = hline.style_dotted)
+hline(-exitZ, "exit -",  color = color.new(color.teal, 50), linestyle = hline.style_dotted)
+hline(stopZ,  "stop +",  color = color.new(color.red, 40),  linestyle = hline.style_dashed)
+hline(-stopZ, "stop -",  color = color.new(color.red, 40),  linestyle = hline.style_dashed)
+bgcolor(pairPos != 0 ? color.new(zc, 92) : na, title = "In a pair")
+
+plotshape(opened and pairPos == 1,  "LONG A / SHORT B", style = shape.labelup,
+     location = location.bottom, color = color.new(color.teal, 0),
+     text = "L A / S B", textcolor = color.white, size = size.tiny)
+plotshape(opened and pairPos == -1, "SHORT A / LONG B", style = shape.labeldown,
+     location = location.top, color = color.new(color.red, 0),
+     text = "S A / L B", textcolor = color.white, size = size.tiny)
+plotshape(closed, "CLOSE", style = shape.xcross, location = location.bottom,
+     color = color.new(color.yellow, 0), size = size.tiny)
+
+var table t = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "leg A (chart)", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, syminfo.ticker, text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 1, "leg B", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, symB, text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 2, "z now", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, na(z) ? "-" : str.tostring(z, "#.##"), text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 3, "position", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, pairPos == 1 ? "LONG A / SHORT B" : pairPos == -1 ? "SHORT A / LONG B" : "flat",
+         text_color = pairPos == 0 ? color.gray : color.new(zc, 0), text_size = size.small)
+
+alertcondition(opened and pairPos == 1,  "Pairs: LONG A / SHORT B", "Pairs {{ticker}}: z <= -entry -> LONG A, SHORT B")
+alertcondition(opened and pairPos == -1, "Pairs: SHORT A / LONG B", "Pairs {{ticker}}: z >= +entry -> SHORT A, LONG B")
+alertcondition(closed, "Pairs: CLOSE", "Pairs {{ticker}}: pair closed")

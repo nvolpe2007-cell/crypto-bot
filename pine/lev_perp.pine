@@ -1,0 +1,239 @@
+//@version=6
+//
+// LEVERAGED perp arm — all three variants (v1 / v2 / EMA) in one script
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: lev_perp_paper.py (v1), lev_perp_v2_paper.py (v2), lev_perp_ema_paper.py
+//   The three runners share their entry filters, leverage, liquidation and costs
+//   byte-for-byte — they differ ONLY in the direction signal and the exit engine.
+//   So they are two dropdowns here, and the A/B/C the proof scorecard runs
+//   head-to-head is a matter of switching the mode:
+//
+//       v1   = Signal: SMA(50)     + Exit: fixed take-profit / stop
+//       v2   = Signal: SMA(50)     + Exit: ATR chandelier trail
+//       EMA  = Signal: EMA(21/55)  + Exit: ATR chandelier trail
+//
+// ⚠ READ THIS BEFORE YOU ENJOY THE EQUITY CURVE
+//   Leverage is SETTLED-DANGEROUS in this project, not an open question. The
+//   simulation behind memory doubling_in_a_month_verdict found the leverage that
+//   doubles an account quickly also liquidates it roughly half the time. This arm
+//   exists to SHOW that on a forward clock with real prices and paper money — not
+//   because leverage is believed to add edge.
+//
+//   The asymmetry is the whole lesson, and it is arithmetic, not opinion:
+//       one liquidation (-95% of margin) = about 6.5 take-profits (+14.6% each)
+//   You can watch the Strategy Tester confirm this. A long string of neat +5%
+//   wins followed by a single liquidation is the CHARACTERISTIC shape here.
+//
+//   Also: v1's fixed +5% take-profit CAPS every winner while the trend is still
+//   running — its first 8 wins were ALL capped at the TP. That observation is
+//   what motivated v2's trailing exit. Comparing v1 to v2 on the same chart is
+//   the cleanest way to see it.
+//
+// EMA MODE — WHAT THE RESEARCH FOUND, AND WHAT IT DID NOT
+//   backtest_directional_bias.py (2026-07-27, 5y daily OKX, BTC/ETH/SOL, every
+//   other mechanic held fixed) tested SMA(50) against Supertrend, MACD, DMI and
+//   the EMA(21/55) cross. EMA cross + chandelier was the standout: +$3,250 vs
+//   SMA50's +$1,279, positive in EVERY year 2021-2026 (SMA50 had two losing
+//   years), positive on all three symbols. BUT its raw t-stat of 2.12 does NOT
+//   clear the family-wise bar of 2.80 given 10 configurations were tried. That is
+//   a real backtest LEAD, not proof.
+//
+// PAPER ONLY. US Kraken-spot cannot trade perps or leverage with real funds today,
+//   and Kraken US perps (Bitnomial) are not integrated in the bot.
+//
+strategy("Leveraged perp arm (v1 / v2 / EMA)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 1000,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.075,      // 0.15% round trip on NOTIONAL = 0.075%/side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── mode ──────────────────────────────────────────────────────────────────────
+sigMode = input.string("SMA(50)  [v1, v2]", "Direction signal",
+     options = ["SMA(50)  [v1, v2]", "EMA(21/55) cross  [EMA arm]"], group = "Mode")
+exitMode = input.string("ATR chandelier  [v2, EMA]", "Exit engine",
+     options = ["Fixed TP / SL  [v1]", "ATR chandelier  [v2, EMA]"], group = "Mode",
+     tooltip = "Fixed TP caps winners; the chandelier lets them run until the trend actually bends. This is the A/B the proof scorecard judges.")
+
+useEma  = sigMode == "EMA(21/55) cross  [EMA arm]"
+useTrail = exitMode == "ATR chandelier  [v2, EMA]"
+
+// ── signal inputs ─────────────────────────────────────────────────────────────
+smaN    = input.int(50, "SMA length  (LEV_PERP_SMA)", minval = 2, group = "Signal")
+emaFast = input.int(21, "EMA fast  (LEV_PERP_EMA_FAST)", minval = 1, group = "Signal")
+emaSlow = input.int(55, "EMA slow  (LEV_PERP_EMA_SLOW)", minval = 1, group = "Signal")
+
+// ── leverage / liquidation ────────────────────────────────────────────────────
+levCap    = input.float(3.0,  "Leverage cap  (LEV_PERP_LEVERAGE)", minval = 1.0, step = 0.5, group = "Leverage")
+maint     = input.float(5.0,  "Maintenance margin %  (LEV_PERP_MAINT)", minval = 0.1, step = 0.5, group = "Leverage") / 100.0
+volTarget = input.float(2.0,  "Vol target, % per day  (LEV_PERP_VOL_TARGET)", minval = 0.0, step = 0.25, group = "Leverage",
+     tooltip = "Effective leverage = min(cap, target / realized vol). 0 disables vol targeting and uses the raw cap.")
+volN      = input.int(20,     "Realized-vol lookback  (LEV_PERP_VOL_N)", minval = 2, group = "Leverage")
+marginFrac = input.float(33.0, "Margin per position, % of equity", minval = 1.0, maxval = 100.0, step = 1.0, group = "Leverage",
+     tooltip = "The runner splits the book across BTC/ETH/SOL, so each gets ~33%. One chart = one symbol; set 100 to simulate the whole book on this symbol. NOTE: the runner also halves margin when a second same-direction major is already open (its correlation cap). A single chart cannot see the other symbols, so that cap CANNOT be reproduced here — this script is therefore slightly MORE aggressive than the runner when the other majors agree.") / 100.0
+
+// ── entry filters (identical in all three runners) ────────────────────────────
+useFilters = input.bool(true, "Apply the four entry filters", group = "Entry filters")
+rsiN       = input.int(14,   "RSI period  (LEV_PERP_RSI_PERIOD)", minval = 1, group = "Entry filters")
+rsiMax     = input.float(45, "Skip entry when RSI >=  (LEV_PERP_RSI_MAX)", minval = 1, group = "Entry filters")
+minAge     = input.int(8,    "Min trend age, bars  (LEV_PERP_MIN_TREND_AGE)", minval = 0, group = "Entry filters",
+     tooltip = "How long the current side has persisted. In EMA mode this is measured on the EMA cross's own persistence, matching lev_perp_ema_paper.")
+volMult    = input.float(1.2, "Min volume vs average  (LEV_PERP_VOL_MULT)", minval = 0.0, step = 0.1, group = "Entry filters")
+volLookback = input.int(20,  "Volume average lookback  (LEV_PERP_VOL_LOOKBACK)", minval = 1, group = "Entry filters")
+skipAdx    = input.bool(true, "Skip the ADX dead zone  (LEV_PERP_SKIP_ADX_DEAD_ZONE)", group = "Entry filters")
+adxN       = input.int(14,   "ADX period", minval = 1, group = "Entry filters")
+adxLow     = input.float(20, "ADX dead zone low",  minval = 0, group = "Entry filters")
+adxHigh    = input.float(30, "ADX dead zone high", minval = 0, group = "Entry filters")
+
+// ── exits ─────────────────────────────────────────────────────────────────────
+tpFrac  = input.float(5.0, "Take-profit, % price move  (LEV_PERP_TP_PRICE_FRAC)", minval = 0.1, step = 0.5, group = "Exit: fixed",
+     tooltip = "5% of PRICE = 15% on margin at 3x. This is the 'sell in profit' rule.") / 100.0
+slFrac  = input.float(5.0, "Hard stop, % price move  (LEV_PERP_SL_PRICE_FRAC)", minval = 0.0, step = 0.5, group = "Exit: fixed") / 100.0
+atrN    = input.int(14,    "ATR length  (LEV_PERP_V2_ATR_N)", minval = 1, group = "Exit: chandelier")
+atrMult = input.float(2.0, "ATR multiple  (LEV_PERP_V2_ATR_MULT)", minval = 0.1, step = 0.1, group = "Exit: chandelier")
+
+fundingApy = input.float(10.0, "Funding drag, % APY  (LEV_PERP_FUNDING_APY)", minval = 0.0, step = 1.0, group = "Costs",
+     tooltip = "TradingView's tester has no time-based carry cost, so its Net Profit is TOO GENEROUS. This script accrues the drag itself and reports equity net of it in the panel. Judge that number.") / 100.0
+
+// ── indicators ────────────────────────────────────────────────────────────────
+smaV = ta.sma(close, smaN)
+eF   = ta.ema(close, emaFast)
+eS   = ta.ema(close, emaSlow)
+rsiV = ta.rsi(close, rsiN)
+[diPlus, diMinus, adxV] = ta.dmi(adxN, adxN)
+atrV = ta.atr(atrN)
+
+// realized daily vol, % — population stdev of the last N returns
+rets    = (close / close[1] - 1) * 100
+realVol = ta.stdev(rets, volN)
+
+// ── direction ─────────────────────────────────────────────────────────────────
+rawSide = useEma ? (eF >= eS ? 1 : -1) : (close >= smaV ? 1 : -1)
+warm    = useEma ? (not na(eF) and not na(eS)) : not na(smaV)
+
+// trend age: consecutive bars the current side has held
+var int trendAge = 0
+if warm
+    trendAge := rawSide == rawSide[1] ? trendAge + 1 : 1
+
+// ── the four entry filters ────────────────────────────────────────────────────
+avgVol   = ta.sma(volume, volLookback)[1]
+volRatio = not na(avgVol) and avgVol > 0 ? volume / avgVol : na
+
+fRsi = not useFilters or na(rsiV) or rsiV < rsiMax
+fAge = not useFilters or trendAge >= minAge
+fVol = not useFilters or na(volRatio) or volRatio >= volMult
+fAdx = not useFilters or not skipAdx or na(adxV) or not (adxV >= adxLow and adxV <= adxHigh)
+filtersOk = fRsi and fAge and fVol and fAdx
+
+// ── vol-targeted effective leverage ───────────────────────────────────────────
+effLev = volTarget <= 0 or na(realVol) or realVol == 0 ? levCap : math.max(0.1, math.min(levCap, volTarget / realVol))
+
+// ── position management ───────────────────────────────────────────────────────
+inPos   = strategy.position_size != 0
+curSide = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+
+var float entryPx  = na
+var float liqPx    = na
+var float tpPx     = na
+var float slPx     = na
+var float trailPx  = na
+var float peakPx   = na
+var float entryAtr = na
+var float posLev   = na
+var float notional = na
+var float cumFunding = 0.0
+
+canEnter = warm and not inPos and filtersOk
+
+if canEnter
+    lev     = effLev
+    liqFrac = math.max(0.000001, (1.0 - maint) / lev)
+    entryPx  := close
+    posLev   := lev
+    liqPx    := close * (1 - rawSide * liqFrac)
+    tpPx     := close * (1 + rawSide * tpFrac)
+    slPx     := slFrac > 0 ? close * (1 - rawSide * slFrac) : na
+    entryAtr := na(atrV) ? close * 0.02 : atrV      // ~2% fallback during warm-up
+    peakPx   := close
+    trailPx  := close - rawSide * atrMult * entryAtr
+    // notional = margin * leverage; qty is that notional in units of the asset.
+    notional := strategy.equity * marginFrac * lev
+    qty      = notional / close
+    if rawSide > 0
+        strategy.entry("L", strategy.long,  qty = qty)
+    else
+        strategy.entry("S", strategy.short, qty = qty)
+
+// ── exits ─────────────────────────────────────────────────────────────────────
+// These go out as REAL stop/limit orders so TradingView fills them at the level,
+// intrabar — not at the bar close, which is what strategy.close() would do and
+// which would quietly flatter every stopped-out trade.
+//
+// A NOTE ON LIQUIDATION, so the tester is not misread: at 3x with maintenance 5%
+// the liquidation is ~31.7% against you, while the stop (2xATR trail, or the
+// fixed 5%) is far tighter. So the STOP is what actually fires — liquidation
+// binds only when a bar GAPS through both, and in that case TradingView fills at
+// the open, which is at least as bad as the liquidation price. This matches the
+// runner, whose _check_exit() also only reaches liquidation on a gap. If you set
+// the hard stop to 0 to study the raw leverage tail, liquidation becomes live and
+// the "one liquidation = ~6.5 take-profits" asymmetry shows up in the tester.
+if inPos
+    // ratchet the trail from THIS bar's extremes, only in the trade's favour
+    if useTrail
+        if curSide > 0 and high > peakPx
+            peakPx  := high
+            trailPx := math.max(trailPx, peakPx - atrMult * entryAtr)
+        else if curSide < 0 and low < peakPx
+            peakPx  := low
+            trailPx := math.min(trailPx, peakPx + atrMult * entryAtr)
+
+    stopLevel = useTrail ? trailPx : slPx
+    // The stop can never sit beyond the liquidation price.
+    effStop = na(stopLevel) ? liqPx : (curSide > 0 ? math.max(stopLevel, liqPx) : math.min(stopLevel, liqPx))
+
+    if curSide > 0
+        strategy.exit("xL", from_entry = "L", stop = effStop, limit = useTrail ? na : tpPx,
+             comment_loss = "stop", comment_profit = "take_profit")
+    else
+        strategy.exit("xS", from_entry = "S", stop = effStop, limit = useTrail ? na : tpPx,
+             comment_loss = "stop", comment_profit = "take_profit")
+
+    // trend flip closes at the bar close, like the runner
+    if rawSide != curSide
+        strategy.close_all(comment = "trend_flip")
+
+// funding accrues on NOTIONAL while held
+if inPos
+    cumFunding += math.abs(strategy.position_size) * close * (fundingApy / 365.0)
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(useEma ? eF : smaV, useEma ? "EMA fast" : "SMA", color = color.new(color.orange, 0), linewidth = 2)
+plot(useEma ? eS : na,   "EMA slow", color = color.new(color.purple, 0), linewidth = 2)
+plot(inPos and useTrail ? trailPx : na, "Trail stop", color = color.new(color.fuchsia, 0), style = plot.style_linebr, linewidth = 2)
+plot(inPos ? liqPx : na,  "Liquidation", color = color.new(color.red, 0),   style = plot.style_linebr, linewidth = 2)
+plot(inPos and not useTrail ? tpPx : na, "Take profit", color = color.new(color.teal, 0), style = plot.style_linebr)
+
+barcolor(curSide == 1 ? color.new(color.teal, 45) : curSide == -1 ? color.new(color.red, 45) : color.new(color.gray, 70))
+
+var table t = table.new(position.top_right, 2, 6, border_width = 1)
+f_g(bool b) => b ? "PASS" : "fail"
+f_c(bool b) => b ? color.teal : color.maroon
+if barstate.islast
+    table.cell(t, 0, 0, "RSI < " + str.tostring(rsiMax, "#"), text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 0, f_g(fRsi), text_color = f_c(fRsi), text_size = size.tiny)
+    table.cell(t, 0, 1, "trend age >= " + str.tostring(minAge) + "  (now " + str.tostring(trendAge) + ")", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 1, f_g(fAge), text_color = f_c(fAge), text_size = size.tiny)
+    table.cell(t, 0, 2, "volume >= " + str.tostring(volMult, "#.#") + "x", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 2, f_g(fVol), text_color = f_c(fVol), text_size = size.tiny)
+    table.cell(t, 0, 3, "ADX outside dead zone", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 3, f_g(fAdx), text_color = f_c(fAdx), text_size = size.tiny)
+    table.cell(t, 0, 4, "effective leverage", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 4, str.tostring(effLev, "#.##") + "x", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 0, 5, "equity NET of funding", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 5, "$" + str.tostring(strategy.equity - cumFunding, "#.##"),
+         text_color = (strategy.equity - cumFunding) >= strategy.initial_capital ? color.teal : color.maroon,
+         text_size = size.tiny)
