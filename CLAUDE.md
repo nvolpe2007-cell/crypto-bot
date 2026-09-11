@@ -89,7 +89,16 @@ citations: vault `Notes/SSRN Literature Scan 2026-09-10.md`. Four things change 
    Kraken-only *execution* protects fills; it does **not** protect a signal built from
    Binance/Bybit/aggregator volume. This is methodology lesson 3 (`altcoin-pairs` retraction)
    in another costume — robustness checks cannot detect a flaw uniformly present in the input.
-   Audit any volume-weighted path or "top N by volume" universe before trusting it.
+   **The audit was run 2026-09-10 — don't repeat it, read the result.** Live paths are CLEAN:
+   `paper_trading.py`'s whale-print filter reads `ccxt.kraken` OHLCV, every forward-test runner
+   pulls `api.kraken.com`, and `funding_scanner.py` reads Binance/Bybit **funding rates only**
+   (no turnover filter anywhere). One real exposure, **dormant**: `src/altperp/` feeds Bybit
+   klines into `is_volume_spike(3× over 20 bars)`, which is a REQUIRED conjunct of the Tier-1
+   flush-long gate — and since wash volume RISES under volatile conditions (SSRN 4971590), the
+   contamination is *correlated with the gate firing*, biasing toward false positives in exactly
+   the regime it exists to detect. `altperp.enabled: false`, so it's a latent trap for whoever
+   re-enables it. `research_universe.py` separately ranks top-N by Bybit `turnover24h`. Both
+   sites now carry warnings naming the fix (PR #125).
 6. **Discount every published effect size by roughly half before forward-testing.** McLean &
    Pontiff (SSRN 2156623): published predictors return **26% less OOS and 58% less
    post-publication**. Every crypto trend paper that corroborates our surviving arm is
