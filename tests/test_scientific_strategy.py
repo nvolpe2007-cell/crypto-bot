@@ -442,3 +442,41 @@ class TestScientificStrategyEvaluate:
         )
         result = self._eval(df)
         assert result is None or isinstance(result, ScientificSignal)
+
+
+# ── ScientificStrategy(lead_lag_min=...) ──────────────────────────────────────
+# lead_lag_min is accepted by __init__ and stored on self, but _evaluate() never
+# reads it back -- unlike ofi_min (which gates ofi_dir classification), a
+# lead-lag signal fires has_buy/has_sell and contributes lead_lag_score at ANY
+# strength, including strengths far below lead_lag_min's own default. These
+# tests pin that current (surprising but not-a-recent-regression -- see the
+# NOTE in scientific_strategy.py's __init__ and _evaluate()) behavior so a
+# future change to wire lead_lag_min in is a deliberate, reviewed decision
+# rather than an accidental behavior change nobody notices.
+
+class TestLeadLagMinHasNoEffect:
+    SYMBOL = "BTC/USD"
+
+    def _eval(self, strat, df, lead_dir, lead_strength):
+        return strat.evaluate(
+            df, self.SYMBOL,
+            ofi_calc=_FakeOFI(0.0), lead_lag=_FakeLeadLag(lead_dir, lead_strength),
+            regime="RANGING", regime_conf=0.8, funding_rate=None,
+        )
+
+    def test_signal_fires_even_far_below_default_lead_lag_min(self):
+        # lead_strength=0.0001 is far below the default lead_lag_min=0.003, yet
+        # lead_dir alone is enough to produce a BUY -- strength never gates it.
+        df = _make_df(n=100, trend=0.0)
+        result = self._eval(ScientificStrategy(), df, lead_dir="BUY", lead_strength=0.0001)
+        assert result is not None
+        assert result.signal == Signal.BUY
+
+    def test_raising_lead_lag_min_does_not_suppress_a_weak_signal(self):
+        # A strategy constructed with a much stricter lead_lag_min behaves
+        # identically to the default -- the constructor argument has zero effect.
+        df = _make_df(n=100, trend=0.0)
+        default_result = self._eval(ScientificStrategy(), df, lead_dir="BUY", lead_strength=0.0001)
+        strict_result = self._eval(ScientificStrategy(lead_lag_min=0.99), df, lead_dir="BUY", lead_strength=0.0001)
+        assert default_result is not None and default_result.signal == Signal.BUY
+        assert strict_result is not None and strict_result.signal == Signal.BUY
