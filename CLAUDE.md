@@ -59,6 +59,37 @@ Costs (~0.3% round-trip) dominate at this size. Filters like `atr_alive` correct
 **refuse negative-EV trades** — that's why the bot sits idle in flat markets. **Do not
 loosen gates to force more trades**; that recreates the old ~1% win rate.
 
+## External evidence (SSRN scan 2026-09-10)
+The published literature was checked against this repo's own conclusions. Full note with
+citations: vault `Notes/SSRN Literature Scan 2026-09-10.md`. Four things change how you work:
+
+1. **Turnover screen — apply it BEFORE writing a backtest.** Novy-Marx & Velikov
+   (SSRN 2535173) price a large anomaly set net of costs: most anomalies with **one-sided
+   monthly turnover below ~50%** keep a significant net spread, **few above it do**. Any new
+   directional candidate above that threshold is presumed dead until proven otherwise. This
+   retrospectively explains the corpus — the microstructure scalper died at 73.6% fee drag
+   because its turnover was never going to clear the bar; the multi-day trend and 4h swing
+   arms are the survivors.
+2. **Buy/hold spread is the best simple cost mitigation** (SSRN 3253359) — enter on a strict
+   signal, exit on a looser one, so positions aren't churned at the boundary. This is
+   structurally what `FUNDING_ARB_EXIT_CONFIRM_HOURS` does for the funding arms. It is **not
+   applied to the directional side**; that's an open improvement, not a done thing.
+3. **The proof bar is in the right family, slightly low.** Harvey, Liu & Zhu (SSRN 2249314):
+   with hundreds of mined factors, t>2.0 is meaningless and the honest floor is **t > 3.0**.
+   At k=7 the Šidák family bar here sits near 2.68. Don't loosen it; know it's not generous.
+4. **Confirmed independently:** time-series momentum strong / cross-sectional momentum weak
+   in crypto under realistic assumptions (SSRN 4675565); trend factors survive costs only on
+   **large liquid coins** (4601972); crypto overreactions are real and **not** exploitable
+   after costs (3113177). These match `xsec_momentum_verdict`, the majors-only swing
+   universe, and `meanrev_dead` respectively. Do not re-litigate them.
+
+**One open tension, NOT a verdict:** Kim, Tse & Wald (SSRN 2786955) argue published TSMOM
+results are largely driven by **volatility scaling rather than momentum itself**, while this
+repo's `trend-signal-honest` walk-forward *rejected* inverse-vol sizing on the SMA(100) rule
+(Sharpe 0.98 → 0.76) — contradicting the general vol-targeting endorsement further down this
+file. Two credible sources, opposite directions, same lever. Pre-register a test; don't
+assume either.
+
 ## Key Files
 ```
 src/bot.py                  # ScalpingBot entry; starts the paper session
