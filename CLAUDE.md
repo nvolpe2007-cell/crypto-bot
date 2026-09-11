@@ -83,12 +83,42 @@ citations: vault `Notes/SSRN Literature Scan 2026-09-10.md`. Four things change 
    after costs (3113177). These match `xsec_momentum_verdict`, the majors-only swing
    universe, and `meanrev_dead` respectively. Do not re-litigate them.
 
+5. **NEVER compute a signal from aggregated multi-venue volume.** Cong, Li, Tang & Yang
+   (SSRN 3530220): unregulated exchanges wash-trade **over 70%** of reported volume (Bitwise
+   says up to 95%), detectable via Benford first-digit anomalies and trade-size rounding.
+   Kraken-only *execution* protects fills; it does **not** protect a signal built from
+   Binance/Bybit/aggregator volume. This is methodology lesson 3 (`altcoin-pairs` retraction)
+   in another costume — robustness checks cannot detect a flaw uniformly present in the input.
+   Audit any volume-weighted path or "top N by volume" universe before trusting it.
+6. **Discount every published effect size by roughly half before forward-testing.** McLean &
+   Pontiff (SSRN 2156623): published predictors return **26% less OOS and 58% less
+   post-publication**. Every crypto trend paper that corroborates our surviving arm is
+   published. Changes no verdict — changes the number you'd plan around. A published effect
+   size is a ceiling, never a forecast.
+7. **The crypto factor space is small.** Liu, Tsyvinski & Wu (SSRN 3379131): ten crypto
+   long-short characteristics are **all absorbed by three factors — market, size, momentum**.
+   There is no long tail of undiscovered edges to hunt. Also relevant to the shelved ML work:
+   Gu, Kelly & Xiu (3159577) find ML's dominant signals are momentum, liquidity and volatility
+   — it fit the known factors better, it did not find a fourth one.
+
+**Two traps the literature will happily sell you.** *Calendar/seasonality*: SSRN papers claim
+exploitable crypto day-of-week and time-of-day profits, several from a commercial backtest
+shop; `exhaustive_search_320_zero` already ran calendar effects through MC + multiple-testing
++ OOS with **zero survivors** — trust the gauntlet. *Cross-venue arb*: BTC spreads of 8.67–15.69%
+across 80 exchanges are real (SSRN 4816710) but concentrated on non-US, non-trustworthy and DEX
+venues, and driven by capital controls across countries (3171204) — not reachable from a US
+Kraken account, exactly as `altcoin-cross-venue-arb` concluded.
+
 **One open tension, NOT a verdict:** Kim, Tse & Wald (SSRN 2786955) argue published TSMOM
 results are largely driven by **volatility scaling rather than momentum itself**, while this
 repo's `trend-signal-honest` walk-forward *rejected* inverse-vol sizing on the SMA(100) rule
 (Sharpe 0.98 → 0.76) — contradicting the general vol-targeting endorsement further down this
-file. Two credible sources, opposite directions, same lever. Pre-register a test; don't
-assume either.
+file. It is a three-sided debate: Moreira & Muir (2659431) are FOR, Kim/Tse/Wald are for but
+reframe the edge, Cederburg et al (3357038) are AGAINST on real-time performance, and our own
+walk-forward is against. **The variable that actually differs:** Moreira/Muir scale a
+*diversified factor portfolio*; we scaled a *single-asset binary trend rule*. Pre-register the
+narrow version — does vol scaling help a BASKET, where diversification was already the only
+thing that measured better? Don't assume either way.
 
 ## Key Files
 ```
