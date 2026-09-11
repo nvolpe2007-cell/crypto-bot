@@ -1,0 +1,54 @@
+# Canonical GEX (dealer gamma-exposure) forward-LOGGING cron line.
+# Installed by deploy/setup_vps.sh. Runs hourly at :05.
+#
+# WHY THIS FILE EXISTS AT ALL
+#   The pipeline was built 2026-09-05 and then ran ONCE, by hand. As of
+#   2026-09-08 `data/gex_log.csv` held a single row. Every other forward arm in
+#   this repo has a cron (swing, tsmom, lev_perp, trend_ensemble); GEX did not,
+#   so the one line of research that could ever escape the daily-OHLC boundary
+#   (memory `exhaustive_search_320_zero`: "no edge in daily OHLC; need new DATA")
+#   was accumulating nothing. This is that fix. It is infrastructure, not a
+#   strategy — no trade is taken and no gate is evaluated.
+#
+# WHAT IT LOGS (2 Deribit public API calls per run, no key required)
+#   Per-strike net dealer gamma exposure, the zero-gamma flip point, the nearest
+#   ceiling/floor walls, ATM IV and realized vol. One row per symbol per hour to
+#   `data/gex_log.csv`; latest snapshot to `data/gex_state.json`.
+#
+# WHY HOURLY, NOT DAILY
+#   The hypothesis is about where price sits RELATIVE to the walls, so the data
+#   is only useful paired with subsequent price. Hourly snapshots let a later
+#   study measure 1h/4h/24h forward returns conditioned on dist-to-flip and
+#   dist-to-wall. Daily would cap the sample at ~30/month and make the intraday
+#   question untestable. Cost is 2 unauthenticated calls/hour.
+#
+# PRE-REGISTERED QUESTION — write this down now, before the data exists
+#   H: when spot sits BELOW the zero-gamma flip point (dealer-short-gamma), moves
+#      are amplified; ABOVE it (dealer-long-gamma), moves are dampened. If true,
+#      realized vol over the next N hours should be reliably HIGHER in the
+#      below-flip regime, and price should mean-revert near ceiling/floor walls.
+#   KILL CRITERIA (agreed in advance, so this cannot be rationalised later):
+#      - no significant difference in forward realized vol between regimes after
+#        >=200 paired observations, OR
+#      - the wall-reversion effect is smaller than the 0.54% round-trip cost.
+#   Either outcome retires the line. A "promising but underpowered" reading after
+#   200 observations is a NULL, not a reason to keep looking.
+#
+# THE ASSUMPTION THAT COULD INVALIDATE ALL OF IT
+#   Net GEX per strike assumes call OI = dealer LONG gamma and put OI = dealer
+#   SHORT gamma. That is the standard convention and it is UNVERIFIABLE from
+#   public data — Deribit publishes open interest, not dealer inventory. If the
+#   convention is wrong the sign of every regime label flips. Do not treat a
+#   result from this data as proof of a mechanism; at best it is evidence that
+#   the PROXY correlates with something. Stated in every file that touches this.
+#
+# NOT WIRED TO TRADING. Logging only, by design and by the owner's explicit
+# 2026-09-05 scope decision. Do not add an entry gate off this data until the
+# pre-registered question above has an answer.
+5 * * * * cd /opt/crypto-bot && /usr/bin/python3 gex_paper.py >> logs/gex_paper.log 2>&1
+
+# ── OPTIONAL: add ETH once BTC has a clean month of rows ──────────────────────
+# Deliberately NOT enabled. One symbol first: if the BTC record is inconclusive,
+# a second correlated symbol adds observations without adding independent
+# evidence, and inflates k against every other arm on the proof scorecard.
+# 5 * * * * cd /opt/crypto-bot && GEX_SYMBOLS=BTC,ETH /usr/bin/python3 gex_paper.py >> logs/gex_paper.log 2>&1

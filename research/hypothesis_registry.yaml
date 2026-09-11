@@ -502,3 +502,71 @@ hypotheses:
       methodological fix made before the full run — sweeping the smoothing window
       to chase a better number would NOT have been legitimate.
       Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
+
+  - id: gex-dealer-exposure-walls
+    name: Dealer gamma-exposure (GEX) walls from the Deribit options chain
+    family: infrastructure
+    hypothesis: >
+      Options-derived dealer gamma exposure (per-strike net GEX, the
+      zero-gamma flip point, and call/put-OI walls) identifies ceiling/floor
+      price levels and a mean-reversion-vs-trend-extension regime that
+      predicts short-horizon price behavior better than an unconditional
+      baseline.
+    code: src/gex/ (black_scholes.py, deribit_client.py, gex_calculator.py), gex_paper.py
+    evidence:
+      - date: 2026-09-05
+        script: gex_paper.py
+        method: >
+          Built the missing data pipeline this idea was parked for on
+          2026-06-08 (memory market_structure_signals_verdict): Deribit's
+          public get_book_summary_by_currency (OI + mark IV per strike, one
+          call, no auth) + Black-Scholes gamma computed locally (per-instrument
+          greeks would be ~1000 API calls). Captured one live BTC snapshot to
+          verify the pipeline runs end-to-end and produces sane output.
+        result: >
+          No measurement performed — this is a first live snapshot, not
+          evidence of a signal. BTC spot 79,863: net GEX at spot +261M
+          (positive/dealer-long-gamma regime), zero-gamma flip point 68,283
+          (14.5% below spot), ceiling wall 82,000, floor wall 77,000, ATM IV
+          (~30d tenor) 36.3% vs Deribit realized vol 38.0% (spread -1.7pp).
+          Numbers are the right shape (flip below spot, walls bracketing
+          spot, IV/RV roughly in line) but nothing here has been checked
+          against subsequent price action.
+    deployment_gate:
+      requires: forward-logged record (data/gex_log.csv, gex_paper.py run
+        repeatedly) showing price behavior near a wall or across the flip
+        point differs from an unconditional baseline, at the family-wise
+        t-bar, before any live wiring
+      blocked_by: zero forward observations yet; no pre-registered concrete
+        claim (which wall rank, what % distance, what hold period) has been
+        fixed before data collection starts
+    status: infrastructure
+    notes: |
+      SIGN-CONVENTION CAVEAT (the one thing to not forget): net GEX per
+      strike is computed as (call_OI - put_OI) * gamma_BS, the standard
+      public-GEX-tracker assumption that call OI = dealer long gamma and put
+      OI = dealer short gamma. Deribit's public data cannot confirm or
+      refute this — nobody outside the exchange sees actual dealer
+      positioning. Every number this pipeline produces is conditional on
+      that assumption holding on average across the chain. See
+      src/gex/gex_calculator.py's module docstring.
+
+      Deliberately NOT wired into entry_checklist/probability_gate or any
+      live/paper strategy. Per the 2026-06-08 verdict's own reasoning (cost
+      dominates, not signal quality) and this repo's standing rule to never
+      loosen a gate to force trades, this stays signal-logging-only
+      (gex_paper.py appends one row per run to data/gex_log.csv, never
+      edited) until there is a forward record to judge by proof_scorecard.
+
+      No historical backtest exists or is planned near-term: Deribit does
+      not serve historical options chains the way it serves live ones: a
+      real backtest would need a paid historical-options-data source. The
+      forward log is the only evidence path right now.
+
+      DO NOT RE-PROPOSE without new evidence:
+        - Treating the sign-convention assumption as verified fact.
+        - Backtesting this against "reconstructed" historical option chains
+          without a real historical-options data source.
+        - Wiring this into any live entry path before a forward record
+          exists and clears proof_scorecard.
+      Source doc: RESEARCH_2026-09-05_gex_dealer_exposure_walls.md.
