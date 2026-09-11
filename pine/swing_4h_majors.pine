@@ -1,0 +1,143 @@
+//@version=6
+//
+// Swing — long-only majors, 4h pullback entry in a confirmed uptrend
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: src/swing_strategy.py + swing_paper.py
+//          (state: data/swing_paper_state.json, judged by proof_scorecard)
+//
+// WHAT IT IS — THE FIVE-GATE ENTRY, ALL OF WHICH MUST PASS
+//   1. TREND        close > EMA50 AND EMA20 > EMA50
+//   2. MOMENTUM     20-bar rate-of-change >= 2%
+//   3. PULLBACK     RSI crossing UP through 50 (buy the dip in an uptrend,
+//                   not the breakout top)
+//   4. NOT CHASING  RSI < 68 (overbought veto)
+//   5. COST CLEARS  ATR target >= 3x the round-trip cost
+//   Exit: ATR stop (2x), ATR target (3x), or trend break (close < EMA50).
+//
+// WHY GATE 2 IS 2% AND NOT SIMPLY "POSITIVE"
+//   This is the strategy's own thesis, and it came from reviewing its real trades:
+//   weak-trend entries (ROC < 2%) won 20% of the time, real-trend entries
+//   (ROC >= 2%) won ~53%. The trend-break losers were all barely-trends. Trade
+//   REAL trends or do not trade.
+//
+// WHY LONG ONLY
+//   A US Kraken-SPOT account cannot short. Every trade this arm takes is actually
+//   executable with real money — which is the entire reason it was the arm the
+//   project treated as its path to a live account. Adding a short side would make
+//   that false. See memory swing_forward_test.
+//
+// WHY THE WIN RATE IS SUPPOSED TO BE LOW
+//   ~40% win rate with 3:1 winners is profitable. The money comes from R:R and
+//   risk control, not from being right often. Do not "improve" this by tightening
+//   toward a higher hit rate — that is the documented way to destroy expectancy
+//   (memory win_rate_trap).
+//
+// ⚠ THE MOST IMPORTANT THING ON THIS PAGE — THE ONE-YEAR BACKTEST KILLED IT
+//   A 120-day window showed +$1.13/trade. The full ONE-YEAR backtest showed
+//   71 trades, -$0.47/trade, t = -0.98, with LTC going 0-for-13. The good window
+//   was a fluke. Momentum AND mean-reversion both fail on majors once the 0.54%
+//   cost wall is charged honestly. See memory swing_one_year_backtest_negative.
+//   This port exists so the rule can be INSPECTED on a chart, not because the
+//   edge is believed. If your Strategy Tester shows this printing money, check
+//   the window length before you believe it — and do not cherry-pick ETH.
+//
+// UNIVERSE: the proven 6 majors only — BTC, ETH, SOL, LTC, BCH, XRP. A 2026-06-08
+//   sweep found broadening the universe BLED. Off-spec symbols are your own test.
+//
+strategy("Swing 4h majors (long only)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 500,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.275,      // 0.55% round trip = 0.275% per side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── inputs (defaults are SwingStrategy.__init__ defaults) ─────────────────────
+emaFast     = input.int(20,   "EMA fast",  minval = 1, group = "Trend")
+emaSlow     = input.int(50,   "EMA slow",  minval = 1, group = "Trend")
+rocN        = input.int(20,   "ROC lookback", minval = 1, group = "Momentum")
+minRoc      = input.float(2.0, "Min ROC %  (min_roc)", minval = 0.0, step = 0.5, group = "Momentum",
+     tooltip = "2% is the strategy thesis, measured on its own trade review: below this, entries won 20%; above, ~53%.") / 100.0
+rsiN        = input.int(14,   "RSI length", minval = 1, group = "Entry timing")
+rsiOb       = input.float(68.0, "RSI overbought veto  (rsi_overbought)", minval = 1, group = "Entry timing")
+atrN        = input.int(14,   "ATR length", minval = 1, group = "Risk")
+atrStopMult = input.float(2.0, "ATR stop multiple  (atr_stop_mult)",   minval = 0.1, step = 0.1, group = "Risk")
+atrTgtMult  = input.float(3.0, "ATR target multiple  (atr_target_mult)", minval = 0.1, step = 0.1, group = "Risk")
+rtCost      = input.float(0.55, "Round-trip cost %  (SWING_ROUND_TRIP_COST_FRAC)",
+     minval = 0.0, step = 0.05, group = "Risk",
+     tooltip = "0.55% = Kraken maker round trip (0.50%) plus a spread cushion. Set 0.80 to stress-test market-order execution.") / 100.0
+minTgtCost  = input.float(3.0, "Target must exceed cost by  (min_target_cost_mult)",
+     minval = 1.0, step = 0.5, group = "Risk")
+useHTF      = input.bool(true, "Force 4h bars regardless of chart timeframe", group = "Trend",
+     tooltip = "The spec is a 4h-bar strategy. The 1h and daily variants were tested and BLED (memory swing_frequency_1h_band).")
+
+// ── data (the rule is defined on 4h closes) ───────────────────────────────────
+tf   = useHTF ? "240" : timeframe.period
+c4   = request.security(syminfo.tickerid, tf, close, lookahead = barmerge.lookahead_off)
+eF   = request.security(syminfo.tickerid, tf, ta.ema(close, emaFast), lookahead = barmerge.lookahead_off)
+eS   = request.security(syminfo.tickerid, tf, ta.ema(close, emaSlow), lookahead = barmerge.lookahead_off)
+rsiV = request.security(syminfo.tickerid, tf, ta.rsi(close, rsiN),    lookahead = barmerge.lookahead_off)
+rsiP = request.security(syminfo.tickerid, tf, ta.rsi(close, rsiN)[1], lookahead = barmerge.lookahead_off)
+atrV = request.security(syminfo.tickerid, tf, ta.atr(atrN),           lookahead = barmerge.lookahead_off)
+rocV = request.security(syminfo.tickerid, tf, ta.roc(close, rocN),    lookahead = barmerge.lookahead_off) / 100.0
+
+warm = not na(eS) and not na(rsiP) and not na(atrV) and not na(rocV)
+
+// ── the five gates, kept explicit so nothing the strategy "thinks" is hidden ──
+targetPct = warm and c4 > 0 ? (atrV * atrTgtMult) / c4 : na
+stopPct   = warm and c4 > 0 ? (atrV * atrStopMult) / c4 : na
+
+gTrend    = warm and c4 > eS and eF > eS
+gMomentum = warm and rocV >= minRoc
+gPullback = warm and rsiP < 50.0 and rsiV >= 50.0      // RSI crossing UP through 50
+gNotOb    = warm and rsiV < rsiOb
+gCost     = warm and targetPct >= rtCost * minTgtCost
+
+enterNow  = gTrend and gMomentum and gPullback and gNotOb and gCost
+inPos     = strategy.position_size > 0
+
+// ── entry ─────────────────────────────────────────────────────────────────────
+if enterNow and not inPos
+    strategy.entry("LONG", strategy.long)
+    stopPrice = c4 - atrV * atrStopMult
+    tgtPrice  = c4 + atrV * atrTgtMult
+    // Stop and target are tracked INTRABAR by the runner; exit-on-close handles
+    // the trend break separately below.
+    strategy.exit("bracket", from_entry = "LONG", stop = stopPrice, limit = tgtPrice)
+
+// ── trend-break exit, evaluated on the bar close ──────────────────────────────
+if inPos and warm and c4 < eS
+    strategy.close("LONG", comment = "trend break")
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(eF, "EMA fast", color = color.new(color.aqua, 0))
+plot(eS, "EMA slow", color = color.new(color.orange, 0), linewidth = 2)
+bgcolor(inPos ? color.new(color.teal, 93) : na, title = "In position")
+plotshape(enterNow and not inPos, "ENTER", style = shape.labelup, location = location.belowbar,
+     color = color.new(color.teal, 0), text = "BUY", textcolor = color.white, size = size.tiny)
+
+// The decision-log panel: exactly which gate is blocking, the same question
+// swing_paper.py's DecisionLog answers on every bar.
+f_g(bool b) => b ? "PASS" : "fail"
+f_c(bool b) => b ? color.teal : color.maroon
+var table t = table.new(position.top_right, 2, 7, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "1 trend  c>EMA50, EMA20>EMA50", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 0, f_g(gTrend), text_color = f_c(gTrend), text_size = size.tiny)
+    table.cell(t, 0, 1, "2 momentum  ROC>=" + str.tostring(minRoc * 100, "#.#") + "%", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 1, f_g(gMomentum), text_color = f_c(gMomentum), text_size = size.tiny)
+    table.cell(t, 0, 2, "3 pullback  RSI up through 50", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 2, f_g(gPullback), text_color = f_c(gPullback), text_size = size.tiny)
+    table.cell(t, 0, 3, "4 not overbought  RSI<" + str.tostring(rsiOb, "#"), text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 3, f_g(gNotOb), text_color = f_c(gNotOb), text_size = size.tiny)
+    table.cell(t, 0, 4, "5 cost clears  tgt>=" + str.tostring(minTgtCost, "#") + "x cost", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 4, f_g(gCost), text_color = f_c(gCost), text_size = size.tiny)
+    table.cell(t, 0, 5, "ROC now", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 5, str.tostring(rocV * 100, "#.#") + "%", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 0, 6, "R:R", text_color = color.gray, text_size = size.tiny)
+    table.cell(t, 1, 6, na(stopPct) or stopPct == 0 ? "-" : str.tostring(targetPct / stopPct, "#.##"),
+         text_color = color.gray, text_size = size.tiny)
+
+alertcondition(enterNow, "Swing: ENTER", "Swing {{ticker}}: uptrend pullback resuming -> BUY")
