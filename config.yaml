@@ -73,6 +73,14 @@ altperp:
   # so it was running unjudged. Off until it's either executable or measured.
   # Flip back to true (and consider adding it to the scorecard) to resume forward
   # data collection. See proof_scorecard.py.
+  #
+  # SECOND REASON TO LEAVE IT OFF, found 2026-09-10 by the volume-provenance audit:
+  # the Tier-1 flush-long gate REQUIRES a 3× volume spike computed from BYBIT
+  # klines, and Bybit is an unregulated-tier venue where >70% of reported volume is
+  # wash traded (SSRN 3530220). Wash volume rises under volatile conditions, so the
+  # gate is biased toward false positives in exactly the regime it fires in. Before
+  # re-enabling: source volume from a regulated venue, or drop vol_spike from the
+  # tier-1 conjunction. See src/altperp/runner.py and CLAUDE.md "External evidence".
   enabled: false
   # Claude-API gate-keeper layer that confirms / vetoes / sizes structural setups.
   # OFF by default: without ANTHROPIC_API_KEY in .env the brain fail-closes and
