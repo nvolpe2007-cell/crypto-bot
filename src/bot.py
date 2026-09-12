@@ -325,7 +325,9 @@ async def main():
     # wrapper already used for the websocket feeds below) so an unhandled crash
     # in one — e.g. the dashboard — restarts just that subsystem instead of
     # propagating through this gather and killing the whole process, which would
-    # take the live/paper trading loop and funding scanner down with it too.
+    # take the live/paper trading loop down with it too. (A third subsystem,
+    # a funding scanner, was gathered here too until 8104e46 removed it as a
+    # duplicate of paper_trading.py's properly-gated multi-arm wiring.)
     gather_task = asyncio.gather(
         supervised('bot', bot.start, notifier=notifier),
         supervised('dashboard', run_dashboard, notifier=notifier),

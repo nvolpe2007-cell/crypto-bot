@@ -74,6 +74,27 @@ class TestHandleTrades:
             ]})
         assert ofw.last_whale("BTC/USD") is None
 
+    def test_whale_average_excludes_the_candidate_trade_itself(self):
+        # Regression guard: the average used for the multiplier must be over
+        # the PRIOR trade history only. Before the fix, the candidate trade's
+        # own size was folded into its comparison average first, inflating
+        # the effective threshold above _WHALE_MULT (e.g. ~3.86x instead of
+        # 3x at the 10-trade floor: 3*(N-1)/(N-3) with N=10 prior+candidate).
+        # A trade at exactly 3.5x the true prior average sits below that
+        # inflated bar (would have gone undetected pre-fix) but above the
+        # documented 3x bar, so it must be flagged as a whale.
+        ofw = _make_ofw()
+        for _ in range(10):
+            ofw._handle_trades({"data": [
+                {"symbol": "BTC/USD", "qty": "1.0", "price": "100.0", "side": "buy"},
+            ]})
+        ofw._handle_trades({"data": [
+            {"symbol": "BTC/USD", "qty": "3.5", "price": "100.0", "side": "sell"},
+        ]})
+        whale = ofw.last_whale("BTC/USD")
+        assert whale is not None
+        assert whale.size == 3.5
+
 
 # ── get_cvd_trend / get_obi / staleness ────────────────────────────────────────
 
