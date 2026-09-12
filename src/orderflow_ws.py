@@ -110,8 +110,7 @@ class OrderFlowWS:
         if len(trades) < _CVD_TREND_HALF * 2:
             return None
         recent = sum(t[0] for t in trades[-_CVD_TREND_HALF:])
-        prior  = sum(t[0] for t in trades[-_CVD_TREND_HALF * 2:-_CVD_TREND_HALF])
-        return recent > prior  # accelerating buying vs prior window
+        return recent > 0  # sign of net flow over the recent window
 
     def get_cvd_raw(self, symbol: str) -> Optional[float]:
         """Return the raw signed sum of the last _CVD_WINDOW trades."""
