@@ -50,6 +50,18 @@ def evaluate_and_act(coin: str, market: Dict, pm: PositionManager,
     fdyn = funding_dynamics_signal(market["funding_rate"], market.get("funding_history", []))
     micro = microstructure_signal(market.get("perp_trades", []), klines,
                                   market.get("spot_klines", []))
+    # ⚠ DATA PROVENANCE — this volume comes from Bybit (src/altperp/data.py →
+    # /v5/market/kline), and Bybit sits in the UNREGULATED tier of the wash-trading
+    # literature's taxonomy, where >70% of reported volume is wash traded (SSRN
+    # 3530220; Bitwise put it as high as 95%). A 3× burst over a 20-bar average is
+    # precisely the statistic wash trading distorts, and wash volume RISES under
+    # volatile conditions (SSRN 4971590) — i.e. exactly when a post-liquidation
+    # flush is being detected. The bias is therefore toward FALSE POSITIVES in the
+    # regime this gate exists to fire in, not toward random noise.
+    # This is methodology lesson 3 from the altcoin-pairs retraction: robustness
+    # checks cannot detect a flaw uniformly present in the input.
+    # Before re-enabling altperp, either source this volume from a regulated venue
+    # or drop vol_spike from the tier-1 gate. See CLAUDE.md "External evidence".
     vols = [c["volume"] for c in klines]
     vol_spike = is_volume_spike(vols[-1], vols[-21:-1], config.VOLUME_SPIKE_MULTIPLIER) \
         if len(vols) > 1 else False
