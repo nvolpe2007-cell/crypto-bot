@@ -17,7 +17,9 @@ Covers:
 
 import pytest
 from datetime import datetime
-from src.paper_trading import PaperTrader, PaperPosition, _SubsystemFailureTracker
+from src.paper_trading import (
+    PaperTrader, PaperPosition, _SubsystemFailureTracker, _funding_extreme_blocks,
+)
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -694,3 +696,36 @@ class TestSubsystemFailureTracker:
         # Both can alert again on a fresh failure streak
         assert t.record_failure("BTC/USD") is False   # only 1 failure so far
         assert t.record_failure("ETH/USD") is False
+
+
+# ── _funding_extreme_blocks ──────────────────────────────────────────────────
+# Pins today's behavior: the kill-filter's funding-extreme veto is direction-
+# agnostic (blocks buy AND sell alike), unlike entry_checklist._funding_favorable
+# which only downweights the side actually paying the rate. See
+# worklog/2026-08-26-dispatch-funding-extreme-kill-filter-direction.md for why
+# this wasn't changed to be side-aware in this pass.
+class TestFundingExtremeBlocks:
+    def test_no_block_when_funding_rate_unknown(self):
+        assert _funding_extreme_blocks(None, "buy") is None
+
+    def test_no_block_below_threshold(self):
+        assert _funding_extreme_blocks(0.0009, "buy") is None
+        assert _funding_extreme_blocks(-0.0009, "sell") is None
+
+    def test_blocks_buy_when_longs_are_paying(self):
+        # fr > 0: longs pay shorts — the side the misleading comment describes.
+        assert _funding_extreme_blocks(0.0015, "buy") == "FUNDING_EXTREME (0.0015/8h)"
+
+    def test_also_blocks_sell_when_longs_are_paying(self):
+        # Same positive fr, but a SHORT would COLLECT this funding, not pay it —
+        # still vetoed today because the check ignores `side` entirely.
+        assert _funding_extreme_blocks(0.0015, "sell") == "FUNDING_EXTREME (0.0015/8h)"
+
+    def test_also_blocks_buy_when_shorts_are_paying(self):
+        # Symmetric case: fr < 0 means shorts pay longs, yet a LONG (which would
+        # collect it) is still vetoed.
+        assert _funding_extreme_blocks(-0.0015, "buy") == "FUNDING_EXTREME (-0.0015/8h)"
+
+    def test_custom_threshold_respected(self):
+        assert _funding_extreme_blocks(0.002, "buy", threshold=0.005) is None
+        assert _funding_extreme_blocks(0.006, "buy", threshold=0.005) is not None
