@@ -13,7 +13,10 @@ Position size scales with confidence above the 93% tier.
 
 Entry requirements:
   - Minimum confidence: 60
-  - OFI must not be strongly opposing (fail-open when unavailable)
+  - OFI must not oppose the trade direction at ANY magnitude (hard block in
+    entry_checklist._ofi_aligned on any negative ofi_score, including the
+    weakest/noise-level opposing tier below — not just "strongly opposing"
+    despite what this used to say; fail-open when OFI is unavailable)
   - Regime must not be blocking (CRASH blocks longs, no other hard blocks)
 """
 
@@ -31,12 +34,17 @@ from .lead_lag_detector import LeadLagDetector
 logger = logging.getLogger(__name__)
 
 # ── Confidence tiers → position size multipliers ──────────────────────────────
-#  < 60  : no trade
-#  60-79 : 0.5x base
-#  80-89 : 0.8x base
-#  90-92 : 1.0x base
-#  93-96 : 1.4x base   ← "high confidence" tier
-#  97-100: 1.8x base   ← "very high confidence" tier
+# Kept in sync with the CONFIDENCE_TIERS table below — this comment previously
+# described a different set of thresholds/multipliers than the table actually
+# implements (it said "<60: no trade", but the table sizes trades down to 38).
+#  < 38  : no trade
+#  38-44 : 0.2x base   (small exploratory)
+#  45-59 : 0.3x base
+#  60-74 : 0.5x base
+#  75-84 : 0.7x base
+#  85-92 : 1.0x base
+#  93-96 : 1.5x base   ← "high confidence" tier
+#  97-100: 2.0x base   ← "very high confidence" tier
 CONFIDENCE_TIERS = [
     (97, 2.0),   # 97-100%: 12% of equity
     (93, 1.5),   # 93-96%:  9% of equity
