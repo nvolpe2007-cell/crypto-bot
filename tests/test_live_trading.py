@@ -66,9 +66,12 @@ from src.live_trading import (
     _daily_loss_halted,
     _sltp_circuit_alert,
     _sltp_circuit_cleared,
+    _debounce_signal_exit,
+    _reset_signal_exit_streak,
     run_live_trading_session,
     FEE_RATE,
     ATR_TRAIL_MULT,
+    SIGNAL_EXIT_STREAK,
 )
 from src.scientific_strategy import ScientificSignal
 import src.kill_switch as kill_switch
@@ -1196,3 +1199,78 @@ class TestSltpCircuitCleared:
         notifier = MagicMock()
         notifier.send_message.side_effect = RuntimeError("telegram down")
         assert _sltp_circuit_cleared(notifier, "BTC/USD") is False
+
+
+# ── _debounce_signal_exit / _reset_signal_exit_streak ───────────────────────────
+#
+# Before this fix, run_live_trading_session closed a real position on a single
+# opposing signal tick, with no debounce at all — despite this module's own
+# docstring claiming "the same ScientificStrategy pipeline as paper_trading."
+# paper_trading.py's exit side requires SIGNAL_EXIT_STREAK (2) consecutive
+# opposing ticks before closing, justified by its own backtest: 25/33
+# signal-flip exits on a single opposing bar had a 4% win rate. These helpers
+# port that exact debounce to the live (real-money) path.
+
+class TestDebounceSignalExit:
+    def test_single_opposing_tick_does_not_fire(self):
+        streak = {}
+        assert _debounce_signal_exit("BTC/USD", streak) is False
+        assert streak["BTC/USD"] == 1
+
+    def test_reaches_default_threshold_on_second_consecutive_tick(self):
+        streak = {}
+        _debounce_signal_exit("BTC/USD", streak)
+        assert _debounce_signal_exit("BTC/USD", streak) is True
+        assert streak["BTC/USD"] == 2
+
+    def test_default_threshold_matches_module_constant(self):
+        streak = {}
+        for _ in range(SIGNAL_EXIT_STREAK - 1):
+            assert _debounce_signal_exit("BTC/USD", streak) is False
+        assert _debounce_signal_exit("BTC/USD", streak) is True
+
+    def test_custom_threshold_honored(self):
+        streak = {}
+        assert _debounce_signal_exit("BTC/USD", streak, threshold=1) is True
+
+    def test_streaks_are_tracked_independently_per_symbol(self):
+        streak = {}
+        _debounce_signal_exit("BTC/USD", streak)
+        _debounce_signal_exit("BTC/USD", streak)
+        assert _debounce_signal_exit("ETH/USD", streak) is False
+        assert streak == {"BTC/USD": 2, "ETH/USD": 1}
+
+    def test_streak_keeps_incrementing_past_threshold_if_not_reset(self):
+        """Not load-bearing behavior, but pins that the counter doesn't clamp —
+        callers are expected to reset after acting on a True result."""
+        streak = {}
+        for _ in range(SIGNAL_EXIT_STREAK + 2):
+            _debounce_signal_exit("BTC/USD", streak)
+        assert streak["BTC/USD"] == SIGNAL_EXIT_STREAK + 2
+
+
+class TestResetSignalExitStreak:
+    def test_clears_existing_streak(self):
+        streak = {"BTC/USD": 1}
+        _reset_signal_exit_streak("BTC/USD", streak)
+        assert "BTC/USD" not in streak
+
+    def test_missing_symbol_does_not_raise(self):
+        streak = {}
+        _reset_signal_exit_streak("BTC/USD", streak)  # must not KeyError
+        assert streak == {}
+
+    def test_only_clears_the_named_symbol(self):
+        streak = {"BTC/USD": 2, "ETH/USD": 1}
+        _reset_signal_exit_streak("BTC/USD", streak)
+        assert streak == {"ETH/USD": 1}
+
+    def test_a_fresh_reversal_after_reset_starts_the_count_over(self):
+        """Regression guard for the exact bug this fix targets: without a
+        reset, an old partial streak from an earlier, unrelated reversal could
+        combine with a later one and fire the exit after only one fresh
+        opposing tick instead of SIGNAL_EXIT_STREAK."""
+        streak = {"BTC/USD": 1}
+        _reset_signal_exit_streak("BTC/USD", streak)
+        assert _debounce_signal_exit("BTC/USD", streak) is False
+        assert streak["BTC/USD"] == 1
