@@ -12,6 +12,9 @@ Safety guarantees:
   - Daily loss circuit breaker: halts NEW entries if realized loss exceeds
     MAX_DAILY_LOSS, without abandoning SL/TP protection on any open position
   - Min confidence: 70 (higher bar than paper's 60)
+  - Signal-reversal exits require SIGNAL_EXIT_STREAK consecutive opposing
+    signals before closing (same debounce as paper_trading.py) — a lone
+    opposing bar is mostly noise, not a real reversal
 """
 
 import asyncio
@@ -46,6 +49,10 @@ LIVE_MIN_CONFIDENCE = 70.0   # higher bar than paper (60) — real money
 EVAL_INTERVAL       = 2.0    # seconds between signal evaluations per symbol
 FEE_RATE            = 0.0026  # Kraken taker fee (0.26%) — overridden by actual order fee
 ATR_TRAIL_MULT      = 2.5    # chandelier exit: trail = highest_since_entry - ATR_TRAIL_MULT × entry ATR
+# Consecutive opposing-signal ticks required before a signal-reversal exit
+# fires — mirrors paper_trading.py's own SIGNAL_EXIT_STREAK (a single opposing
+# bar is mostly noise; see _debounce_signal_exit below).
+SIGNAL_EXIT_STREAK  = 2
 
 
 @dataclass
@@ -519,6 +526,9 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
     indicators:     Dict[str, dict]         = {}
     recent_trades:  List[dict]              = []
     equity_curve:   List[dict]              = []
+    # Per-symbol streak state for the signal-reversal exit debounce — see
+    # _debounce_signal_exit / SIGNAL_EXIT_STREAK below.
+    opposing_streak: Dict[str, int] = {}
     iteration = 0
     killed = False  # master kill switch state — see _kill_switch_engaged()
     daily_loss_halted = False  # daily-loss breaker state — see _daily_loss_halted()
@@ -683,11 +693,22 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
 
                 # ── LONG EXIT (signal reversed) ────────────────────────────────
                 elif sig.signal == Signal.SELL and pos is not None:
-                    trade = await trader.close_long(symbol, current_price, "SIGNAL")
-                    if trade:
-                        equity = trader.account.initial_capital + trader.account.total_pnl
-                        equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
-                        recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
+                    if _debounce_signal_exit(symbol, opposing_streak, SIGNAL_EXIT_STREAK):
+                        trade = await trader.close_long(symbol, current_price, "SIGNAL")
+                        if trade:
+                            equity = trader.account.initial_capital + trader.account.total_pnl
+                            equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
+                            recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
+                        _reset_signal_exit_streak(symbol, opposing_streak)
+                    else:
+                        logger.debug(f"[LIVE EXIT-DEBOUNCE] {symbol}: opposing "
+                                     f"{opposing_streak[symbol]}/{SIGNAL_EXIT_STREAK}")
+
+                # Any tick without an opposing signal resets the streak (mirrors
+                # paper_trading.py — a single reversal that doesn't repeat next
+                # tick shouldn't count toward a later, unrelated streak).
+                elif pos is not None:
+                    _reset_signal_exit_streak(symbol, opposing_streak)
 
             trader.update_unrealized(prices)
 
@@ -798,6 +819,29 @@ def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
     trail = pos.highest_price_since_entry - ATR_TRAIL_MULT * pos.atr_at_entry
     if trail > pos.stop_loss_price:
         pos.stop_loss_price = trail
+
+
+def _debounce_signal_exit(symbol: str, opposing_streak: Dict[str, int],
+                           threshold: int = SIGNAL_EXIT_STREAK) -> bool:
+    """Track consecutive opposing-signal ticks for `symbol`; return True once
+    `threshold` is reached (i.e. the exit should fire now).
+
+    Mirrors paper_trading.py's opposing_streak / SIGNAL_EXIT_STREAK debounce:
+    paper's own backtest found 25/33 signal-flip exits on a single opposing bar
+    had a 4% win rate — a lone reversal is mostly noise. This module's
+    docstring claims "the same ScientificStrategy pipeline as paper_trading";
+    before this fix the exit side of that pipeline diverged (live closed real
+    positions on one opposing tick with no debounce at all).
+    """
+    opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
+    return opposing_streak[symbol] >= threshold
+
+
+def _reset_signal_exit_streak(symbol: str, opposing_streak: Dict[str, int]) -> None:
+    """Clear symbol's opposing-signal streak. Call on any tick that isn't an
+    opposing signal, so an old partial streak can't combine with a later,
+    unrelated reversal to fire the exit early."""
+    opposing_streak.pop(symbol, None)
 
 
 def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool) -> bool:
