@@ -1,0 +1,202 @@
+//@version=6
+//
+// Micro CVD & the Cost Wall — what a maker-only entry has to clear to be worth taking
+// ─────────────────────────────────────────────────────────────────────────────────
+// WHAT THIS IS
+//   The CVD half of the maker-only microstructure gate (micro_paper.py), plus the
+//   measurement that decides whether the whole idea is viable: of the bars where the
+//   signal fires, how many go on to clear a 0.50% round trip before hitting the stop?
+//
+//   The count in the table IS the finding. If it sits near or below break-even, the
+//   strategy is dead at this fee no matter how good the signal is — which is exactly
+//   how the previous incarnation of this scalper died (t ≈ -8.82 at taker cost).
+//
+// WHAT THIS IS *NOT* — READ THIS BEFORE TRUSTING IT
+//   This is NOT the arm in micro_paper.py, and it cannot be. Three inputs are
+//   unavailable in Pine, and each one matters:
+//
+//     1. ORDER BOOK IMBALANCE — impossible. Pine has no order-book access of any
+//        kind. OBI ≥ 0.58 is one of the three gate conditions, and it is simply
+//        absent here. This indicator fires on a WEAKER condition than the arm does,
+//        so expect it to signal more often and worse.
+//
+//     2. TRUE TICK CVD — unavailable. The arm reads the real trade tape with
+//        Kraken's taker side per print. Pine can only take lower-timeframe bars and
+//        infer direction from close vs open. A bar that closes up is counted as
+//        buying. That is an approximation, and on choppy bars it is a poor one.
+//
+//     3. MAKER FILLS — unmodellable. The arm's whole point is that a resting bid
+//        fills ONLY when a taker sell trades down through it, and otherwise cancels
+//        with NO TRADE. TradingView's emulator fills a limit when price merely
+//        touches, and models no non-fills. So any strategy version of this would
+//        overstate fills, which is the exact flattery the arm exists to avoid.
+//
+//   Treat this as a viewer for the cost wall, not as a signal to trade.
+//
+// THE ECONOMICS, WHICH ARE THE POINT
+//   Kraken spot maker is 0.25%/side at tier 0 → a round trip costs 0.50%. So a
+//   maker-only strategy CANNOT scalp: the move has to clear half a percent before
+//   the trade is worth making at all. That is why the default target here is 0.65%
+//   and not the few-basis-points a "scalper" implies.
+//
+//   The repo's standing rule applies to anything you add on top: any change that
+//   raises the win rate while increasing trade count should be assumed to be
+//   destroying expectancy until proven otherwise. Twelve of twelve filter cells
+//   reproduced that. See pine/trend_signal_honest.pine.
+//
+// ─────────────────────────────────────────────────────────────────────────────────
+
+indicator("Micro CVD & Cost Wall", shorttitle="CVD/COST", overlay=true, max_labels_count=200)
+
+// ── inputs ───────────────────────────────────────────────────────────────────────
+grpS = "Signal"
+ltf        = input.timeframe("1",  "Lower timeframe for volume delta", group=grpS,
+     tooltip="Bars used to infer buying vs selling. Finer is better, but TradingView " +
+             "limits how far back it can look — go too fine and history shortens.")
+slopeLen   = input.int(14,  "CVD slope lookback (bars)", minval=2,  group=grpS)
+minSlope   = input.float(0.0, "Minimum CVD slope",       step=0.1, group=grpS,
+     tooltip="Net signed volume per bar. >0 means net buying over the lookback.")
+needRespond= input.bool(true, "Require price to respond to CVD", group=grpS,
+     tooltip="Price must be moving the same way as CVD. Without this you buy into " +
+             "absorption — heavy buying that price refuses to follow.")
+
+grpC = "Costs and targets"
+makerFee   = input.float(0.25, "Maker fee %/side",   step=0.01, group=grpC)
+takeProfit = input.float(0.65, "Take profit %",      step=0.05, group=grpC)
+stopLoss   = input.float(0.45, "Stop loss %",        step=0.05, group=grpC)
+horizon    = input.int(60,     "Bars to resolve a signal", minval=5, group=grpC,
+     tooltip="How long a signal gets to reach target or stop before it's called a timeout.")
+
+grpD = "Display"
+showBands  = input.bool(true, "Show target / stop bands on signals", group=grpD)
+showTable  = input.bool(true, "Show the cost-wall table",            group=grpD)
+
+roundTrip = makerFee * 2.0
+
+// ── the cost guard, mirrored from micro_paper.py ─────────────────────────────────
+// The runner refuses to start when the target can't clear the round trip. Same
+// refusal here: a red chart is better than a plausible-looking losing signal.
+badTarget = takeProfit <= roundTrip
+if barstate.islast and badTarget
+    label.new(bar_index, high, "Target " + str.tostring(takeProfit, "#.##") +
+              "% does not clear the " + str.tostring(roundTrip, "#.##") +
+              "% round trip.\nNegative-EV by construction — raise it.",
+              style=label.style_label_down, color=color.red, textcolor=color.white,
+              size=size.large)
+
+// ── CVD from lower-timeframe bars ────────────────────────────────────────────────
+// Signed volume per sub-bar: up-bar counts as buying, down-bar as selling. This is
+// the approximation the header warns about — the real arm reads taker side per print.
+[ltfClose, ltfOpen, ltfVol] = request.security_lower_tf(syminfo.tickerid, ltf,
+     [close, open, volume])
+
+barDelta = 0.0
+if array.size(ltfVol) > 0
+    for i = 0 to array.size(ltfVol) - 1
+        c = array.get(ltfClose, i)
+        o = array.get(ltfOpen,  i)
+        v = array.get(ltfVol,   i)
+        barDelta := barDelta + (c > o ? v : c < o ? -v : 0.0)
+
+var float cvd = 0.0
+cvd := cvd + barDelta
+
+cvdSlope = (cvd - cvd[slopeLen]) / slopeLen
+priceMove = close - close[slopeLen]
+// "responding" = price is going the way the flow says it should
+responding = (cvdSlope > 0 and priceMove > 0) or (cvdSlope < 0 and priceMove < 0)
+
+longSignal = not badTarget and cvdSlope > minSlope and barDelta > 0 and
+             (not needRespond or responding)
+fresh = longSignal and not longSignal[1]
+
+// ── did the signal clear the cost wall? ──────────────────────────────────────────
+// Walk forward from each fresh signal: target first = win, stop first = loss,
+// neither within the horizon = timeout. Counting timeouts separately matters —
+// folding them into either bucket is how a strategy gets to look better than it is.
+var int nWin  = 0
+var int nLoss = 0
+var int nTime = 0
+var float sumRet = 0.0
+
+var float pendPrice = na
+var int   pendBar   = na
+
+if fresh and na(pendPrice)
+    pendPrice := close
+    pendBar   := bar_index
+
+if not na(pendPrice)
+    tgt = pendPrice * (1.0 + takeProfit / 100.0)
+    stp = pendPrice * (1.0 - stopLoss  / 100.0)
+    if low <= stp
+        nLoss  := nLoss + 1
+        sumRet := sumRet - stopLoss - roundTrip
+        pendPrice := na
+        pendBar   := na
+    else if high >= tgt
+        nWin   := nWin + 1
+        sumRet := sumRet + takeProfit - roundTrip
+        pendPrice := na
+        pendBar   := na
+    else if bar_index - pendBar >= horizon
+        nTime  := nTime + 1
+        sumRet := sumRet + ((close - pendPrice) / pendPrice) * 100.0 - roundTrip
+        pendPrice := na
+        pendBar   := na
+
+// ── plots ────────────────────────────────────────────────────────────────────────
+plotshape(fresh and not badTarget, title="Signal", style=shape.triangleup,
+          location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+
+tgtLine = showBands and not na(pendPrice) ? pendPrice * (1.0 + takeProfit / 100.0) : na
+stpLine = showBands and not na(pendPrice) ? pendPrice * (1.0 - stopLoss  / 100.0) : na
+plot(tgtLine, "Target", color=color.new(color.teal, 30), style=plot.style_linebr, linewidth=1)
+plot(stpLine, "Stop",   color=color.new(color.red,  30), style=plot.style_linebr, linewidth=1)
+
+// ── the table: this is the deliverable ───────────────────────────────────────────
+if showTable and barstate.islast
+    total = nWin + nLoss + nTime
+    winPct = total > 0 ? 100.0 * nWin / total : 0.0
+    avg    = total > 0 ? sumRet / total : 0.0
+    var table t = table.new(position.top_right, 2, 7, border_width=1)
+    table.cell(t, 0, 0, "Cost wall", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(t, 1, 0, syminfo.ticker + " " + timeframe.period,
+               bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(t, 0, 1, "Round trip")
+    table.cell(t, 1, 1, str.tostring(roundTrip, "#.##") + "%")
+    table.cell(t, 0, 2, "Signals")
+    table.cell(t, 1, 2, str.tostring(total))
+    table.cell(t, 0, 3, "Cleared cost")
+    table.cell(t, 1, 3, str.tostring(nWin))
+    table.cell(t, 0, 4, "Stopped")
+    table.cell(t, 1, 4, str.tostring(nLoss))
+    table.cell(t, 0, 5, "Timed out")
+    table.cell(t, 1, 5, str.tostring(nTime))
+    table.cell(t, 0, 6, "Avg net/trade",
+               bgcolor=avg > 0 ? color.new(color.teal, 60) : color.new(color.red, 60))
+    table.cell(t, 1, 6, str.tostring(avg, "#.###") + "%",
+               bgcolor=avg > 0 ? color.new(color.teal, 60) : color.new(color.red, 60))
+
+// ── alerts ───────────────────────────────────────────────────────────────────────
+alertcondition(fresh, "CVD long signal",
+     "CVD long signal — NOT a trade instruction: no OBI, approximate CVD, no maker fill model.")
+
+// ─────────────────────────────────────────────────────────────────────────────────
+// HOW TO READ THE TABLE
+//   "Avg net/trade" already subtracts the round trip. If it is negative, this signal
+//   does not pay at this fee on this symbol and timeframe — and that is a result,
+//   not a failure of the chart. Change the symbol or the timeframe and watch how
+//   fast it flips; that instability is itself informative.
+//
+//   Be suspicious of a high "Cleared cost" count with a negative average. That is the
+//   win-rate trap in its natural habitat: many small wins, fewer larger losses.
+//
+// WHAT WOULD MAKE THIS TRUSTWORTHY
+//   Nothing here is out-of-sample. It is a viewer over whatever chart you point it
+//   at, and tuning the inputs until the table turns green is exactly the overfitting
+//   this repo has documented repeatedly. The real evidence comes from the forward
+//   arm (micro_paper.py) recording to data/micro_paper_state.json and being judged
+//   by proof_scorecard.py on the pre-registered bar — n ≥ 30, expectancy > 0,
+//   family-wise t, and DSR > 0.95.
+// ─────────────────────────────────────────────────────────────────────────────────
