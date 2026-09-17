@@ -107,6 +107,38 @@ class TestCvdTrendAndStaleness:
             ]})
         assert ofw.get_cvd_trend("BTC/USD") is True
 
+    def test_cvd_trend_true_when_still_net_buying_but_decelerating(self):
+        # Prior window strongly net-buying, recent window still net-buying (just
+        # smaller). The docstring's contract is "sign of recent net flow", so this
+        # must read True even though recent < prior — regression test for the
+        # get_cvd_trend bug where `recent > prior` (acceleration) was used instead
+        # of `recent > 0` (sign), which silently mislabeled decelerating-but-still-
+        # bullish tape as bearish and let confirms_sell fail to block a short into it.
+        ofw = _make_ofw()
+        for _ in range(10):
+            ofw._handle_trades({"data": [
+                {"symbol": "BTC/USD", "qty": "10.0", "price": "100.0", "side": "buy"},
+            ]})
+        for _ in range(10):
+            ofw._handle_trades({"data": [
+                {"symbol": "BTC/USD", "qty": "1.0", "price": "100.0", "side": "buy"},
+            ]})
+        assert ofw.get_cvd_trend("BTC/USD") is True
+
+    def test_cvd_trend_false_when_still_net_selling_but_decelerating(self):
+        # Symmetric case: prior window strongly net-selling, recent window still
+        # net-selling (just smaller) — must read False, not True.
+        ofw = _make_ofw()
+        for _ in range(10):
+            ofw._handle_trades({"data": [
+                {"symbol": "BTC/USD", "qty": "10.0", "price": "100.0", "side": "sell"},
+            ]})
+        for _ in range(10):
+            ofw._handle_trades({"data": [
+                {"symbol": "BTC/USD", "qty": "1.0", "price": "100.0", "side": "sell"},
+            ]})
+        assert ofw.get_cvd_trend("BTC/USD") is False
+
 
 class TestConfirmsBuySell:
     def test_confirms_buy_fail_open_when_no_data(self):
