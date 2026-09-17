@@ -183,12 +183,22 @@ class PairsStrategy:
             self._divergence_start[pair] = None
             return None
 
-        # Track how long this divergence has been active
+        # Track how long this divergence has been active.
         if self._divergence_start[pair] is None:
             self._divergence_start[pair] = now
+        # Deliberately do NOT reset _divergence_start on staleness (age >
+        # MAX_DIVERGENCE_AGE): if we did, the underlying divergence is still
+        # active (z/leader/lagger conditions above still held this tick), so
+        # the very next call would treat it as brand new and immediately
+        # re-fire at age=0 — a one-tick blip that defeats the "stale
+        # divergences don't work" guarantee this class documents. Leaving the
+        # start timestamp in place means age keeps growing for as long as the
+        # divergence persists, so it stays blocked until the divergence
+        # actually breaks (z drops below threshold, or leader/lagger move
+        # conditions fail above — both of which already reset
+        # _divergence_start to None) and a new one forms.
         age = now - self._divergence_start[pair]
         if age > MAX_DIVERGENCE_AGE:
-            self._divergence_start[pair] = None
             return None
 
         direction = 'long' if leader_ret > 0 else 'short'
