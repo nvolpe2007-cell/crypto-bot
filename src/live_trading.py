@@ -2,8 +2,10 @@
 Live Trading Engine — places real orders on Kraken.
 
 Uses the same ScientificStrategy pipeline as paper_trading (OFI + BTC lead-lag +
-regime + MTF + ML scorer).  Longs only on first deployment — shorts can be enabled
-via ENABLE_SHORTS=true in .env once the strategy has a proven live track record.
+regime + MTF + ML scorer).  Longs only — there is no short-entry or short-exit path
+in the main loop or the SL/TP watcher. ENABLE_SHORTS in .env is read at startup but
+NOT wired to any logic yet (it will log a startup warning if set); implementing
+shorts here is future work, gated on the strategy having a proven live track record.
 
 Safety guarantees:
   - Startup reconciliation: syncs bot state with actual Kraken open positions
@@ -421,6 +423,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
 
     max_daily_loss    = float(os.getenv('MAX_DAILY_LOSS', 15))
     enable_shorts     = os.getenv('ENABLE_SHORTS', 'false').lower() == 'true'
+    _warn_if_shorts_unimplemented(enable_shorts)
     session_start_pnl = trader.account.total_pnl
 
     if notifier:
@@ -798,6 +801,18 @@ def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
     trail = pos.highest_price_since_entry - ATR_TRAIL_MULT * pos.atr_at_entry
     if trail > pos.stop_loss_price:
         pos.stop_loss_price = trail
+
+
+def _warn_if_shorts_unimplemented(enable_shorts: bool) -> None:
+    """ENABLE_SHORTS is read at startup but no short-entry/short-exit path exists
+    in the main loop or the SL/TP watcher (longs-only by design — see module
+    docstring). Setting it to true today silently does nothing; warn loudly so an
+    operator doesn't mistake "no shorts fired" for "no short setups appeared"."""
+    if enable_shorts:
+        logger.warning(
+            "[LIVE] ENABLE_SHORTS=true but short trading is NOT implemented in "
+            "live_trading.py yet (longs-only) — this flag currently has no effect."
+        )
 
 
 def _kill_switch_engaged(notifier: Optional[TelegramNotifier], was_killed: bool) -> bool:
