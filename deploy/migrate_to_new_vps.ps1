@@ -17,6 +17,7 @@
 .EXAMPLE
   .\migrate_to_new_vps.ps1 -NewHost 203.0.113.10
   .\migrate_to_new_vps.ps1 -NewHost 203.0.113.10 -SkipState   # code only, fresh books
+  .\migrate_to_new_vps.ps1 -NewHost 203.0.113.10 -ClearHostKey # IP recycled: drop the stale host key
 #>
 param(
     [Parameter(Mandatory = $true)][string]$NewHost,
@@ -24,6 +25,7 @@ param(
     [string]$KeyFile = "$HOME\.ssh\crypto_bot_vps",
     [string]$EnvFile,
     [switch]$SkipState,
+    [switch]$ClearHostKey,
     [switch]$WhatIfOnly
 )
 
@@ -56,6 +58,28 @@ if ($WhatIfOnly) { Warn "WhatIfOnly set - stopping before any remote change."; r
 Step 1 "Checking SSH to $Target"
 $sshOpts = @("-i", $KeyFile, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15")
 $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
+
+# A conflicting known_hosts entry fails HARD and no StrictHostKeyChecking value
+# rescues it - accept-new only covers a host that is entirely unknown. Rebuilding
+# onto a recycled or reused IP hits this routinely, and the raw ssh error reads as
+# an attack rather than as a stale record, so handle it explicitly. (Detected via
+# ssh itself, not ssh-keyscan: the bundled Windows keyscan cannot negotiate with
+# a modern OpenSSH server here - "unsupported KEX method" - and would report a
+# reachable host as having no keys at all.)
+$probeText = ($probe | Out-String)
+if ($probeText -match "REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed") {
+    Warn "$NewHost is already in known_hosts with a DIFFERENT host key."
+    Warn "Normal for a rebuilt box or a recycled IP - but it is also what a"
+    Warn "man-in-the-middle looks like, and this script uploads .env (live API keys)."
+    ($probe | Where-Object { $_ -match "SHA256:|Offending" }) | ForEach-Object { Write-Host "      $_" }
+    if (-not $ClearHostKey) {
+        throw "Stale host key for $NewHost. Confirm that fingerprint in your provider console, then re-run with -ClearHostKey."
+    }
+    & ssh-keygen -R $NewHost 2>&1 | Out-Null
+    Ok "stale host key removed (-ClearHostKey); the new one is accepted on first connect"
+    $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
+}
+
 if ($probe -notmatch "READY") {
     Warn "Key auth not working yet. Installing public key (you'll be asked for the root password once)."
     $pub = Get-Content "$KeyFile.pub" -Raw
