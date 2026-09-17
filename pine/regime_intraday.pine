@@ -1,0 +1,136 @@
+//@version=6
+//
+// Intraday REGIME follower — long uptrends, short downtrends, flat otherwise
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: regime_arm.py (state: data/regime_arm_state.json, runs in-process
+//          every 15 min on the VPS — no cron)
+//
+// WHAT IT IS
+//   A two-sided trend follower on an INTRADAY clock, built deliberately to avoid
+//   the cost wall that killed the 1-minute engine. Three conditions must align:
+//       LONG   : EMA(fast) > EMA(slow)  AND  close > EMA(fast)  AND  EMA slope > 0
+//       SHORT  : EMA(fast) < EMA(slow)  AND  close < EMA(fast)  AND  EMA slope < 0
+//       else   : FLAT
+//   ...plus a hysteresis band that must be cleanly broken before the state flips,
+//   and an ATR COST GATE that forces FLAT whenever the bar's expected move is
+//   smaller than a multiple of the round-trip cost.
+//
+// THE COST GATE IS THE POINT OF THE ARM — DO NOT LOOSEN IT
+//   The 1-minute scalper died because its typical move was ~0.1x the ~0.5% toll.
+//   scripts/timeframe_edge.py measured the ratio by timeframe: 1h is ~1.9x cost,
+//   4h ~2.8x. So this arm lives at 1h or 4h AND refuses to trade whenever ATR%
+//   falls under COST_MULT x round-trip. When it sits flat in a quiet tape that is
+//   the gate working, not the strategy failing. Loosening it to force more trades
+//   recreates the ~1% win rate the whole project spent months escaping.
+//   (Standing rule: memory win_rate_trap, and the core principle in CLAUDE.md.)
+//
+// THE HYSTERESIS DETAIL WORTH COPYING FAITHFULLY
+//   When the arm wants to reverse but the band is not cleanly broken, it does NOT
+//   snap to the opposite side — it steps to FLAT first (exit the short into flat,
+//   rather than slamming long). That asymmetry is in the runner's
+//   target_with_hysteresis() and is reproduced below.
+//
+// SHORTS ARE PAPER PERPS. A US Kraken-spot account cannot short. Every short bar
+//   on this chart is hypothetical until Kraken US perps are integrated.
+//
+// STATUS: PROMISING, NOT PROVEN. The 30-day backtest that looked good was
+//   shorting a bear market; the 4h results were mixed. Judged by the forward
+//   scorecard on the family-wise bar, not by the Strategy Tester tab.
+//   See memory regime_intraday_arm.
+//
+strategy("Intraday regime follower (L/S)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 500,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.25,       // 0.50% round trip = 0.25% per side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── inputs (defaults mirror REGIME_* env knobs) ───────────────────────────────
+emaFast   = input.int(50,   "EMA fast  (REGIME_EMA_FAST)", minval = 2, group = "Regime")
+emaSlow   = input.int(200,  "EMA slow  (REGIME_EMA_SLOW)", minval = 2, group = "Regime")
+slopeWin  = input.int(10,   "Slope window, bars  (REGIME_SLOPE_WIN)", minval = 1, group = "Regime")
+band      = input.float(0.3, "Hysteresis band %  (REGIME_BAND)", minval = 0.0, step = 0.05,
+     group = "Regime",
+     tooltip = "Price must clear EMA-fast by this much on the NEW side before the state flips. 0.3% is the runner default.") / 100.0
+allowShort = input.bool(true, "Allow shorts  (REGIME_ALLOW_SHORT)", group = "Regime")
+
+atrN      = input.int(14,   "ATR length", minval = 1, group = "Cost gate")
+costFrac  = input.float(0.5, "Round-trip cost %  (REGIME_COST_FRAC)", minval = 0.0, step = 0.05,
+     group = "Cost gate") / 100.0
+costMult  = input.float(1.5, "Required ATR / cost multiple  (REGIME_ATR_COST_MULT)",
+     minval = 0.0, step = 0.1, group = "Cost gate",
+     tooltip = "FLAT whenever ATR% < this x round-trip cost. Lowering this to generate more trades is the exact mistake that produced the 1% win-rate era. Leave it alone.")
+
+// ── indicators ────────────────────────────────────────────────────────────────
+ef     = ta.ema(close, emaFast)
+es     = ta.ema(close, emaSlow)
+atrp   = ta.atr(atrN) / close            // ATR as a fraction of price
+efPast = ef[slopeWin]
+slope  = not na(efPast) and efPast != 0 ? (ef - efPast) / efPast : na
+
+warm   = not na(ef) and not na(es) and not na(atrp) and not na(slope) and bar_index >= slopeWin
+costOk = warm and atrp >= costMult * costFrac
+
+// ── classify(): the target state, before hysteresis ───────────────────────────
+wantRaw = not warm ? 0 : not costOk ? 0 : (ef > es and close > ef and slope > 0) ? 1 : (allowShort and ef < es and close < ef and slope < 0) ? -1 : 0
+
+// ── target_with_hysteresis(): only flip on a clean break of the band ──────────
+var int pos = 0
+if warm
+    if wantRaw == pos
+        pos := pos
+    else if wantRaw == 1
+        // Must clear the band above EMA-fast. If not, step to flat rather than
+        // snapping long from a short.
+        pos := close > ef * (1 + band) ? 1 : (pos == -1 ? 0 : pos)
+    else if wantRaw == -1
+        pos := close < ef * (1 - band) ? -1 : (pos == 1 ? 0 : pos)
+    else
+        pos := 0
+
+goLong  = warm and pos ==  1 and pos[1] !=  1
+goShort = warm and pos == -1 and pos[1] != -1
+goFlat  = warm and pos ==  0 and pos[1] !=  0
+
+if goLong
+    strategy.entry("LONG", strategy.long)
+if goShort
+    strategy.entry("SHORT", strategy.short)
+if goFlat
+    strategy.close_all(comment = costOk ? "no-trend" : "move<cost")
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(ef, "EMA fast", color = color.new(color.orange, 0), linewidth = 2)
+plot(es, "EMA slow", color = color.new(color.purple, 0), linewidth = 2)
+pu = plot(ef * (1 + band), "band +", color = color.new(color.teal, 70))
+pl = plot(ef * (1 - band), "band -", color = color.new(color.maroon, 70))
+fill(pu, pl, color = color.new(color.gray, 92), title = "Hysteresis band")
+
+barcolor(pos == 1 ? color.new(color.teal, 40) : pos == -1 ? color.new(color.red, 40) : color.new(color.gray, 65))
+// Shade the bars the cost gate is vetoing — the "why is it doing nothing" answer.
+bgcolor(warm and not costOk ? color.new(color.orange, 90) : na, title = "Cost gate: move < cost")
+
+plotshape(goLong,  "LONG",  style = shape.labelup,   location = location.belowbar,
+     color = color.new(color.teal, 0), text = "L", textcolor = color.white, size = size.tiny)
+plotshape(goShort, "SHORT", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.red, 0),  text = "S", textcolor = color.white, size = size.tiny)
+
+var table t = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "ATR % of price", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, str.tostring(atrp * 100, "#.###") + "%", text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 1, "needs (cost x mult)", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(costMult * costFrac * 100, "#.###") + "%", text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 2, "cost gate", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, costOk ? "open" : "VETO", text_size = size.small,
+         text_color = costOk ? color.teal : color.orange)
+    table.cell(t, 0, 3, "position", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "flat", text_size = size.small,
+         text_color = pos == 1 ? color.teal : pos == -1 ? color.red : color.gray)
+
+alertcondition(goLong,  "Regime: LONG",  "Regime {{ticker}}: TRENDING_UP -> LONG")
+alertcondition(goShort, "Regime: SHORT", "Regime {{ticker}}: TRENDING_DOWN -> SHORT")
+alertcondition(goFlat,  "Regime: FLAT",  "Regime {{ticker}}: no-trend or move<cost -> FLAT")
