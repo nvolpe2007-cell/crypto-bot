@@ -442,3 +442,45 @@ class TestScientificStrategyEvaluate:
         )
         result = self._eval(df)
         assert result is None or isinstance(result, ScientificSignal)
+
+
+# ── ScientificStrategy(ofi_min=...) ───────────────────────────────────────────
+# Regression test: ofi_min was stored on self but _evaluate() classified OFI
+# BULLISH/BEARISH against a hardcoded 0.15 literal instead of self.ofi_min, so
+# the constructor argument was silently a no-op for any non-default value.
+
+class TestOfiMinThreshold:
+    SYMBOL = "BTC/USD"
+
+    def _eval(self, strat, df, ofi):
+        return strat.evaluate(
+            df, self.SYMBOL,
+            ofi_calc=_FakeOFI(ofi), lead_lag=None,
+            regime="RANGING", regime_conf=0.8, funding_rate=None,
+        )
+
+    def test_default_ofi_min_classifies_moderate_ofi_as_bullish(self):
+        # Flat df: no EMA cross, RSI pinned at 50 → OFI is the only trigger.
+        df = _make_df(n=100, trend=0.0)
+        result = self._eval(ScientificStrategy(), df, ofi=0.20)
+        assert result is not None
+        assert result.signal == Signal.BUY
+        assert result.ofi_score > 0.0
+
+    def test_stricter_ofi_min_suppresses_the_same_ofi_value(self):
+        df = _make_df(n=100, trend=0.0)
+        result = self._eval(ScientificStrategy(ofi_min=0.90), df, ofi=0.20)
+        assert result is not None
+        # 0.20 no longer clears the stricter 0.90 threshold, and with no other
+        # signal present (flat df, no lead-lag, RANGING regime) the strategy
+        # must fall through to HOLD rather than silently trading anyway.
+        assert result.signal == Signal.HOLD
+
+    def test_looser_ofi_min_classifies_a_weaker_ofi_as_bearish(self):
+        df = _make_df(n=100, trend=0.0)
+        # -0.05 is below the default 0.15 threshold (no signal) but clears a
+        # deliberately loosened 0.03 threshold.
+        default_result = self._eval(ScientificStrategy(), df, ofi=-0.05)
+        loose_result = self._eval(ScientificStrategy(ofi_min=0.03), df, ofi=-0.05)
+        assert default_result is not None and default_result.signal == Signal.HOLD
+        assert loose_result is not None and loose_result.signal == Signal.SELL
