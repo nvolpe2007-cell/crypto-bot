@@ -203,6 +203,47 @@ _project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+# ── Attribution ledger: never let a test write to the REAL P&L database ───────
+# src/attribution.record() writes through a PROCESS-WIDE SINGLETON whose db_path
+# defaults to data/attribution.db -- the live ledger behind the dashboard and the
+# daily Telegram P&L scorecard. regime_arm.py and arbitrage/funding_arb_paper.py
+# call record() directly, so merely exercising those code paths in a test appended
+# rows to production. Measured 2026-09-06: one `pytest tests/` run added 6 rows,
+# and 94 accumulated rows carried reason='test' with a hardcoded net_pnl of 10.0,
+# which made the regime_intraday arm read as a 100%-win-rate, +$942 strategy.
+#
+# The singleton is "first call wins the db_path", so claiming it HERE -- before any
+# test imports a module that records -- redirects every write to a throwaway file.
+# This changes no production behaviour; it only binds the singleton inside pytest.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+
+_attrib_tmpdir = _tempfile.mkdtemp(prefix="pytest-attribution-")
+_atexit.register(_shutil.rmtree, _attrib_tmpdir, True)
+
+import src.attribution as _attribution  # noqa: E402
+
+_attribution.get_ledger(_os.path.join(_attrib_tmpdir, "attribution.db"))
+assert _attribution.get_ledger().db_path.startswith(_attrib_tmpdir), (
+    "attribution ledger singleton was claimed before conftest could redirect it; "
+    "a test would write to the production data/attribution.db"
+)
+
+# ── Trade journal: same bug class as the attribution ledger above ────────────
+# src/trade_journal.py exposes TWO module-level paths, JOURNAL_FILE (.json) and
+# CSV_FILE (.csv). tests/test_trade_journal.py monkeypatches only JOURNAL_FILE,
+# so append_csv() kept writing to the PRODUCTION data/trade_journal.csv --
+# measured 2026-09-07 at +15,838 bytes per suite run. That file is what
+# src/session_filter.py rated trading sessions from, and it had accumulated 3665
+# rows of which 3290 were synthetic, EVERY one stamped hour_utc=12.
+#
+# Redirect both here so no test can reach the real files, whatever it patches.
+import src.trade_journal as _trade_journal  # noqa: E402
+
+_trade_journal.JOURNAL_FILE = _os.path.join(_attrib_tmpdir, "trade_journal.json")
+_trade_journal.CSV_FILE = _os.path.join(_attrib_tmpdir, "trade_journal.csv")
+
 # Pre-import modules that test_live_trading.py would otherwise replace with
 # MagicMock stubs (via _ensure_stub).  Importing here — after all stubs above
 # are installed — caches the real implementations in sys.modules so that
@@ -214,3 +255,54 @@ import src.multi_timeframe as _  # noqa: F401, E402
 import src.portfolio_optimizer as _  # noqa: F401, E402
 import src.market_sentiment as _  # noqa: F401, E402
 import src.ml_scorer as _  # noqa: F401, E402
+
+# ── General guard: the suite must not touch ANYTHING under data/ ─────────────
+# Two separate production files were found being written by tests on 2026-09-07
+# (data/attribution.db and data/trade_journal.csv), each through a different
+# mechanism. Rather than keep patching one path at a time, snapshot the whole
+# directory and fail the run if any file changes. A test that legitimately needs
+# to write must use tmp_path.
+import hashlib as _hashlib
+
+_DATA_DIR = _os.path.join(_project_root, "data")
+_data_snapshot: dict = {}
+
+
+def _snapshot_data() -> dict:
+    snap = {}
+    for root, _dirs, files in _os.walk(_DATA_DIR):
+        for name in files:
+            fp = _os.path.join(root, name)
+            try:
+                with open(fp, "rb") as fh:
+                    snap[fp] = _hashlib.md5(fh.read()).hexdigest()
+            except OSError:
+                pass
+    return snap
+
+
+def pytest_sessionstart(session):
+    global _data_snapshot
+    if _os.path.isdir(_DATA_DIR):
+        _data_snapshot = _snapshot_data()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _data_snapshot:
+        return
+    after = _snapshot_data()
+    changed = sorted(
+        [p for p in after if p in _data_snapshot and after[p] != _data_snapshot[p]]
+        + [p for p in after if p not in _data_snapshot]
+        + [p for p in _data_snapshot if p not in after]
+    )
+    if changed:
+        rel = [_os.path.relpath(p, _project_root) for p in changed]
+        print()
+        print("=" * 70)
+        print("TEST SUITE MODIFIED PRODUCTION DATA FILES -- this is a bug:")
+        for r in rel:
+            print("   " + r)
+        print("Tests must write to tmp_path. See tests/test_attribution_isolation.py")
+        print("=" * 70)
+        session.exitstatus = 1
