@@ -5,11 +5,20 @@ Covers:
 - prepare_ohlcv_dataframe: type conversions, index, empty input
 - EMACrossRSI: column presence, signal types, insufficient-data guard,
   crossover detection, RSI filter (overbought blocks buys)
-- supertrend, atr, ema_htf: the indicator helpers actually consumed by the
-  live/paper strategies (paper_trading.py, scientific_strategy.py,
-  microstructure_strategy.py, mean_reversion_strategy.py, live_trading.py) —
-  previously zero coverage even though EMACrossRSI (used only by the legacy
-  backtester) was thoroughly tested.
+- supertrend, atr, ema_htf: the indicator helpers.
+
+  NOTE (corrected 2026-09-03): an earlier version of this docstring claimed
+  these three are "actually consumed by the live/paper strategies".  They are
+  not.  paper_trading.py, scientific_strategy.py, microstructure_strategy.py,
+  mean_reversion_strategy.py and live_trading.py import only `Signal` and
+  `prepare_ohlcv_dataframe` from this module; nothing outside these tests
+  imports supertrend/atr/ema_htf.  They are unwired helpers, so the bugs fixed
+  on 2026-09-03 had no live blast radius — but the false claim is exactly the
+  kind of stale doc CLAUDE.md warns about, so it is corrected rather than kept.
+
+  Beware when reading the supertrend tests: conftest.py replaces pandas_ta with
+  a stub that has NO `supertrend`, so tests that do not patch it exercise the
+  MANUAL FALLBACK, not the pandas_ta branch production would take.
 """
 
 import pytest
@@ -333,3 +342,189 @@ class TestSupertrend:
         df = _trending_df(60)
         out = supertrend(df)  # no explicit period/multiplier
         assert out["supertrend"].notna().all()
+
+
+# ── supertrend: the ATR warm-up path ──────────────────────────────────────────
+#
+# conftest.py stubs pandas_ta, and the stub has no `supertrend`, so every test
+# above silently exercises the MANUAL FALLBACK — never the pandas_ta branch that
+# production actually takes.  The stub's `_atr` also uses ewm() with no
+# min_periods, so it yields a value from row 0 and has no NaN warm-up.
+#
+# Real pandas_ta.atr DOES emit a NaN warm-up prefix, and that combination is
+# what the tests above cannot see: seeding the band recursion at row 0 lets the
+# warm-up NaN fail every comparison, so both branches carry it forward and the
+# whole series stays NaN — an all-NaN supertrend line that reads as permanently
+# bullish even on a pure downtrend.  These tests pin that behaviour by injecting
+# an ATR with a realistic warm-up.
+
+def _atr_with_warmup(high, low, close, length: int = 14, **_) -> pd.Series:
+    """ATR that emits a NaN warm-up prefix, the way real pandas_ta.atr does."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    out = tr.ewm(span=length, adjust=False).mean()
+    out.iloc[: length - 1] = np.nan
+    return out
+
+
+class TestSupertrendAtrWarmup:
+    @pytest.fixture
+    def warmup_atr(self, monkeypatch):
+        import src.indicators as ind
+        monkeypatch.setattr(ind.ta, "atr", _atr_with_warmup)
+
+    def test_line_is_finite_after_warmup(self, warmup_atr):
+        df = _trending_df(60, start=100, end=200)
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert out["supertrend"].iloc[:9].isna().all(), "warm-up should be NaN"
+        assert out["supertrend"].iloc[9:].notna().all(), (
+            "the band recursion carried the ATR warm-up NaN forward forever"
+        )
+
+    def test_downtrend_is_bearish_despite_warmup(self, warmup_atr):
+        # The production failure in one line: with a NaN warm-up the old code
+        # reported bull=True for every bar of a monotonic 200 -> 100 decline.
+        df = _trending_df(60, start=200, end=100)
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert not out["supertrend_bull"].iloc[20:].any()
+
+    def test_uptrend_is_bullish_despite_warmup(self, warmup_atr):
+        df = _trending_df(60, start=100, end=200)
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert out["supertrend_bull"].iloc[20:].all()
+
+    def test_bullish_line_stays_below_close(self, warmup_atr):
+        df = _trending_df(60, start=100, end=200)
+        out = supertrend(df, period=10, multiplier=2.5).iloc[20:]
+        assert (out["supertrend"] <= out["close"]).all()
+
+    def test_too_few_bars_for_any_atr_is_all_nan_not_a_crash(self, warmup_atr):
+        df = _trending_df(5)  # fewer bars than period → ATR never becomes valid
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert len(out) == 5
+        assert out["supertrend"].isna().all()
+        assert not out["supertrend_bull"].any()
+        assert not out["supertrend_flip"].any()
+
+    def test_warmup_coming_online_is_not_a_flip(self, warmup_atr):
+        # A flip means bear -> bull.  The bar where the indicator first produces
+        # a direction is not a reversal, so it must not be marked as one.
+        df = _trending_df(60, start=100, end=200)  # pure uptrend, never reverses
+        out = supertrend(df, period=10, multiplier=2.5)
+        assert not out["supertrend_flip"].any()
+
+    def test_real_reversal_still_flips(self, warmup_atr):
+        closes = np.concatenate([np.linspace(200, 100, 30), np.linspace(100, 250, 30)])
+        df = pd.DataFrame({
+            "open": closes + 0.5, "high": closes + 1.0,
+            "low": closes - 1.0, "close": closes,
+            "volume": np.full(len(closes), 100.0),
+        })
+        out = supertrend(df, period=10, multiplier=2.5)
+        flips = np.flatnonzero(out["supertrend_flip"].to_numpy())
+        assert flips.size >= 1
+        for i in flips:
+            assert bool(out["supertrend_bull"].iloc[i]) is True
+            assert bool(out["supertrend_bull"].iloc[i - 1]) is False
+
+
+# ── supertrend: the pandas_ta branch production actually takes ────────────────
+
+class TestSupertrendPandasTaBranch:
+    """Exercise the branch conftest's stub hides, with a faked pandas_ta."""
+
+    @staticmethod
+    def _fake_st_frame(n: int, direction_at: dict = None) -> pd.DataFrame:
+        direction_at = direction_at or {}
+        d = np.array([direction_at.get(i, 1) for i in range(n)], dtype=float)
+        return pd.DataFrame({
+            "SUPERT_10_2.5":  np.arange(n, dtype=float),
+            "SUPERTd_10_2.5": d,
+            "SUPERTl_10_2.5": np.full(n, np.nan),
+            "SUPERTs_10_2.5": np.full(n, np.nan),
+        })
+
+    def test_value_column_is_selected_not_rejected(self, monkeypatch):
+        import src.indicators as ind
+        n = 20
+        frame = self._fake_st_frame(n)
+        monkeypatch.setattr(ind.ta, "supertrend", lambda *a, **k: frame, raising=False)
+        out = supertrend(_trending_df(n), period=10, multiplier=2.5)
+        # If the SUPERT_ column were filtered out, this would silently fall back
+        # to the manual implementation and these values would not match.
+        assert out["supertrend"].tolist() == list(range(n))
+        assert out["supertrend_bull"].all()
+
+    def test_direction_column_drives_bull_flag(self, monkeypatch):
+        import src.indicators as ind
+        n = 20
+        frame = self._fake_st_frame(n, direction_at={i: -1 for i in range(0, 10)})
+        monkeypatch.setattr(ind.ta, "supertrend", lambda *a, **k: frame, raising=False)
+        out = supertrend(_trending_df(n), period=10, multiplier=2.5)
+        assert not out["supertrend_bull"].iloc[:10].any()
+        assert out["supertrend_bull"].iloc[10:].all()
+        # exactly one bear -> bull transition, at index 10
+        assert np.flatnonzero(out["supertrend_flip"].to_numpy()).tolist() == [10]
+
+    def test_nan_direction_warmup_is_not_a_flip(self, monkeypatch):
+        import src.indicators as ind
+        n = 20
+        frame = self._fake_st_frame(n, direction_at={i: np.nan for i in range(0, 5)})
+        monkeypatch.setattr(ind.ta, "supertrend", lambda *a, **k: frame, raising=False)
+        out = supertrend(_trending_df(n), period=10, multiplier=2.5)
+        assert not out["supertrend_bull"].iloc[:5].any()
+        # NaN -> bull is the indicator coming online, not a reversal
+        assert not out["supertrend_flip"].any()
+
+    def test_unexpected_columns_fall_back_without_raising(self, monkeypatch):
+        import src.indicators as ind
+        bad = pd.DataFrame({"TOTALLY_WRONG": np.arange(30, dtype=float)})
+        monkeypatch.setattr(ind.ta, "supertrend", lambda *a, **k: bad, raising=False)
+        out = supertrend(_trending_df(30), period=10, multiplier=2.5)
+        for col in ("supertrend", "supertrend_bull", "supertrend_flip"):
+            assert col in out.columns
+        assert out["supertrend"].notna().any(), "fallback should still produce a line"
+
+    def test_fallback_tracks_the_pandas_ta_result(self, monkeypatch):
+        """The two branches must agree — the fallback is a substitute, not a
+        different indicator."""
+        import src.indicators as ind
+        df = _trending_df(80, start=100, end=260)
+
+        monkeypatch.setattr(ind.ta, "atr", _atr_with_warmup)
+        fallback = supertrend(df, period=10, multiplier=2.5)
+
+        # A textbook supertrend built independently of the code under test.
+        ref = _reference_supertrend(df, period=10, multiplier=2.5)
+        pd.testing.assert_series_equal(
+            fallback["supertrend"].iloc[15:], ref.iloc[15:],
+            check_names=False, rtol=1e-9,
+        )
+
+
+def _reference_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.Series:
+    """Independent textbook supertrend, used as an oracle for the fallback."""
+    hl2 = (df["high"] + df["low"]) / 2.0
+    a = _atr_with_warmup(df["high"], df["low"], df["close"], length=period)
+    ub = (hl2 + multiplier * a).to_numpy(dtype=float)
+    lb = (hl2 - multiplier * a).to_numpy(dtype=float)
+    cl = df["close"].to_numpy(dtype=float)
+    n = len(df)
+
+    fu, fl = np.full(n, np.nan), np.full(n, np.nan)
+    d = np.full(n, np.nan)
+    seed = int(np.flatnonzero(~np.isnan(ub))[0])
+    fu[seed], fl[seed], d[seed] = ub[seed], lb[seed], 1.0
+    for i in range(seed + 1, n):
+        fu[i] = ub[i] if (ub[i] < fu[i - 1] or cl[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lb[i] if (lb[i] > fl[i - 1] or cl[i - 1] < fl[i - 1]) else fl[i - 1]
+        if d[i - 1] == -1.0 and cl[i] > fu[i]:
+            d[i] = 1.0
+        elif d[i - 1] == 1.0 and cl[i] < fl[i]:
+            d[i] = -1.0
+        else:
+            d[i] = d[i - 1]
+    line = np.where(d == 1.0, fl, np.where(d == -1.0, fu, np.nan))
+    return pd.Series(line, index=df.index)
