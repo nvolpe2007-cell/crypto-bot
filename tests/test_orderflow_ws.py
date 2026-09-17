@@ -19,6 +19,7 @@ from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
+import pytest
 
 from src.orderflow_ws import OrderFlowWS, WhalePrint
 
@@ -106,6 +107,23 @@ class TestCvdTrendAndStaleness:
                 {"symbol": "BTC/USD", "qty": "5.0", "price": "100.0", "side": "buy"},
             ]})
         assert ofw.get_cvd_trend("BTC/USD") is True
+
+
+class TestDataAgeSecs:
+    def test_returns_stale_secs_when_no_data_has_ever_arrived(self):
+        from src.orderflow_ws import _STALE_SECS
+        ofw = _make_ofw()
+        age = ofw.data_age_secs("BTC/USD")
+        # Was returning ~time.time() (billions of seconds) before the fix,
+        # since .get(symbol, 0) defaulted the missing timestamp to epoch 0.
+        assert age == pytest.approx(_STALE_SECS, abs=1.0)
+
+    def test_returns_true_elapsed_age_once_data_has_arrived(self):
+        ofw = _make_ofw()
+        ofw._cvd_updated["BTC/USD"] = time.time() - 5
+        ofw._book_updated["BTC/USD"] = time.time() - 2
+        age = ofw.data_age_secs("BTC/USD")
+        assert age == pytest.approx(5.0, abs=1.0)
 
 
 class TestConfirmsBuySell:
