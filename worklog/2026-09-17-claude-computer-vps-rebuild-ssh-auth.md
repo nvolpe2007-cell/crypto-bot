@@ -57,23 +57,48 @@ timeouts, not refusals. Reinstalling with the plain `24.04` template fixed it in
   it fails with "Connection closed" on *every* fresh box, which is the worst kind of bug:
   it misattributes its own failure to the operator's password.
 
-## Verification
+## Two more bugs the real run exposed
 
-- `[Parser]::ParseFile` clean; `-WhatIfOnly` preflight passes against the real host.
-- Key auth to `root@162.35.186.42` works; `ssh crypto-bot-vps` alias repointed.
-- Remote confirmed: no `ubuntu-desktop`/`gnome-shell` packages, Python 3.12.3, git 2.43.0.
-- **The migration itself has NOT been run** — the harness refused it as a production
-  deploy. Nothing is on the box yet; `/opt/crypto-bot` does not exist.
+The first migration attempt printed "Migration complete" while installing **zero** crons.
+Both faults are in `migrate_to_new_vps.ps1` and neither can be caught without a live host:
+
+**Step 5 sent CRLF to bash.** The here-string *is* normalised with a CR/LF replace — and
+that is not enough, because piping a multi-line string to a NATIVE command makes
+PowerShell re-split it and write each line with the system newline, restoring the CRLFs.
+bash read `setup_vps.sh\r`, and the bare CR returned the cursor mid-line, so the error
+surfaced as the garbled `: No such file or directoryy/setup_vps.sh`. Now base64-encoded
+into one argv-safe token; verified by round-tripping a two-line script through the host.
+
+**Step 6 escaped a subexpression with a backslash.** PowerShell has no backslash escape,
+so `$(...)` interpolated LOCALLY and `systemctl` ran on the Windows box —
+`CommandNotFoundException`. Rewritten single-quoted with double quotes inside.
+
+The dangerous part was the combination: no exit-code check followed the bootstrap, so a
+remote step that never ran still produced a Step 6 header and a "Migration complete"
+banner. Silent failure *and* a success summary. An exit-code check now guards it.
+
+## Verification — the bot is LIVE
+
+- `systemctl is-active crypto-bot` → **active**, enabled; `weekly_report.timer` active.
+- **13 crons installed** (swing 4h-majors, tsmom, trend_ensemble, lev_perp ×4,
+  meme_cohort ×2, meme_radar ×2, callout_scorecard, trade_close_notifier).
+- Kraken websockets up: `[PublicWS] connected`, `[TradeFeed] connected`,
+  `[BookFeed] connected`.
+- First live heartbeat since mid-June: `equity=$500.00 pnl=$+0.00 trades=0 open=none`,
+  `[FUNNEL] seen=90 ... directional_shelved=90` (correct — the scalper is shelved),
+  `[SUBSYSTEMS] all OK (15 tasks)`.
+- `-SkipState` did what it was for: clean $500 book, no three-month hole in the sample.
+
+Note: the box had already been bootstrapped once at ~23:37–23:50 by another agent, so
+the first run's Step 5 failure was real but harmless (`[ ! -d .git ]` was already false).
+The crons were the part that never got installed, and the second run fixed that.
 
 ## Open
 
-1. **Run the migration** (owner):
-   `.\deploy\migrate_to_new_vps.ps1 -NewHost 162.35.186.42 -SkipState`
-   `-SkipState` is deliberate: every arm's state froze mid-June with `closed: []`, and
-   resuming it puts a three-month hole *inside* each sample, which corrupts any t-stat
-   computed across it. Pre-June history remains in git and the vault.
-2. **GEX cron still missing.** PR #112 remains unmerged and CONFLICTING, so
-   `setup_vps.sh` still installs seven crons, not eight. The pipeline stays dark on the
-   rebuilt box until that lands (memory `gex_dealer_exposure_walls`).
-3. The box boots to `graphical.target` — a template leftover, harmless with no DE
+1. **GEX cron still missing.** PR #112 remains unmerged and CONFLICTING, so
+   `setup_vps.sh` installs the set above and not the GEX line. That pipeline stays dark
+   on the rebuilt box until #112 lands (memory `gex_dealer_exposure_walls`).
+2. The box boots to `graphical.target` — a template leftover, harmless with no DE
    installed, but `systemctl set-default multi-user.target` would be tidier.
+3. `deploy/setup_outreach_vps.sh` and the Remy units in `D:\agent-swarm\deploy\` now have
+   a host to install onto; neither has been deployed.
