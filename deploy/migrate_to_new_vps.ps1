@@ -56,7 +56,16 @@ if ($WhatIfOnly) { Warn "WhatIfOnly set - stopping before any remote change."; r
 
 # ── 1. SSH reachability + key install ────────────────────────────────────────
 Step 1 "Checking SSH to $Target"
-$sshOpts = @("-i", $KeyFile, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15")
+# IdentitiesOnly=yes: without it ssh offers every default key in ~/.ssh (id_rsa,
+# id_ecdsa, id_ed25519, ...) BEFORE the one named by -i, and each offer burns one
+# of the server's MaxAuthTries (6 by default on Ubuntu). On a box where our key
+# is not installed yet that budget is exhausted before the password prompt is
+# even answered, and sshd drops the connection - which surfaces as
+# "Connection closed by <host> port 22" and reads exactly like a rejected
+# password. Measured on the 2026-09-17 rebuild: 7 keys offered, connection
+# closed, password never actually evaluated.
+$sshOpts = @("-i", $KeyFile, "-o", "IdentitiesOnly=yes",
+             "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15")
 $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
 
 # A conflicting known_hosts entry fails HARD and no StrictHostKeyChecking value
@@ -84,7 +93,14 @@ if ($probe -notmatch "READY") {
     Warn "Key auth not working yet. Installing public key (you'll be asked for the root password once)."
     $pub = Get-Content "$KeyFile.pub" -Raw
     $installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qF '$($pub.Trim())' ~/.ssh/authorized_keys 2>/dev/null || echo '$($pub.Trim())' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo KEY_INSTALLED"
-    & ssh -o StrictHostKeyChecking=accept-new $Target $installCmd
+    # PubkeyAuthentication=no for the SAME MaxAuthTries reason as $sshOpts, and
+    # it matters more here: this is the one call that is *expected* to fall
+    # through to a password, so it must not spend the server's auth budget on
+    # keys we already know are not installed. Without these two options this
+    # line fails with "Connection closed" on a fresh box every time.
+    & ssh -o StrictHostKeyChecking=accept-new `
+          -o PubkeyAuthentication=no -o PreferredAuthentications=password `
+          $Target $installCmd
     $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
     if ($probe -notmatch "READY") { throw "Key auth still failing after install. Check the VPS console." }
 }
@@ -155,11 +171,35 @@ if [ ! -d .git ]; then
 fi
 bash /opt/crypto-bot/deploy/setup_vps.sh
 '@ -replace "`r`n", "`n"
-$bootstrap | & ssh @sshOpts $Target "bash -s"
+
+# Base64 rather than `$bootstrap | ssh ... "bash -s"`.
+#
+# The -replace above is correct and still not enough: piping a multi-line string
+# to a NATIVE command makes PowerShell re-split it and write each line with the
+# system newline, which on Windows puts the CRLFs straight back. bash then reads
+# `setup_vps.sh\r` and reports "No such file or directory" - and the bare CR
+# returns the cursor mid-line, so the error prints as the garbled
+# ": No such file or directoryy/setup_vps.sh". Measured on the 2026-09-17 run.
+#
+# Encoding sidesteps the pipeline's text handling entirely: one argv-safe token
+# goes over, and the bytes bash receives are the bytes built here.
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrap))
+& ssh @sshOpts $Target "echo $b64 | base64 -d | bash"
+if ($LASTEXITCODE -ne 0) { throw "Remote bootstrap failed (exit $LASTEXITCODE). Nothing below this point has run." }
 
 # ── 6. Verify ────────────────────────────────────────────────────────────────
 Step 6 "Verifying"
-& ssh @sshOpts $Target "echo 'unit:  '\$(systemctl is-active crypto-bot); echo 'timer: '\$(systemctl is-active weekly_report.timer); echo '--- crons ---'; crontab -l 2>/dev/null | grep -v '^#'; echo '--- last 15 log lines ---'; journalctl -u crypto-bot --no-pager -n 15"
+# SINGLE-quoted in PowerShell, double-quoted inside for the remote shell.
+# The previous form used \$(...) on the assumption that backslash escapes the
+# expansion. PowerShell has no backslash escape - the \ is literal and $(...)
+# interpolated LOCALLY, so `systemctl` ran on the Windows box and the whole
+# verify step died with CommandNotFoundException.
+$verify = 'echo "unit:  $(systemctl is-active crypto-bot)"; ' +
+          'echo "timer: $(systemctl is-active weekly_report.timer)"; ' +
+          'echo "--- crons ---"; crontab -l 2>/dev/null | grep -v "^#"; ' +
+          'echo "--- last 15 log lines ---"; ' +
+          'journalctl -u crypto-bot --no-pager -n 15'
+& ssh @sshOpts $Target $verify
 
 Write-Host "`n=== Migration complete ===" -ForegroundColor White
 Write-Host "Watch live:  ssh crypto-bot-vps `"journalctl -u crypto-bot -f`""
