@@ -171,11 +171,35 @@ if [ ! -d .git ]; then
 fi
 bash /opt/crypto-bot/deploy/setup_vps.sh
 '@ -replace "`r`n", "`n"
-$bootstrap | & ssh @sshOpts $Target "bash -s"
+
+# Base64 rather than `$bootstrap | ssh ... "bash -s"`.
+#
+# The -replace above is correct and still not enough: piping a multi-line string
+# to a NATIVE command makes PowerShell re-split it and write each line with the
+# system newline, which on Windows puts the CRLFs straight back. bash then reads
+# `setup_vps.sh\r` and reports "No such file or directory" - and the bare CR
+# returns the cursor mid-line, so the error prints as the garbled
+# ": No such file or directoryy/setup_vps.sh". Measured on the 2026-09-17 run.
+#
+# Encoding sidesteps the pipeline's text handling entirely: one argv-safe token
+# goes over, and the bytes bash receives are the bytes built here.
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrap))
+& ssh @sshOpts $Target "echo $b64 | base64 -d | bash"
+if ($LASTEXITCODE -ne 0) { throw "Remote bootstrap failed (exit $LASTEXITCODE). Nothing below this point has run." }
 
 # ── 6. Verify ────────────────────────────────────────────────────────────────
 Step 6 "Verifying"
-& ssh @sshOpts $Target "echo 'unit:  '\$(systemctl is-active crypto-bot); echo 'timer: '\$(systemctl is-active weekly_report.timer); echo '--- crons ---'; crontab -l 2>/dev/null | grep -v '^#'; echo '--- last 15 log lines ---'; journalctl -u crypto-bot --no-pager -n 15"
+# SINGLE-quoted in PowerShell, double-quoted inside for the remote shell.
+# The previous form used \$(...) on the assumption that backslash escapes the
+# expansion. PowerShell has no backslash escape - the \ is literal and $(...)
+# interpolated LOCALLY, so `systemctl` ran on the Windows box and the whole
+# verify step died with CommandNotFoundException.
+$verify = 'echo "unit:  $(systemctl is-active crypto-bot)"; ' +
+          'echo "timer: $(systemctl is-active weekly_report.timer)"; ' +
+          'echo "--- crons ---"; crontab -l 2>/dev/null | grep -v "^#"; ' +
+          'echo "--- last 15 log lines ---"; ' +
+          'journalctl -u crypto-bot --no-pager -n 15'
+& ssh @sshOpts $Target $verify
 
 Write-Host "`n=== Migration complete ===" -ForegroundColor White
 Write-Host "Watch live:  ssh crypto-bot-vps `"journalctl -u crypto-bot -f`""
