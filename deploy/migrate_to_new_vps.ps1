@@ -56,7 +56,16 @@ if ($WhatIfOnly) { Warn "WhatIfOnly set - stopping before any remote change."; r
 
 # ── 1. SSH reachability + key install ────────────────────────────────────────
 Step 1 "Checking SSH to $Target"
-$sshOpts = @("-i", $KeyFile, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15")
+# IdentitiesOnly=yes: without it ssh offers every default key in ~/.ssh (id_rsa,
+# id_ecdsa, id_ed25519, ...) BEFORE the one named by -i, and each offer burns one
+# of the server's MaxAuthTries (6 by default on Ubuntu). On a box where our key
+# is not installed yet that budget is exhausted before the password prompt is
+# even answered, and sshd drops the connection - which surfaces as
+# "Connection closed by <host> port 22" and reads exactly like a rejected
+# password. Measured on the 2026-09-17 rebuild: 7 keys offered, connection
+# closed, password never actually evaluated.
+$sshOpts = @("-i", $KeyFile, "-o", "IdentitiesOnly=yes",
+             "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15")
 $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
 
 # A conflicting known_hosts entry fails HARD and no StrictHostKeyChecking value
@@ -84,7 +93,14 @@ if ($probe -notmatch "READY") {
     Warn "Key auth not working yet. Installing public key (you'll be asked for the root password once)."
     $pub = Get-Content "$KeyFile.pub" -Raw
     $installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qF '$($pub.Trim())' ~/.ssh/authorized_keys 2>/dev/null || echo '$($pub.Trim())' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; echo KEY_INSTALLED"
-    & ssh -o StrictHostKeyChecking=accept-new $Target $installCmd
+    # PubkeyAuthentication=no for the SAME MaxAuthTries reason as $sshOpts, and
+    # it matters more here: this is the one call that is *expected* to fall
+    # through to a password, so it must not spend the server's auth budget on
+    # keys we already know are not installed. Without these two options this
+    # line fails with "Connection closed" on a fresh box every time.
+    & ssh -o StrictHostKeyChecking=accept-new `
+          -o PubkeyAuthentication=no -o PreferredAuthentications=password `
+          $Target $installCmd
     $probe = & ssh @sshOpts -o BatchMode=yes $Target "echo READY" 2>&1
     if ($probe -notmatch "READY") { throw "Key auth still failing after install. Check the VPS console." }
 }
