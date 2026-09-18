@@ -40,7 +40,17 @@ WINRATE_FLOOR = float(os.getenv("SESSION_WINRATE_FLOOR", "0.40"))  # Wilson-LB f
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_JOURNAL = _ROOT / "data" / "trade_journal.csv"
+_DEFAULT_JOURNAL_JSON = _ROOT / "data" / "trade_journal.json"
 _DEFAULT_SWING = _ROOT / "data" / "swing_paper_state.json"
+
+# Trade ids that are seed/backtest rows, not realised trades. proof_scorecard's
+# _directional() already drops exactly these; the session gate did not, which is
+# how it came to rate a session off synthetic data (see _load_journal).
+_SYNTHETIC_ID_PREFIXES = ("id_", "BTC_17000")
+
+
+def _is_synthetic(trade_id) -> bool:
+    return str(trade_id or "").startswith(_SYNTHETIC_ID_PREFIXES)
 
 
 def session_of_hour(hour: Optional[int]) -> Optional[str]:
@@ -94,7 +104,7 @@ class SessionEdge:
         self.min_samples = min_samples
         self.winrate_floor = winrate_floor
         if records is None:
-            records = self._load_journal(_DEFAULT_JOURNAL) + self._load_swing(_DEFAULT_SWING)
+            records = self._load_default_journal() + self._load_swing(_DEFAULT_SWING)
         self._records: List[dict] = [r for r in records if r.get("hour") is not None]
         self._stats_cache: Optional[Dict[str, dict]] = None
 
@@ -143,6 +153,48 @@ class SessionEdge:
         return SessionEdge._records_from_closed(d.get("closed", []))
 
     @staticmethod
+    def _load_journal_json(path: Path) -> List[dict]:
+        """Load the realised journal from trade_journal.JSON.
+
+        This is the authoritative directional record. The sibling .csv is
+        seed/backtest-polluted -- as of 2026-09-07 it held 3665 rows of which
+        3290 were synthetic and EVERY row carried hour_utc=12, so a session gate
+        reading it could only ever populate one session and rated EU FAVORABLE
+        (59.9% win) when the real record says UNFAVORABLE (1.8%)."""
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return []
+        recs = data if isinstance(data, list) else (
+            data.get("trades") or data.get("records") or [])
+        out: List[dict] = []
+        for r in recs:
+            if not isinstance(r, dict) or _is_synthetic(r.get("trade_id")):
+                continue
+            hour = r.get("hour_utc")
+            if hour is None:
+                continue
+            try:
+                h = int(float(hour))
+                pnl = float(r.get("pnl") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            won = r.get("won")
+            won = (won is True) if won is not None else pnl > 0
+            out.append({"hour": h, "won": bool(won), "pnl": pnl})
+        return out
+
+    @classmethod
+    def _load_default_journal(cls) -> List[dict]:
+        """Prefer the JSON journal; fall back to the CSV only if it is absent.
+        Never merge the two -- they overlap, and double-counting trades would
+        inflate every n on this gate."""
+        recs = cls._load_journal_json(_DEFAULT_JOURNAL_JSON)
+        return recs if recs else cls._load_journal(_DEFAULT_JOURNAL)
+
+    @staticmethod
     def _load_journal(path: Path) -> List[dict]:
         if not path.exists():
             return []
@@ -150,6 +202,8 @@ class SessionEdge:
         try:
             with path.open(newline="") as fh:
                 for row in csv.DictReader(fh):
+                    if _is_synthetic(row.get("trade_id")):
+                        continue
                     hour = row.get("hour_utc")
                     if hour in (None, ""):
                         continue
