@@ -12,7 +12,8 @@ A confidence score (0–100) is computed for each potential trade.
 Position size scales with confidence above the 93% tier.
 
 Entry requirements:
-  - Minimum confidence: 60
+  - Minimum confidence: enforced externally, not by this class — see
+    ScientificStrategy.min_confidence below
   - OFI must not be strongly opposing (fail-open when unavailable)
   - Regime must not be blocking (CRASH blocks longs, no other hard blocks)
 """
@@ -138,6 +139,13 @@ class ScientificStrategy:
                  min_confidence:   float = 45.0):   # lower default — learner raises it adaptively
         self.ofi_min        = ofi_min
         self.lead_lag_min   = lead_lag_min
+        # Stored but NOT read by evaluate()/_evaluate() — this class always
+        # returns its computed confidence unconditionally. Actual gating
+        # happens per-caller via entry_checklist._min_confidence against
+        # CheckContext.min_confidence: paper_trading.py's adaptive
+        # _adapt['min_confidence'] (35-45) or live_trading.py's constant
+        # LIVE_MIN_CONFIDENCE (70). Neither caller passes this constructor
+        # arg, so it never takes effect.
         self.min_confidence = min_confidence
         self.ml_scorer      = None   # set by paper_trading after MLScorer is ready
 
