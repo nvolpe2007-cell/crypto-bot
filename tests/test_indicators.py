@@ -185,6 +185,25 @@ class TestEMACrossRSIGetLatestSignal:
         result = EMACrossRSI(fast_ema=5, slow_ema=15).get_latest_signal(df)
         assert result is not None
 
+    def test_returns_none_at_exactly_slow_ema_rows(self, monkeypatch):
+        # The conftest ta.ema stub uses plain ewm(adjust=False) with no
+        # min_periods, so it never produces NaN and can't reproduce this.
+        # Real pandas_ta.ema() seeds with min_periods=length, so the first
+        # `length - 1` rows are NaN. Patch the stub for this test only to
+        # match that real warm-up behavior, then confirm the gate refuses
+        # a df with exactly `slow_ema` rows instead of returning a spurious
+        # HOLD (ema_slow.shift(1) would be NaN on the last row there).
+        import src.indicators as indicators_mod
+
+        def _ema_with_min_periods(series, length=9, **_):
+            return series.ewm(span=length, min_periods=length).mean()
+
+        monkeypatch.setattr(indicators_mod.ta, "ema", _ema_with_min_periods)
+
+        strat = EMACrossRSI(fast_ema=9, slow_ema=21)
+        assert strat.get_latest_signal(_make_df(21)) is None
+        assert strat.get_latest_signal(_make_df(22)) is not None
+
     def test_get_signals_history_returns_dataframe(self):
         df = _make_df(80)
         history = EMACrossRSI().get_signals_history(df)
