@@ -3,12 +3,16 @@ Technical Indicators for Scalping Strategy
 EMA Crossover + RSI + Supertrend + ATR helpers
 """
 
+import logging
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from typing import Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 # ── Supertrend ─────────────────────────────────────────────────────────────────
@@ -30,62 +34,115 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5
     try:
         st = ta.supertrend(df['high'], df['low'], df['close'],
                            length=period, multiplier=multiplier)
-        # pandas_ta column names: SUPERT_10_2.5, SUPERTd_10_2.5, ...
-        col_val = [c for c in st.columns if c.startswith('SUPERT_') and 'd' not in c and 'l' not in c and 's' not in c]
+        # pandas_ta column names: SUPERT_10_2.5 (line), SUPERTd_10_2.5 (direction),
+        # plus SUPERTl_/SUPERTs_ (long/short legs).  'SUPERT_' as a prefix already
+        # excludes the d/l/s variants — the character after 'SUPERT' is the
+        # discriminator — so no extra substring filtering is needed (and the old
+        # `'d' not in c` form would reject a legitimate value column whenever the
+        # multiplier stringified with a letter in it).
+        col_val = [c for c in st.columns if c.startswith('SUPERT_')]
         col_dir = [c for c in st.columns if c.startswith('SUPERTd_')]
         if col_val and col_dir:
+            bull = st[col_dir[0]] == 1
+            bear = st[col_dir[0]] == -1
             df['supertrend']      = st[col_val[0]]
-            df['supertrend_bull'] = st[col_dir[0]] == 1
-            df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+            df['supertrend_bull'] = bull
+            # A flip requires the PRIOR bar to be confirmed bearish, not merely
+            # "not bullish" — during the ATR warm-up direction is NaN, so a
+            # not-bullish test would report a spurious flip on the first bar the
+            # indicator comes online, which is not a bear->bull reversal at all.
+            df['supertrend_flip'] = bull & bear.shift(1, fill_value=False)
             return df
-    except Exception:
-        pass
+        logger.warning(
+            "supertrend: pandas_ta returned unexpected columns %s — "
+            "falling back to the manual implementation", list(st.columns))
+    except Exception as exc:
+        # Do not degrade silently: the fallback is a different code path with
+        # different numerics, so a reader of the logs should know it engaged.
+        logger.warning("supertrend: pandas_ta path failed (%s) — "
+                       "falling back to the manual implementation", exc)
 
     # ── Fallback: manual implementation ───────────────────────────────────────
     hl2 = (df['high'] + df['low']) / 2.0
     atr_s = ta.atr(df['high'], df['low'], df['close'], length=period)
     if atr_s is None:
-        df['supertrend'] = hl2
-        df['supertrend_bull'] = True
+        # No ATR means no bands, which means no indicator. Emit an explicit
+        # "unknown" rather than a synthetic hl2 line flagged bullish — a
+        # fabricated permanent buy bias is the worst failure mode this module
+        # has, so it must not be the behaviour on a degraded path.
+        logger.warning("supertrend: ATR unavailable — emitting an empty indicator")
+        df['supertrend']      = np.nan
+        df['supertrend_bull'] = False
         df['supertrend_flip'] = False
         return df
 
     upper_basic = hl2 + multiplier * atr_s
     lower_basic = hl2 - multiplier * atr_s
 
-    upper = upper_basic.copy()
-    lower = lower_basic.copy()
-    direction = pd.Series(1, index=df.index)  # 1=bull, -1=bear
+    # ATR is NaN for its warm-up prefix, so the band recursion MUST start at the
+    # first bar that has a real band pair.  Seeding at row 0 instead poisons the
+    # whole series: NaN fails every comparison below, so both branches carry the
+    # NaN forward and every subsequent bar inherits it — the old code returned an
+    # all-NaN line that was permanently 'bullish' even on a pure downtrend.
+    n = len(df)
+    ub = upper_basic.to_numpy(dtype=float)
+    lb = lower_basic.to_numpy(dtype=float)
+    cl = df['close'].to_numpy(dtype=float)
 
-    for i in range(1, len(df)):
-        prev_upper = upper.iloc[i - 1]
-        prev_lower = lower.iloc[i - 1]
-        prev_close = df['close'].iloc[i - 1]
+    upper = np.full(n, np.nan)
+    lower = np.full(n, np.nan)
+    direction = np.full(n, np.nan)  # 1=bull, -1=bear, NaN=warm-up
 
-        upper.iloc[i] = (upper_basic.iloc[i]
-                         if upper_basic.iloc[i] < prev_upper or prev_close > prev_upper
-                         else prev_upper)
-        lower.iloc[i] = (lower_basic.iloc[i]
-                         if lower_basic.iloc[i] > prev_lower or prev_close < prev_lower
-                         else prev_lower)
+    seeds = np.flatnonzero(~np.isnan(ub) & ~np.isnan(lb))
+    if seeds.size == 0:
+        # Not enough bars for a single ATR reading — emit an explicit warm-up.
+        df['supertrend']      = np.nan
+        df['supertrend_bull'] = False
+        df['supertrend_flip'] = False
+        return df
 
-        prev_dir = direction.iloc[i - 1]
-        close_i  = df['close'].iloc[i]
-        if prev_dir == -1 and close_i > upper.iloc[i]:
-            direction.iloc[i] = 1
-        elif prev_dir == 1 and close_i < lower.iloc[i]:
-            direction.iloc[i] = -1
+    seed = int(seeds[0])
+    upper[seed]     = ub[seed]
+    lower[seed]     = lb[seed]
+    direction[seed] = 1.0
+
+    for i in range(seed + 1, n):
+        prev_upper = upper[i - 1]
+        prev_lower = lower[i - 1]
+        prev_close = cl[i - 1]
+
+        # A NaN basic band carries the previous band forward rather than
+        # overwriting a good band with NaN.
+        if np.isnan(ub[i]):
+            upper[i] = prev_upper
         else:
-            direction.iloc[i] = prev_dir
+            upper[i] = ub[i] if (ub[i] < prev_upper or prev_close > prev_upper) else prev_upper
 
-    # Supertrend line = lower band when bullish, upper band when bearish
-    st_line = pd.Series(index=df.index, dtype=float)
-    st_line[direction == 1]  = lower[direction == 1]
-    st_line[direction == -1] = upper[direction == -1]
+        if np.isnan(lb[i]):
+            lower[i] = prev_lower
+        else:
+            lower[i] = lb[i] if (lb[i] > prev_lower or prev_close < prev_lower) else prev_lower
 
-    df['supertrend']      = st_line
-    df['supertrend_bull'] = direction == 1
-    df['supertrend_flip'] = (df['supertrend_bull'] == True) & (df['supertrend_bull'].shift(1) == False)
+        prev_dir = direction[i - 1]
+        if prev_dir == -1.0 and cl[i] > upper[i]:
+            direction[i] = 1.0
+        elif prev_dir == 1.0 and cl[i] < lower[i]:
+            direction[i] = -1.0
+        else:
+            direction[i] = prev_dir
+
+    # Supertrend line = lower band when bullish, upper band when bearish,
+    # NaN through the warm-up (matching pandas_ta's own convention).
+    st_line = np.where(direction == 1.0, lower,
+                       np.where(direction == -1.0, upper, np.nan))
+
+    bull = pd.Series(direction == 1.0, index=df.index)
+    bear = pd.Series(direction == -1.0, index=df.index)
+    df['supertrend']      = pd.Series(st_line, index=df.index)
+    df['supertrend_bull'] = bull
+    # Same rule as the pandas_ta branch: the prior bar must be confirmed bearish,
+    # so neither the seed bar nor the end of the warm-up counts as a flip.
+    df['supertrend_flip'] = bull & bear.shift(1, fill_value=False)
     return df
 
 
