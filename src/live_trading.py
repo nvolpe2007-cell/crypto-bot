@@ -352,8 +352,13 @@ class LiveTrader:
             logger.info("[ML] Retraining triggered")
             self.ml_scorer.train()
 
-        # Notification
-        total_equity = self.account.initial_capital + self.account.total_pnl
+        # Notification. Matches get_summary()'s total_equity formula (initial_capital +
+        # total_pnl + unrealized_pnl of positions still open) — this position was just
+        # deleted above, but any OTHER open position's unrealized PnL must still count,
+        # or the Telegram trade-closed message understates equity whenever ≥1 other
+        # position remains open.
+        total_equity = self.account.initial_capital + self.account.total_pnl + \
+            sum(p.unrealized_pnl for p in self.positions.values())
         if self.notifier and sig:
             issues, positives = _quick_diagnose(trade.pnl, reason, sig)
             self.notifier.send_trade_analysis(
