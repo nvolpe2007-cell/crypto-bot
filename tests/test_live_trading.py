@@ -1070,7 +1070,23 @@ class TestCandleRefresherTimeoutFallback:
 
         public_ws = MagicMock()
         public_ws.candle_queue = MagicMock()
-        public_ws.candle_queue.get = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        # Raise TimeoutError exactly once (triggering the fallback branch),
+        # then suspend on a real, long sleep. An AsyncMock that raises on
+        # *every* call would make _candle_refresher's `while trader.running`
+        # loop spin with no genuine suspension point in between — under
+        # Python 3.12/3.13's asyncio scheduler that starves every other task
+        # in the event loop (including this test's own polling loop below),
+        # hanging the test indefinitely instead of failing fast.
+        get_call_count = {"n": 0}
+
+        async def _fake_get():
+            get_call_count["n"] += 1
+            if get_call_count["n"] == 1:
+                raise asyncio.TimeoutError
+            await asyncio.sleep(3600)
+
+        public_ws.candle_queue.get = _fake_get
         public_ws.get_prices = MagicMock(return_value={})
 
         async def _run():
@@ -1086,7 +1102,7 @@ class TestCandleRefresherTimeoutFallback:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        asyncio.run(_run())
+        asyncio.run(asyncio.wait_for(_run(), timeout=10))
 
         # Fails pre-fix: the fallback branch fetched fresh OHLCV but never
         # called regime_detector.detect(), leaving regime_cache stale.

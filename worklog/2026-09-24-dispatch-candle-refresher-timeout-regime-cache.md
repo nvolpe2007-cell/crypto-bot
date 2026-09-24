@@ -74,15 +74,35 @@ exactly (3 lines added, no other logic touched).
 
 - Added `TestCandleRefresherTimeoutFallback` (`tests/test_live_trading.py`): drives
   `run_live_trading_session` as a background task with a `public_ws` whose
-  `candle_queue.get()` always raises `asyncio.TimeoutError` (forcing only the
-  fallback branch to ever run), polls until `trader.regime_detector.detect` has been
-  called, then cancels the task. Confirmed this **fails on pre-fix code**
-  (`assert 0 >= 1`, i.e. `detect()` never called) via `git stash -- src/live_trading.py`
-  and re-running, then confirmed it passes with the fix restored.
+  `candle_queue.get()` triggers the fallback branch, polls until
+  `trader.regime_detector.detect` has been called, then cancels the task.
+- **CI caught a real test-design bug the first push missed**: PR #141's first CI run
+  passed on Python 3.11 but hung until the runner force-killed it (13+ min, exit 143)
+  on 3.12, with 3.13 stuck the same way. Root cause (confirmed with a minimal
+  standalone repro, no pytest involved): the original mock made
+  `candle_queue.get()` raise `asyncio.TimeoutError` on *every* call, so
+  `_candle_refresher`'s `while trader.running:` loop had no real suspension point
+  between iterations — under Python 3.12/3.13's asyncio scheduler (not 3.11) this
+  starves every sibling task in the same event loop, including the test's own
+  polling loop, forever. Reproduced locally in fresh 3.11/3.12/3.13 venvs pinned to
+  the repo's exact `pytest`/`pytest-asyncio` versions — 3.11 passed in <1s, 3.12/3.13
+  hung until manually killed, matching CI exactly. This is a **test-harness bug, not
+  a production one**: production's real `fetch_ohlcv`/`candle_queue.get()` calls do
+  actual network I/O, which always yields control; only an always-instantly-raising
+  mock manufactures a true busy-loop. Fixed the test: the fake `get()` now raises
+  `TimeoutError` on its first call only (still exercises the fallback branch once)
+  and suspends on a real (long) sleep after that, so the task genuinely yields —
+  confirmed no starvation and a clean pass on all three Python versions. Also wrapped
+  the test body in `asyncio.wait_for(..., timeout=10)` as a backstop, so any future
+  regression in this shape fails the test in 10s instead of hanging a CI runner for
+  13+ minutes again.
+- Confirmed the (now CI-safe) test still **fails on pre-fix code** — restored the
+  pre-fix `src/live_trading.py` via `git show <parent-commit>:src/live_trading.py`,
+  re-ran under the pinned Python 3.12 venv (`assert 0 >= 1`, i.e. `detect()` never
+  called, failed cleanly and fast — no hang), then restored the fix and confirmed a
+  pass, on 3.11/3.12/3.13 all.
 - `python -m pytest tests/test_live_trading.py -q -k TestCandleRefresherTimeoutFallback`
-  → 1 passed (0.17s — no real-time sleeps needed; the background task is cancelled
-  once the assertion condition is observed, so the test doesn't wait through the
-  main loop's real `EVAL_INTERVAL` sleep).
+  → 1 passed (~0.1–0.4s across all three Python versions).
 - Full suite: `python -m pytest tests/ -q` → **3609 passed, 0 failed** (3608 baseline
   + 1 new test, no regressions).
 
