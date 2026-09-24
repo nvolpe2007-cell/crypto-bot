@@ -21,6 +21,7 @@ What is tested (all without real network calls or real money):
 import sys
 import types
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -1042,6 +1043,54 @@ class TestRunLiveTradingSessionReconcileAbort:
             notifier=None,
         ))
         assert trader.running is False
+
+
+# ── candle refresher: 90s-timeout fallback path ─────────────────────────────────
+#
+# _candle_refresher() has two ways to refresh ohlcv_cache: a real candle arriving
+# from public_ws (primary path), or a 90s asyncio.wait_for() timeout when the WS
+# candle feed has gone quiet (fallback path). The primary path also refreshes
+# regime_cache via trader.regime_detector.detect(); the fallback path refreshed
+# only ohlcv_cache and never called regime_detector.detect(), so a stalled WS
+# feed silently froze the regime fed into every strategy.evaluate() call
+# (regime_name/regime_conf, including the CRASH-blocks-longs rule) for as long
+# as the feed stayed quiet, even though price data kept refreshing normally.
+
+class TestCandleRefresherTimeoutFallback:
+    def test_timeout_fallback_refreshes_regime_cache(self):
+        trader = _make_trader()
+        trader.symbols = ["BTC/USD"]
+        trader.exchange.fetch_ohlcv = AsyncMock(return_value=[
+            [1_700_000_000_000 + i * 60_000, 50_000, 50_100, 49_900, 50_050, 10]
+            for i in range(5)
+        ])
+        trader.regime_detector.detect.return_value = MagicMock(
+            to_dict=lambda: {"regime": "TRENDING_UP", "confidence": 0.8}
+        )
+
+        public_ws = MagicMock()
+        public_ws.candle_queue = MagicMock()
+        public_ws.candle_queue.get = AsyncMock(side_effect=asyncio.TimeoutError)
+        public_ws.get_prices = MagicMock(return_value={})
+
+        async def _run():
+            task = asyncio.create_task(run_live_trading_session(
+                exchange=trader.exchange, trader=trader, symbols=trader.symbols,
+                notifier=None, public_ws=public_ws,
+            ))
+            for _ in range(50):
+                await asyncio.sleep(0)
+                if trader.regime_detector.detect.call_count:
+                    break
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+
+        # Fails pre-fix: the fallback branch fetched fresh OHLCV but never
+        # called regime_detector.detect(), leaving regime_cache stale.
+        assert trader.regime_detector.detect.call_count >= 1
 
 
 # ── _kill_switch_engaged ────────────────────────────────────────────────────────

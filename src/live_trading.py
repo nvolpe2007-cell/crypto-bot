@@ -590,6 +590,9 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                         ohlcv = await exchange.fetch_ohlcv(sym, timeframe, limit=lookback)
                         if ohlcv:
                             ohlcv_cache[sym] = prepare_ohlcv_dataframe(ohlcv)
+                            result = trader.regime_detector.detect(ohlcv_cache[sym])
+                            if result:
+                                regime_cache[sym] = result.to_dict()
                     except CircuitBreakerOpen as e:
                         wait = e.remaining_seconds if e.remaining_seconds > 0 else 60.0
                         logger.warning(f"[LIVE] Circuit open (fallback path) — sleeping {wait:.0f}s")
