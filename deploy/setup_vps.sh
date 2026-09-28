@@ -68,6 +68,10 @@ install_cron deploy/trend_ensemble_cron.txt        trend_ensemble_paper.py  tren
 install_cron deploy/lev_perp_arms_cron.txt         lev_perp_paper.py        lev_perp_arms
 install_cron deploy/meme_cohort_cron.txt           meme_cohort.py           meme_cohort
 install_cron deploy/meme_radar_cron.txt            meme_radar.py            meme_radar
+# GEX dealer-exposure SNAPSHOT LOGGER - not a strategy, not wired to trading. It collects
+# the options-chain history nothing else has; see deploy/gex_cron.txt for the pre-registered
+# question and kill criteria.
+install_cron deploy/gex_cron.txt                   gex_paper.py             gex
 install_cron deploy/trade_close_notifier_cron.txt  trade_close_notifier.py  trade_close_notifier
 
 # ── 3. Weekly report timer. ───────────────────────────────────────────────────
