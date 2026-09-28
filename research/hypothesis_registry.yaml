@@ -502,3 +502,89 @@ hypotheses:
       methodological fix made before the full run — sweeping the smoothing window
       to chase a better number would NOT have been legitimate.
       Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
+
+  - id: polymarket-btc-updown-fair-value
+    name: Polymarket 15m BTC Up/Down — fair-value mispricing (paper)
+    family: prediction-markets
+    hypothesis: >
+      Polymarket's 15-minute "Bitcoin Up or Down" markets misprice P(Up)
+      mid-window relative to a volatility-scaled digital fair value computed
+      from the start price, spot and realized vol, by more than the taker fee
+      (0.07*p*(1-p)/share, ~3.5% of stake at p=0.50) plus ~1c spread.
+    code: polymarket_bot/fair_value.py, polymarket_bot/runner.py
+    backtest: scripts/polymarket_twap_backtest.py
+    evidence:
+      - date: 2026-09-28
+        script: scripts/polymarket_twap_backtest.py --days 7
+        window: 672 resolved 15m windows, 2026-09-21 -> 2026-09-28; Coinbase 1m
+          BTC as the underlying proxy; Polymarket prices-history at 1m fidelity
+        result: >
+          Resolution rule: real outcomes match the END-of-window price rule
+          93.2% vs the full-window-TWAP rule 85.3% (the market text says
+          "TWAP"; the data says endpoint). The "partial TWAP locks in the
+          outcome" thesis is therefore wrong. Endpoint model Brier 0.1379 vs
+          market 0.1383 — no calibration advantage. Pre-registered config
+          (edge>=0.03, fee 0.07) showed n=623, +10.8%/stake, t=+1.90 — but a
+          staleness diagnostic withholding ONE minute of BTC data (so the
+          model is no fresher than the Polymarket print) flips it to n=550,
+          win 45.1% vs model-said 55.2%, -8.8%/stake, t=-1.59. The apparent
+          edge is entirely a stale-quote latency artifact of 1m price history.
+    deployment_gate:
+      requires: forward paper arm on LIVE fresh quotes (best ask + Kraken spot
+        at the same instant) with n >= 30 settled, expectancy > 0 net of the
+        real taker fee, and the proof_scorecard family bar
+      blocked_by: backtest shows no edge without an information-latency
+        advantage; live execution is also on the international CLOB, which
+        is geoblocked for this US account — paper only regardless
+    status: paper-only
+    notes: |
+      Prior is strongly negative; the forward arm exists to MEASURE on fresh
+      quotes what the 1m-fidelity history cannot, not because an edge is
+      expected. Known noise: Kraken's 1m open is a proxy for Chainlink's
+      start print — a 0.02% basis moves fair value materially this close to
+      the money. DO NOT re-propose latency arb (being faster than the book)
+      from a REST poller — it is the only thing the backtest "found".
+  - id: polymarket-btc-5m-orderflow-trend
+    name: Polymarket 5m BTC Up/Down — patterns, Kraken order flow, trend regime
+    family: prediction-markets
+    hypothesis: >
+      Follow-up to polymarket-btc-updown-fair-value, on the 5-minute markets.
+      (a) Simple patterns (price-bucket bias, streaks, hour of day) beat the
+      market price net of fees; (b) Kraken order-flow imbalance and trend
+      regime add information to Polymarket's own price.
+    code: scripts/polymarket_5m_patterns.py, scripts/polymarket_5m_features.py
+    evidence:
+      - date: 2026-09-28
+        script: scripts/polymarket_5m_patterns.py --days 14
+        window: 4032 resolved 5m windows; first 7d in-sample, next 7d OOS;
+          entries at the printed price + 0.5c, taker fee 0.07*p*(1-p)
+        result: >
+          Up won 50.3%. 94 cells; 23 IS-positive, 4 positive in both halves,
+          0 with OOS t>3 (best OOS t=+1.01) — the count expected by chance.
+          Best IS cell (buy <10c longshots at min 4, +44.8%) flipped to
+          -47.0% OOS. No price-bucket, streak or hour-of-day edge.
+      - date: 2026-09-28
+        script: scripts/polymarket_5m_features.py --days 7
+        window: 2017 5m windows, 882k Kraken XBTUSD trades (Kraken-only per
+          CLAUDE.md rule 5); features strictly before each print; logistic
+          on logit(p_mkt)+features, fit first half, judged second half
+        result: >
+          OOS log-loss: market 0.4473, recalibrated 0.4461. Order flow adds
+          nothing (ofi60 0.4451, ofi180 0.4461; coefficients ~0; 0 trades).
+          Trend adds nothing (trend60 0.4468 n=23 t=+0.19; sma_gap 0.4463
+          n=31 t=-0.99). Only the fresh-price features score: z (spot vs
+          target) 0.4368, n=561, +21.7%/stake, t=+3.79; mom60 n=493 +13.3%
+          t=+2.68. These are the "BTC just moved, print has not" features —
+          the same signature the 15m staleness diagnostic proved was a
+          1m-fidelity price-history artifact. Treated as UNPROVEN, not edge.
+    deployment_gate:
+      requires: the live paper arm (fresh book + fresh Kraken spot at the
+        same instant) showing n >= 30 settled, expectancy > 0 after fees
+      blocked_by: price-history fidelity cannot separate a real edge from
+        latency; only fresh-quote forward data can
+    status: paper-only
+    notes: |
+      Order flow and trend regime are DEAD as additions to the market price
+      at this horizon — do not re-propose without new data. Gamma levels are
+      UNTESTED (no historical per-strike OI); only forward logging (PR #112)
+      can test them.
