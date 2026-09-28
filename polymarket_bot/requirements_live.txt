@@ -1,0 +1,4 @@
+# Optional — only needed to run polymarket_bot/live_execution.py.
+# Not part of the main crypto-bot requirements.txt: this repo's paper-trading
+# arms and dashboard must keep working even if this is never installed.
+py-clob-client>=0.20.0
