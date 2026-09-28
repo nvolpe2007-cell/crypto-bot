@@ -502,3 +502,45 @@ hypotheses:
       methodological fix made before the full run — sweeping the smoothing window
       to chase a better number would NOT have been legitimate.
       Source doc: RESEARCH_2026-07-26_funding_decay_timing.md (PR #86).
+
+  - id: polymarket-btc-updown-fair-value
+    name: Polymarket 15m BTC Up/Down — fair-value mispricing (paper)
+    family: prediction-markets
+    hypothesis: >
+      Polymarket's 15-minute "Bitcoin Up or Down" markets misprice P(Up)
+      mid-window relative to a volatility-scaled digital fair value computed
+      from the start price, spot and realized vol, by more than the taker fee
+      (0.07*p*(1-p)/share, ~3.5% of stake at p=0.50) plus ~1c spread.
+    code: polymarket_bot/fair_value.py, polymarket_bot/runner.py
+    backtest: scripts/polymarket_twap_backtest.py
+    evidence:
+      - date: 2026-09-28
+        script: scripts/polymarket_twap_backtest.py --days 7
+        window: 672 resolved 15m windows, 2026-09-21 -> 2026-09-28; Coinbase 1m
+          BTC as the underlying proxy; Polymarket prices-history at 1m fidelity
+        result: >
+          Resolution rule: real outcomes match the END-of-window price rule
+          93.2% vs the full-window-TWAP rule 85.3% (the market text says
+          "TWAP"; the data says endpoint). The "partial TWAP locks in the
+          outcome" thesis is therefore wrong. Endpoint model Brier 0.1379 vs
+          market 0.1383 — no calibration advantage. Pre-registered config
+          (edge>=0.03, fee 0.07) showed n=623, +10.8%/stake, t=+1.90 — but a
+          staleness diagnostic withholding ONE minute of BTC data (so the
+          model is no fresher than the Polymarket print) flips it to n=550,
+          win 45.1% vs model-said 55.2%, -8.8%/stake, t=-1.59. The apparent
+          edge is entirely a stale-quote latency artifact of 1m price history.
+    deployment_gate:
+      requires: forward paper arm on LIVE fresh quotes (best ask + Kraken spot
+        at the same instant) with n >= 30 settled, expectancy > 0 net of the
+        real taker fee, and the proof_scorecard family bar
+      blocked_by: backtest shows no edge without an information-latency
+        advantage; live execution is also on the international CLOB, which
+        is geoblocked for this US account — paper only regardless
+    status: paper-only
+    notes: |
+      Prior is strongly negative; the forward arm exists to MEASURE on fresh
+      quotes what the 1m-fidelity history cannot, not because an edge is
+      expected. Known noise: Kraken's 1m open is a proxy for Chainlink's
+      start print — a 0.02% basis moves fair value materially this close to
+      the money. DO NOT re-propose latency arb (being faster than the book)
+      from a REST poller — it is the only thing the backtest "found".

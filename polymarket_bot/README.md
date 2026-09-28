@@ -11,7 +11,15 @@ you, every time.**
 - `paper_sim.py` — paper position open/settle, writes `data/polymarket_paper_state.json`
   in this repo's standard arm-state shape (`equity`/`start_equity`/`open`/`closed`), so
   `src/dashboard_data.py` picks it up automatically.
-- `signal.py` — placeholder, always `HOLD`. No code path here ever reads this to place a
+- `fair_value.py` — P(Up) for the 15m BTC windows (endpoint digital + a window-TWAP
+  variant), realized vol, Polymarket's taker-fee formula, net edge per share.
+- `runner.py` — the live PAPER arm: `python -m polymarket_bot.runner`. Prices each window
+  against fresh Kraken spot + the live best ask, paper-buys at the ask (fee charged) when
+  net edge ≥ 0.03, holds to resolution, logs every decision to
+  `data/polymarket_decisions.jsonl`. **Backtest verdict (registry
+  `polymarket-btc-updown-fair-value`): no edge without a latency advantage — expect it to
+  lose; it runs to measure that on fresh quotes.**
+- `signal.py` — superseded by `runner.py`/`fair_value.py`; kept, always `HOLD`. No code path here ever reads this to place a
   real order — it only exists for a future paper-sim runner. Real signal work is a
   separate, deliberate next step — see the cost/turnover discipline in `CLAUDE.md`
   before trusting one.

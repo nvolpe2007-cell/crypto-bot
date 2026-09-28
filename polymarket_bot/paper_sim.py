@@ -42,6 +42,10 @@ class PaperPosition:
     entry_price: float
     size_usd: float
     opened_at: str
+    # Actual taker fee paid at entry. When set, settlement charges it win OR
+    # lose (that is when Polymarket takes it) instead of the flat legacy cost.
+    fee_usd: Optional[float] = None
+    window_end: Optional[str] = None
 
 
 @dataclass
@@ -77,14 +81,21 @@ def open_paper_position(
     market: BinaryMarket,
     side: str,
     size_usd: float = POSITION_SIZE_USD,
+    entry_price: Optional[float] = None,
+    fee_usd: Optional[float] = None,
+    window_end: Optional[str] = None,
 ) -> Optional[PaperPosition]:
-    """Open a paper position at the current midpoint. No real order is placed."""
+    """Open a paper position. No real order is placed.
+
+    `entry_price` should be the book's best ask (what a taker actually pays);
+    it falls back to the midpoint, which flatters paper P&L by half a spread.
+    """
     token_id = market.yes_token_id if side == "YES" else market.no_token_id
     if not token_id:
         logger.warning("market %s missing token_id for side=%s", market.slug, side)
         return None
 
-    price = get_midpoint_price(token_id)
+    price = entry_price if entry_price is not None else get_midpoint_price(token_id)
     if price is None:
         return None
 
@@ -96,6 +107,8 @@ def open_paper_position(
         entry_price=price,
         size_usd=size_usd,
         opened_at=datetime.now(timezone.utc).isoformat(),
+        fee_usd=fee_usd,
+        window_end=window_end,
     )
     state.open.append(asdict(pos))
     state.save()
@@ -112,8 +125,11 @@ def settle_position(state: PolymarketPaperState, condition_id: str, resolved_yes
 
         won = (raw["side"] == "YES") == resolved_yes
         payout = raw["size_usd"] / raw["entry_price"] if won else 0.0
-        cost = raw["size_usd"] * ASSUMED_ROUND_TRIP_COST_FRAC
-        pnl = payout - raw["size_usd"] - cost if won else -raw["size_usd"]
+        if raw.get("fee_usd") is not None:
+            pnl = payout - raw["size_usd"] - raw["fee_usd"]
+        else:
+            cost = raw["size_usd"] * ASSUMED_ROUND_TRIP_COST_FRAC
+            pnl = payout - raw["size_usd"] - cost if won else -raw["size_usd"]
 
         state.equity += pnl
         state.closed.append(

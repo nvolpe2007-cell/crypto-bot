@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -37,7 +38,7 @@ def test_live_without_env_vars_refuses(monkeypatch):
         ],
         capture_output=True,
         text=True,
-        cwd=__file__.rsplit("/tests/", 1)[0],
+        cwd=str(Path(__file__).resolve().parents[1]),  # repo root, any OS
         env={"PATH": "/usr/bin:/bin", "PYTHONPATH": __file__.rsplit("/tests/", 1)[0]},
         timeout=30,
     )
