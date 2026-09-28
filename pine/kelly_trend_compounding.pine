@@ -1,0 +1,125 @@
+//@version=6
+//
+// Kelly-ish trend — SAME signal as the confluence arm, CONVICTION-SCALED COMPOUNDING
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: kelly_trend_paper.py (state: data/kelly_trend_state.json)
+//
+// THIS IS AN A/B TEST OF SIZING, NOT A NEW SIGNAL
+//   It rides the identical entry rule as conf_trend_momo.pine / btc_trend_paper
+//   (close > SMA100 AND close > close[20]; long/cash). The ONLY difference is how
+//   much is bet. Run this and conf_trend_momo.pine on the same chart and the
+//   trade DATES will match exactly — only the size and the equity curve differ.
+//   That is the experiment: does conviction-scaled compounding actually beat flat
+//   100%-of-equity, or does it just add variance?
+//
+// WHAT THE MONTE-CARLO ESTABLISHED, AND IS BAKED IN HERE
+//   • COMPOUNDING is the real exponential engine: each trade is sized off CURRENT
+//     equity, so wins grow the next bet and losses shrink it. TradingView's
+//     percent_of_equity sizing does this natively.
+//   • CONVICTION scales the bet within a band — stronger 20-day thrust at entry,
+//     bigger fraction.
+//   • HARD NO-LEVERAGE CAP. The fraction is clamped to <= Max fraction, default
+//     1.00 = fully invested, never borrowed. Raising it above 1.0 re-opens the
+//     ruin zone: the simulation showed any perp leverage with a liquidation tail
+//     ruins ~57% of timelines (memory `doubling_in_a_month_verdict`). The input
+//     below permits it only as an explicit research knob.
+//   • SIZING AMPLIFIES AN EDGE, IT CANNOT CREATE ONE. On a positive-EV signal
+//     fractional-Kelly compounds it; on a no-edge signal any sizing just loses
+//     faster. Do not port this sizing onto a signal that has not measured
+//     positive. See memory `position_sizing_verdict`.
+//
+// CONVICTION — PRE-SPECIFIED, NOT SWEPT
+//       momo       = close / close[20] - 1
+//       conviction = clamp(momo / 0.20, 0, 1)        // 20% over 20d = full conviction
+//       fraction   = MIN_FRAC + conviction * (MAX_FRAC - MIN_FRAC)
+//   Mechanical, deterministic, backtestable on purpose. (The discretionary brain
+//   arm sizes by its own judgement; this is the rules-based control for that idea.)
+//   Sweeping CONV_REF until the curve improves is the overfit this arm avoids.
+//
+strategy("Kelly trend — conviction compounding", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,        // overridden per-entry below
+     initial_capital       = 1000,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.27,       // 0.54% round trip = 0.27% per side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── signal inputs (identical spec to the confluence arm) ──────────────────────
+smaN   = input.int(100, "SMA length  (KELLY_TREND_SMA)",  minval = 2, group = "Signal")
+momoN  = input.int(20,  "Momentum lookback  (KELLY_TREND_MOMO)", minval = 1, group = "Signal")
+useHTF = input.bool(true, "Force daily bars regardless of chart timeframe", group = "Signal")
+
+// ── sizing inputs ─────────────────────────────────────────────────────────────
+convRef = input.float(0.20, "Conviction reference: momentum = full conviction  (CONV_REF)",
+     minval = 0.01, step = 0.01, group = "Sizing",
+     tooltip = "0.20 means a +20% 20-day move counts as maximum conviction.")
+minFrac = input.float(0.25, "Min fraction of equity  (MIN_FRAC)", minval = 0.0, maxval = 1.0,
+     step = 0.05, group = "Sizing",
+     tooltip = "A weak but valid trend still participates, at this size.")
+maxFrac = input.float(1.00, "Max fraction of equity  (MAX_FRAC)", minval = 0.0, maxval = 3.0,
+     step = 0.05, group = "Sizing",
+     tooltip = "1.00 = fully invested, NEVER borrowed. Values above 1.0 are leverage " +
+               "and re-open the ruin zone — research knob only, not the spec.")
+
+// ── data ──────────────────────────────────────────────────────────────────────
+src = useHTF ? request.security(syminfo.tickerid, "D", close,
+                   lookahead = barmerge.lookahead_off) : close
+sma = useHTF ? request.security(syminfo.tickerid, "D", ta.sma(close, smaN),
+                   lookahead = barmerge.lookahead_off) : ta.sma(close, smaN)
+ref = useHTF ? request.security(syminfo.tickerid, "D", close[momoN],
+                   lookahead = barmerge.lookahead_off) : close[momoN]
+
+warm     = not na(sma) and not na(ref)
+wantLong = warm and src > sma and src > ref
+
+// ── conviction -> fraction, evaluated AT ENTRY (frozen for the trade) ─────────
+momo = warm and ref != 0 ? src / ref - 1.0 : 0.0
+conv = convRef > 0 ? math.max(0.0, math.min(1.0, momo / convRef)) : 1.0
+frac = minFrac + conv * (maxFrac - minFrac)
+
+var int   pos       = 0
+var float entryFrac = 0.0
+var float entryConv = 0.0
+
+if warm
+    pos := wantLong ? 1 : 0
+
+flipLong = warm and pos == 1 and pos[1] != 1
+flipFlat = warm and pos == 0 and pos[1] != 0
+
+if flipLong
+    entryFrac := frac
+    entryConv := conv
+    // The fraction IS the position size, computed off whatever the book is
+    // worth RIGHT NOW — that is the compounding.
+    strategy.entry("LONG", strategy.long, qty = strategy.equity * entryFrac / close)
+if flipFlat
+    strategy.close("LONG", comment = "to cash")
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(sma, "SMA", color = color.new(color.orange, 0), linewidth = 2)
+barcolor(pos == 1 ? color.new(color.teal, 40) : color.new(color.gray, 60))
+bgcolor(pos == 1 ? color.new(color.teal, 93) : na, title = "In position")
+
+plotshape(flipLong, "BUY", style = shape.labelup, location = location.belowbar,
+     color = color.new(color.teal, 0), text = "BUY", textcolor = color.white, size = size.tiny)
+plotshape(flipFlat, "CASH", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.maroon, 0), text = "CASH", textcolor = color.white, size = size.tiny)
+
+var table t = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "20d momentum", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, str.tostring(momo * 100, "#.#") + "%", text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 1, "conviction", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(conv, "#.##"), text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 2, "fraction if entering now", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(frac * 100, "#.#") + "%", text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 3, "held at", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, pos == 1 ? str.tostring(entryFrac * 100, "#.#") + "% (conv " +
+         str.tostring(entryConv, "#.##") + ")" : "cash",
+         text_color = pos == 1 ? color.teal : color.gray, text_size = size.small)
+
+alertcondition(flipLong, "Kelly trend: go LONG", "Kelly {{ticker}}: conviction-sized LONG")
+alertcondition(flipFlat, "Kelly trend: go CASH", "Kelly {{ticker}}: to CASH")

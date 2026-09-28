@@ -1,0 +1,19 @@
+[Unit]
+# Polymarket 15m BTC Up/Down PAPER arm (polymarket_bot/runner.py). No wallet, no
+# order placement — reads public Polymarket + Kraken data and writes
+# data/polymarket_paper_state.json + data/polymarket_decisions.jsonl.
+# Standalone: does NOT touch the crypto-bot service.
+Description=crypto-bot Polymarket paper arm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/crypto-bot
+ExecStart=/opt/crypto-bot/venv/bin/python -m polymarket_bot.runner
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

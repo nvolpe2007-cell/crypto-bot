@@ -2,7 +2,7 @@
 # execution on the Linux VPS (e.g. `/usr/bin/env bash\r: No such file`).
 *.sh text eol=lf
 
-# The canonical cron line is installed verbatim into the VPS crontab — a CRLF
-# would corrupt the schedule. Force LF.
-deploy/swing_cron.txt text eol=lf
-deploy/tsmom_cron.txt text eol=lf
+# The canonical cron lines are installed verbatim into the VPS crontab by
+# deploy/setup_vps.sh — a CRLF would corrupt the schedule. Force LF for every
+# cron file, not just the two that predated the lev_perp/meme/trend arms.
+deploy/*_cron.txt text eol=lf

@@ -1,0 +1,105 @@
+//@version=6
+//
+// Confluence trend+momentum — long/cash  (close > SMA100 AND close > close[20])
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: conf_paper.py (BTC+ETH+SOL, 1/3 book each)  AND
+//          btc_trend_paper.py (BTC only, whole book)
+//   Both runners ride the IDENTICAL signal — they differ only in universe and
+//   book size, which on a single TradingView chart is the same script. Point it
+//   at BTC with 100% equity and you have btc_trend_paper; point it at each of
+//   BTC/ETH/SOL with 33% and you have conf_paper.
+//
+// WHAT IT IS
+//   Long only when BOTH legs agree: price above its SMA(100) AND 20-day momentum
+//   positive. Cash otherwise. The CONJUNCTION is the whipsaw filter — which is
+//   why, unlike the TSMOM arm, there is no hysteresis band bolted on. Two
+//   conditions that must both hold already refuse the marginal signal.
+//
+// WHERE THE PARAMETERS CAME FROM (this matters more than the numbers)
+//   scripts/longonly_tournament.py, BTC+ETH+SOL daily, honest 0.5% cost. This
+//   configuration ("conf_trend_momo") was the best DRAWDOWN-adjusted
+//   spot-executable bot in that tournament: avg $1138, Sharpe 0.40, -31% max
+//   drawdown against buy & hold's -65%. The lookbacks are taken FROM the
+//   tournament and are not re-tuned here. If you sweep them on your own chart
+//   until the equity curve looks better, you have overfit the window you are
+//   looking at — that is precisely the failure the whole proof apparatus exists
+//   to catch. See memory `longonly_tournament_verdict`.
+//
+// WHAT WINNING LOOKS LIKE — IT IS NOT BEATING BUY-AND-HOLD
+//   The owner's stated goal for this arm is STEADY GAINS, LOW STRESS. Trend
+//   following trades return for safety: it tracks most of the upside while
+//   clipping deep drawdowns and sitting out bears. Judge the Strategy Tester's
+//   max-drawdown line against buy-and-hold's, not the net-profit line.
+//
+// STATUS: CANDIDATE, NOT PROVEN. At ~4-10 round trips a year on one asset, the
+//   n>=30 proof bar is a ~5-year clock. For a long time the verdict is
+//   qualitative. We do not fake proof.
+//
+strategy("Confluence trend+momo (long/cash)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 1000,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.27,       // 0.54% round trip = 0.27% per side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── inputs (defaults mirror CONF_* / BTC_TREND_* env knobs) ───────────────────
+smaN  = input.int(100, "SMA length  (CONF_SMA)",   minval = 2, group = "Signal")
+momoN = input.int(20,  "Momentum lookback, bars  (CONF_MOMO)", minval = 1, group = "Signal",
+     tooltip = "Leg 2 is simply close > close[N] — a raw rate-of-change sign, no smoothing.")
+useHTF = input.bool(true, "Force daily bars regardless of chart timeframe", group = "Signal")
+
+// ── data ──────────────────────────────────────────────────────────────────────
+src  = useHTF ? request.security(syminfo.tickerid, "D", close,
+                    lookahead = barmerge.lookahead_off) : close
+sma  = useHTF ? request.security(syminfo.tickerid, "D", ta.sma(close, smaN),
+                    lookahead = barmerge.lookahead_off) : ta.sma(close, smaN)
+ref  = useHTF ? request.security(syminfo.tickerid, "D", close[momoN],
+                    lookahead = barmerge.lookahead_off) : close[momoN]
+
+// ── the two legs, and the conjunction ─────────────────────────────────────────
+warm     = not na(sma) and not na(ref)
+trendLeg = warm and src > sma
+momoLeg  = warm and src > ref
+wantLong = trendLeg and momoLeg
+
+var int pos = 0
+if warm
+    pos := wantLong ? 1 : 0
+
+flipLong = warm and pos == 1 and pos[1] != 1
+flipFlat = warm and pos == 0 and pos[1] != 0
+
+if flipLong
+    strategy.entry("LONG", strategy.long)
+if flipFlat
+    strategy.close("LONG", comment = "to cash")
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(sma, "SMA100", color = color.new(color.orange, 0), linewidth = 2)
+barcolor(pos == 1 ? color.new(color.teal, 40) : color.new(color.gray, 60))
+bgcolor(pos == 1 ? color.new(color.teal, 93) : na, title = "In position")
+
+plotshape(flipLong, "BUY",  style = shape.labelup,   location = location.belowbar,
+     color = color.new(color.teal, 0),   text = "BUY",  textcolor = color.white, size = size.tiny)
+plotshape(flipFlat, "CASH", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.maroon, 0), text = "CASH", textcolor = color.white, size = size.tiny)
+
+// A tiny panel showing WHICH leg is blocking — the same "why am I flat" question
+// the runner answers in its decision log.
+var table t = table.new(position.top_right, 2, 3, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "trend  close>SMA",  text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, trendLeg ? "PASS" : "fail", text_size = size.small,
+         text_color = trendLeg ? color.teal : color.maroon)
+    table.cell(t, 0, 1, "momo  close>close[N]", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, momoLeg ? "PASS" : "fail", text_size = size.small,
+         text_color = momoLeg ? color.teal : color.maroon)
+    table.cell(t, 0, 2, "position", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, pos == 1 ? "LONG" : "CASH", text_size = size.small,
+         text_color = pos == 1 ? color.teal : color.gray)
+
+alertcondition(flipLong, "Confluence: go LONG", "Conf {{ticker}}: trend AND momentum agree -> LONG")
+alertcondition(flipFlat, "Confluence: go CASH", "Conf {{ticker}}: a leg broke -> CASH")

@@ -1,0 +1,312 @@
+//@version=6
+//
+// Trend Signal (Honest) — simple BUY/SELL from the one rule that measured profitable
+// ─────────────────────────────────────────────────────────────────────────────────
+// WHAT THIS IS
+//   Close vs a long moving average, with a hysteresis band to cut whipsaw. That's it.
+//   BUY when price closes above the band, SELL (to cash) when it closes below.
+//   No oscillators, no volume filter, no volatility filter, no confluence stack.
+//
+// WHY IT IS THIS SIMPLE — THIS IS THE IMPORTANT PART
+//   Built 2026-09-06 after measuring three richer designs on BTC + ETH daily bars
+//   (2019-2026, Coinbase, 0.54% round-trip cost, non-overlapping trades):
+//
+//     1. Fade the volatility bands (mean reversion)     -> PF 0.42-0.66. Loses.
+//        Systematically shorted a 20x bull market.
+//     2. Volatility-compression breakout ("coiled spring") -> PF 0.24-0.46. Loses.
+//        And its PREMISE is false: after vol compression the subsequent 5-day
+//        absolute move is SMALLER, not bigger (t = -2.46, p = 0.014). Low vol
+//        begets low vol. The "squeeze must release" idea did not survive contact
+//        with the data at this horizon.
+//     3. Volatility regime as an OVERLAY on this trend rule -> made it worse in
+//        12 of 12 cells across both assets. See the table below; it is the single
+//        most useful thing in this file.
+//
+// THE 12/12 RESULT, AND WHAT IT MEANS FOR "WIN RATE"
+//   Adding a volatility-regime filter to the trend rule RAISED the win rate and
+//   DESTROYED the profit factor, every single time (no hysteresis band, so the
+//   comparison is like-for-like):
+//
+//     BTC daily, SMA(100)          trades   win%     PF     total
+//       trend only                    50    46.0     5.30   +1299%
+//       + vol-expanding filter        91    47.3     1.42     +49%
+//       + vol-contracting filter      95    49.5     2.01    +116%
+//
+//     ETH daily, SMA(100)          trades   win%     PF     total
+//       trend only                    60    26.7     3.74    +441%
+//       + vol-expanding filter        96    45.8     1.27     -59%
+//       + vol-contracting filter     105    52.4     1.62    +185%
+//
+//   Read the ETH row twice. The filter nearly DOUBLED the win rate (26.7% -> 45.8%)
+//   and turned +441% into -59%. The mechanism: the filter chops long trends into
+//   more, shorter trades (60 -> 96), each paying the round-trip toll, and it exits
+//   during exactly the conditions where the few enormous winners accrue. Trend
+//   following earns its money from a small number of very large wins; anything that
+//   cuts those short raises the hit rate and lowers the expectancy.
+//
+//   So: a LOW win rate here is not a flaw to be fixed. A high win rate is
+//   purchasable at any time — by small targets against wide stops, or by filtering —
+//   and it costs money every time. Judge this by profit factor and expectancy.
+//
+// MEASURED PERFORMANCE OF THE ACTUAL SHIPPED DEFAULT (SMA 100, 2% band)
+//   Same 2019-2026 daily data, 0.54% round-trip cost, signals on confirmed closes:
+//
+//                    trades  win%    PF    total    maxDD   Sharpe   buy&hold (its DD)
+//     BTC              19    47.4   8.08  +2841%   -44.1%    1.02    +1437%  (-76.7%)
+//     ETH              23    34.8   8.21  +1576%   -68.3%    0.60    +1318%  (-79.4%)
+//
+//   Both beat buy-and-hold with a smaller drawdown, both split-halves positive, on
+//   the SAME parameters for both assets (not per-asset tuned).
+//
+// NOW THE PART THAT KEEPS YOU HONEST — READ BEFORE TRADING IT
+//   Those PF-of-8 numbers rest on ONE enormous trade per asset:
+//
+//                    t-stat   p      median trade   biggest win   its share of gross profit
+//     BTC             +1.44   0.17      -1.92%        +476%              59%
+//     ETH             +1.08   0.29      -7.93%       +1203%              81%
+//
+//   * NEITHER CLEARS t > 2, never mind this repo's family-wise Sidak bar (~3.0 at
+//     the ~20 candidates tried across these sessions). This is NOT a proven edge.
+//   * THE MEDIAN TRADE LOSES MONEY on both assets. You should expect most signals
+//     to be small losers. The money, in this sample, came from catching one massive
+//     trend per cycle and holding it. If you abandon the rule after four losses in
+//     a row, you will have paid all the costs and skipped the payoff — that is the
+//     single most common way people fail at trend following.
+//   * n = 19-23 trades is a small sample. PF 8 at n=19 is a description of this
+//     window, not a forecast.
+//   * The sample contains one dominant bull market.
+//
+// WALK-FORWARD — ADDED 2026-09-08, AND IT IS THE REASON TO TRUST THIS AT ALL
+//   The bullet above used to read "no walk-forward". It has now been run
+//   (scripts/walkforward_trust.py): 5 folds, 10 Coinbase assets, parameters
+//   chosen ONLY on data before each test window, results concatenated. Nothing
+//   below was fitted with the answer visible.
+//
+//     the FIXED (untuned) rule beat buy-and-hold on ...... 8 of 10 assets
+//     RE-TUNING each fold beat the fixed rule on .......... 2 of 10 assets
+//     the "best" parameter CHANGED between folds .......... 54% of the time
+//
+//   Read the second and third lines together: tuning this rule is NOISE. The
+//   optimal setting is unstable, and chasing it lost to just leaving it alone on
+//   8 of 10 assets. That is the strongest argument for the fixed defaults here,
+//   and the reason you should not sweep them.
+//
+//   EQUAL-WEIGHT BASKET of those 10, walk-forward test period only:
+//                          growth    maxDD   Sharpe
+//       rule on basket      1.50x   -38.4%    0.44
+//       hold the basket     1.10x   -65.7%    0.34
+//   Better on all three. This is the single most trustworthy result behind this
+//   script -- and note it is the BASKET, not any one chart.
+//
+//   ON STOCKS THE SAME TEST SAYS THE OPPOSITE: across 70 US tickers the rule beat
+//   buy-and-hold on only 4 of 70, and the 70-asset basket returned 2.55x against
+//   holding's 4.98x (drawdown -14.6% vs -33.6%, Sharpe 1.36 vs 1.28). On equities
+//   this is a RISK tool, not a return tool -- use pine/trend_signal_stocks.pine,
+//   which says so on its face.
+//
+//   Still no multiple-testing correction on the headline PF figures, and n is
+//   still small. Walk-forward raises confidence; it does not make this proven.
+//   * A 4% band scored HIGHER than the shipped 2% (BTC PF 11.18). It was NOT
+//     selected, deliberately: 2% was chosen a priori to match the existing
+//     tsmom_paper.py convention, and picking the best-scoring band after seeing the
+//     results is the exact overfit this whole exercise was built to avoid.
+//
+// OUT-OF-SAMPLE TEST — the strongest evidence here (2026-09-06)
+//   Same rule, same parameters, on eight assets that had ZERO influence on its
+//   design (0.10% round-trip for equities/ETFs, which is spread not commission):
+//
+//     asset  trades  win%    PF     maxDD    (buy&hold maxDD)
+//     SPY      22    59.1    5.95   -27.9%      -33.7%
+//     QQQ      26    69.2    5.58   -21.7%      -35.1%
+//     AAPL     36    41.7    3.66   -31.3%      -43.8%
+//     MSFT     29    48.3    4.33   -22.7%      -37.1%
+//     NVDA     47    38.3    5.53   -67.9%      -66.3%
+//     GLD      24    33.3    2.69   -44.0%      -45.6%
+//     TLT      21    42.9    2.15   -32.1%      -48.4%
+//     EEM      26    50.0    2.43   -29.3%      -39.8%
+//
+//   8 of 8 with profit factor > 1, 7 of 8 with a smaller drawdown than holding.
+//   Equities, gold, bonds and emerging markets — none of them used to build it.
+//   That is the best reason to believe the rule is capturing something real
+//   rather than a fit to two crypto charts.
+//
+// WHERE TO USE IT — AND WHERE NOT TO
+//   Only 1 of those 8 equities beat buy-and-hold on SHARPE. On stocks this rule
+//   reduces drawdown but gives up more return than it saves. On crypto it DOES
+//   beat buy-and-hold risk-adjusted (BTC Sharpe 1.02 vs 0.59, ETH 0.60 vs 0.44),
+//   because crypto's -77% drawdowns make sitting out genuinely worth it while
+//   equities grind upward and sitting out mostly costs you.
+//   Use it on crypto, or on a basket for drawdown control. Do NOT expect it to
+//   beat SPY.
+//
+// THE ONE CHANGE THAT MEASURED BETTER — DIVERSIFY, DON'T TUNE
+//     average single asset                   Sharpe +0.56,  maxDD -21% to -68%
+//     8-asset equal weight, same rule        Sharpe +1.01,  maxDD -17.8%
+//   Sharpe roughly doubles and drawdown halves, without touching a single
+//   parameter. It also attacks this rule's real weakness directly: when one
+//   trade is 59-81% of profit on a single asset, running eight of them means you
+//   no longer need to catch THE one trend. The portfolio panel on the right
+//   exists to make that basket visible on one chart.
+//
+// TESTED AND REJECTED: INVERSE-VOL POSITION SIZING
+//     10-asset equal weight                  +647%,  maxDD -24.4%,  Sharpe +0.98
+//     10-asset inverse-vol weighted          +213%,  maxDD -20.9%,  Sharpe +0.76
+//   Worth stating because it is a widely recommended default (and this repo's
+//   own CLAUDE.md calls vol targeting the strongest-proven sizing edge). It does
+//   not hold HERE: this strategy earns from fat right tails on the highest-
+//   volatility assets, and inverse-vol sizing systematically shrinks exactly
+//   those positions. Do not apply it to this rule.
+//
+// SIGNALS FIRE ON BAR CLOSE ONLY (confirmed bars). No repainting: every plotted
+// signal uses barstate.isconfirmed, so what you see on history is what you would
+// have gotten live.
+//
+// The volatility-regime background is included as a VISUAL ONLY, default OFF. It
+// does not gate a single signal. It exists so the thing that was measured harmful
+// stays visible and does not get quietly re-added as a filter later.
+//
+indicator("Trend Signal (Honest)", shorttitle="TrendHonest", overlay=true)
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+maLen     = input.int(100, "Trend MA length", minval=5,
+             tooltip="100 measured best across BTC and ETH daily. 50 and 200 also work; " +
+                     "50 trades more (more cost), 200 trades less (later exits). Not per-asset tuned.")
+maType    = input.string("SMA", "MA type", options=["SMA", "EMA"])
+bandPct   = input.float(2.0, "Hysteresis band %", minval=0.0, step=0.5,
+             tooltip="Price must close this far ABOVE the MA to buy, and this far BELOW to sell. " +
+                     "Without it, price hovering on the MA generates a stream of round-trips that " +
+                     "pay full cost each time. This is the honest turnover fix, not return tuning.")
+showBg    = input.bool(false, "Show volatility-regime background (VISUAL ONLY)",
+             tooltip="OFF by default on purpose. Using this as a signal FILTER was measured to " +
+                     "raise the win rate and destroy the profit factor in 12 of 12 test cells " +
+                     "across BTC and ETH. It is displayed for context, never to gate entries.")
+volShort  = input.int(10, "Vol regime: short window", minval=2)
+volLong   = input.int(50, "Vol regime: long window", minval=5)
+
+// ── Portfolio panel ───────────────────────────────────────────────────────────
+// The ONE change measured to improve results (see header): run the same rule on
+// several assets at once. Across 8 out-of-sample assets, equal-weight took
+// Sharpe from ~0.56 (average single asset) to 1.01 and cut max drawdown to
+// -17.8%. This panel exists so you can see, on one chart, which of your basket
+// is currently LONG and which is in CASH — it changes no signal on this symbol.
+showPanel = input.bool(true, "Show multi-asset portfolio panel", group="Portfolio")
+// Defaults are the walk-forward-tested crypto basket. The 8 slots are filled by
+// LONGEST COINBASE HISTORY -- a performance-blind criterion, chosen so this is not
+// the best-8-of-10. For the record the tested basket was 10 and included ATOM and
+// SOL; ALGO and ATOM both LOST money outright over the test period and the basket
+// still beat holding. Swap any of these freely; the panel changes no signal.
+s1 = input.symbol("COINBASE:BTCUSD",  "Asset 1", group="Portfolio")
+s2 = input.symbol("COINBASE:ETHUSD",  "Asset 2", group="Portfolio")
+s3 = input.symbol("COINBASE:LTCUSD",  "Asset 3", group="Portfolio")
+s4 = input.symbol("COINBASE:BCHUSD",  "Asset 4", group="Portfolio")
+s5 = input.symbol("COINBASE:ETCUSD",  "Asset 5", group="Portfolio")
+s6 = input.symbol("COINBASE:XLMUSD",  "Asset 6", group="Portfolio")
+s7 = input.symbol("COINBASE:LINKUSD", "Asset 7", group="Portfolio")
+s8 = input.symbol("COINBASE:ALGOUSD", "Asset 8", group="Portfolio")
+
+// ── Core rule ─────────────────────────────────────────────────────────────────
+// Stateless equivalent of "long above the upper band, flat below the lower band,
+// hold in between": whichever band was crossed most recently wins. Written this
+// way (rather than a `var` state machine) so the identical logic can be
+// evaluated for OTHER symbols inside request.security() for the portfolio panel.
+isLongState() =>
+    m  = maType == "EMA" ? ta.ema(close, maLen) : ta.sma(close, maLen)
+    bl = ta.barssince(close > m * (1 + bandPct / 100.0))
+    bs = ta.barssince(close < m * (1 - bandPct / 100.0))
+    nz(bl, 999999) < nz(bs, 999999)
+
+ma     = maType == "EMA" ? ta.ema(close, maLen) : ta.sma(close, maLen)
+upper  = ma * (1 + bandPct / 100.0)
+lower  = ma * (1 - bandPct / 100.0)
+isLong = isLongState()
+
+buySignal  = isLong and not isLong[1]
+sellSignal = not isLong and isLong[1]
+
+// ── Volatility regime (display only — never gates a signal) ───────────────────
+logret  = math.log(close / close[1])
+volS    = ta.stdev(logret, volShort)
+volL    = ta.stdev(logret, volLong)
+expanding = volS > volL
+
+// ── Plotting ──────────────────────────────────────────────────────────────────
+plot(ma, "Trend MA", color=color.new(color.gray, 0), linewidth=2)
+upPlot  = plot(upper, "Upper band", color=color.new(color.gray, 70))
+loPlot  = plot(lower, "Lower band", color=color.new(color.gray, 70))
+fill(upPlot, loPlot, color=color.new(color.gray, 92), title="Hysteresis band")
+
+barcolor(isLong ? color.new(color.teal, 40) : color.new(color.gray, 70))
+
+bgcolor(showBg ? (expanding ? color.new(color.orange, 92) : color.new(color.blue, 94)) : na,
+        title="Vol regime (visual only)")
+
+plotshape(buySignal and barstate.isconfirmed, title="BUY", location=location.belowbar,
+          style=shape.labelup, color=color.new(color.teal, 0), textcolor=color.white,
+          text="BUY", size=size.small)
+plotshape(sellSignal and barstate.isconfirmed, title="SELL", location=location.abovebar,
+          style=shape.labeldown, color=color.new(color.red, 0), textcolor=color.white,
+          text="SELL", size=size.small)
+
+// ── Alerts ────────────────────────────────────────────────────────────────────
+alertcondition(buySignal,  title="BUY  — trend turned up",
+               message="Trend Signal: BUY {{ticker}} @ {{close}} (closed above trend band)")
+alertcondition(sellSignal, title="SELL — trend turned down",
+               message="Trend Signal: SELL {{ticker}} @ {{close}} (closed below trend band)")
+
+// ── Portfolio state for the basket (same rule, evaluated per symbol) ──────────
+st1 = request.security(s1, timeframe.period, isLongState())
+st2 = request.security(s2, timeframe.period, isLongState())
+st3 = request.security(s3, timeframe.period, isLongState())
+st4 = request.security(s4, timeframe.period, isLongState())
+st5 = request.security(s5, timeframe.period, isLongState())
+st6 = request.security(s6, timeframe.period, isLongState())
+st7 = request.security(s7, timeframe.period, isLongState())
+st8 = request.security(s8, timeframe.period, isLongState())
+
+longCount = (st1 ? 1 : 0) + (st2 ? 1 : 0) + (st3 ? 1 : 0) + (st4 ? 1 : 0) + (st5 ? 1 : 0) + (st6 ? 1 : 0) + (st7 ? 1 : 0) + (st8 ? 1 : 0)
+
+// ── On-chart status ───────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 13, border_width=1)
+
+// Strip the "EXCHANGE:" prefix off a symbol input for a compact panel label.
+nameOf(s) =>
+    parts = str.split(s, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : s
+
+row(int r, string label, bool lng) =>
+    table.cell(info, 0, r, label, text_color=color.gray, text_size=size.tiny,
+               text_halign=text.align_left)
+    table.cell(info, 1, r, lng ? "LONG" : "cash",
+               bgcolor=lng ? color.new(color.teal, 40) : color.new(color.gray, 70),
+               text_color=color.white, text_size=size.tiny)
+
+if barstate.islast
+    table.cell(info, 0, 0, isLong ? "POSITION: LONG" : "POSITION: CASH",
+               bgcolor=isLong ? color.new(color.teal, 20) : color.new(color.gray, 30),
+               text_color=color.white, text_size=size.normal)
+    table.cell(info, 1, 0, "", bgcolor=isLong ? color.new(color.teal, 20) : color.new(color.gray, 30))
+    table.cell(info, 0, 1, str.format("trend MA({0}) {1,number,#.##}", maLen, ma),
+               text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 1, "", text_size=size.small)
+    table.cell(info, 0, 2, "win rate is LOW by design — judge by PF",
+               text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 2, "", text_size=size.tiny)
+
+    if showPanel
+        table.cell(info, 0, 3, "BASKET  (diversify — the one measured win)",
+                   text_color=color.new(color.white, 20), text_size=size.tiny,
+                   text_halign=text.align_left)
+        table.cell(info, 1, 3, str.format("{0}/8", longCount),
+                   text_color=color.new(color.white, 20), text_size=size.tiny)
+        row(4,  nameOf(s1), st1)
+        row(5,  nameOf(s2), st2)
+        row(6,  nameOf(s3), st3)
+        row(7,  nameOf(s4), st4)
+        row(8,  nameOf(s5), st5)
+        row(9,  nameOf(s6), st6)
+        row(10, nameOf(s7), st7)
+        row(11, nameOf(s8), st8)
+        table.cell(info, 0, 12, "8/8 assets PF>1 out-of-sample · equal-weight Sharpe 1.01",
+                   text_color=color.new(color.gray, 30), text_size=size.tiny,
+                   text_halign=text.align_left)
+        table.cell(info, 1, 12, "", text_size=size.tiny)

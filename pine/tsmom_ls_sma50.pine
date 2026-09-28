@@ -1,0 +1,129 @@
+//@version=6
+//
+// TSMOM LONG/SHORT on SMA(50) — the perp arm, with an honest funding drag
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: tsmom_ls_paper.py (state: data/tsmom_ls_state.json)
+//
+// WHAT IT IS
+//   Always in the market once warm: daily close above SMA(50) -> LONG,
+//   below -> SHORT, 1x notional. This is the long/short decomposition that
+//   scripts/short_leg_value.py measured. The long-only arms can only go to CASH
+//   in a downtrend; this one is the arm that answers "is it worth wiring up the
+//   ability to short at all?"
+//
+// WHAT THE RESEARCH ACTUALLY SAID — DO NOT READ THIS AS A GREEN LIGHT
+//   The short leg added +$874 on the blended book, BUT it was ETH-CARRIED and
+//   fragile: SOL's short leg LOSES. It survives funding only up to ~25% APY.
+//   Separately, scripts/ls_momentum_research.py later tested long/short momentum
+//   directly under the hypothesis "shorting is the unlock" and the short leg LOST
+//   in EVERY configuration (squeezes plus funding). The honest reading is that the
+//   bear-market profit was substantially an ETH fluke.
+//   See memory `short_leg_value_verdict` and `ls_momentum_short_leg_loses`.
+//   This arm exists to PROVE OR KILL the short side on the live clock before any
+//   real perp money — not because the short side is believed to work.
+//
+// EXECUTABILITY
+//   A US Kraken-SPOT account cannot short. This is a PAPER perp simulation. Kraken
+//   US perps (via Bitnomial) are not integrated in the bot. Treat every short bar
+//   on this chart as hypothetical.
+//
+// THE FUNDING DRAG — AND A TRADINGVIEW LIMITATION YOU MUST KNOW ABOUT
+//   The runner charges a conservative 10% APY funding drag on notional for the
+//   whole holding period, on BOTH sides (a directional perp does not always PAY
+//   funding, so charging it always is deliberately pessimistic).
+//   TradingView's Strategy Tester has NO concept of a time-based carry cost, so
+//   its "Net Profit" WILL BE TOO GENEROUS. This script therefore tracks the drag
+//   itself and plots an "equity net of funding" curve in a separate pane. Judge
+//   that curve, not the Strategy Tester headline. The gap between the two is
+//   exactly what a perp costs you to hold.
+//
+strategy("TSMOM L/S SMA50 (paper perp)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 1000,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.075,      // 0.15% round trip (perp taker + slippage) = 0.075%/side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── inputs (defaults mirror TSMOM_LS_* env knobs) ─────────────────────────────
+smaN       = input.int(50,  "SMA length  (TSMOM_LS_SMA)", minval = 2, group = "Signal")
+band       = input.float(0.0, "Hysteresis band %  (TSMOM_LS_BAND)", minval = 0.0, step = 0.1,
+     group = "Signal",
+     tooltip = "Default 0 is FAITHFUL to short_leg_value.py. Raising it reduces flips " +
+               "but departs from the measured spec.") / 100.0
+allowShort = input.bool(true, "Allow the short leg", group = "Signal",
+     tooltip = "Turn OFF to see the long-only decomposition on the same chart — " +
+               "the difference between the two curves IS the short leg's contribution, " +
+               "which is the whole question this arm asks.")
+useHTF     = input.bool(true, "Force daily bars regardless of chart timeframe", group = "Signal")
+
+fundingApy = input.float(10.0, "Funding drag, % APY  (TSMOM_LS_FUNDING_APY)",
+     minval = 0.0, step = 1.0, group = "Costs",
+     tooltip = "Charged on notional for the full holding period, on BOTH sides. " +
+               "The research found the short leg survives only up to ~25% APY — " +
+               "set it to 25 to see the edge disappear.") / 100.0
+
+// ── data ──────────────────────────────────────────────────────────────────────
+src = useHTF ? request.security(syminfo.tickerid, "D", close,
+                   lookahead = barmerge.lookahead_off) : close
+sma = useHTF ? request.security(syminfo.tickerid, "D", ta.sma(close, smaN),
+                   lookahead = barmerge.lookahead_off) : ta.sma(close, smaN)
+
+warm  = not na(sma)
+upper = sma * (1 + band)
+lower = sma * (1 - band)
+
+var int pos = 0
+if warm
+    if src > upper
+        pos := 1
+    else if src < lower
+        pos := allowShort ? -1 : 0
+    // else hold
+
+goLong  = warm and pos ==  1 and pos[1] !=  1
+goShort = warm and pos == -1 and pos[1] != -1
+goFlat  = warm and pos ==  0 and pos[1] !=  0
+
+if goLong
+    strategy.entry("LONG", strategy.long)
+if goShort
+    strategy.entry("SHORT", strategy.short)
+if goFlat
+    strategy.close_all(comment = "flat")
+
+// ── funding drag, accrued per bar while in a position ─────────────────────────
+// Bars-per-year for the timeframe actually being charged (daily spec).
+barsPerYear = 365.0
+perBar      = fundingApy / barsPerYear
+var float cumFunding = 0.0
+if strategy.position_size != 0
+    cumFunding += math.abs(strategy.position_size) * close * perBar
+
+equityNetOfFunding = strategy.equity - cumFunding
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(sma, "SMA50", color = color.new(color.orange, 0), linewidth = 2)
+barcolor(pos == 1 ? color.new(color.teal, 40) : pos == -1 ? color.new(color.red, 40)
+                                              : color.new(color.gray, 60))
+plotshape(goLong,  "LONG",  style = shape.labelup,   location = location.belowbar,
+     color = color.new(color.teal, 0), text = "L", textcolor = color.white, size = size.tiny)
+plotshape(goShort, "SHORT", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.red, 0),  text = "S", textcolor = color.white, size = size.tiny)
+
+var table t = table.new(position.top_right, 2, 3, border_width = 1)
+if barstate.islast
+    table.cell(t, 0, 0, "position", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "flat", text_size = size.small,
+         text_color = pos == 1 ? color.teal : pos == -1 ? color.red : color.gray)
+    table.cell(t, 0, 1, "funding paid (cum)", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, "$" + str.tostring(cumFunding, "#.##"), text_color = color.maroon, text_size = size.small)
+    table.cell(t, 0, 2, "equity NET of funding", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, "$" + str.tostring(equityNetOfFunding, "#.##"),
+         text_color = equityNetOfFunding >= strategy.initial_capital ? color.teal : color.maroon,
+         text_size = size.small)
+
+alertcondition(goLong,  "TSMOM L/S: LONG",  "TSMOM L/S {{ticker}}: flip LONG")
+alertcondition(goShort, "TSMOM L/S: SHORT", "TSMOM L/S {{ticker}}: flip SHORT")

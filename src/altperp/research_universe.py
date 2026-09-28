@@ -39,6 +39,14 @@ async def _dump(top_n: int, days: int):
     try:
         res = await dc._get("/v5/market/tickers", {"category": "linear"})
         rows = (res or {}).get("list", [])
+        # ⚠ "Top-N by 24h turnover" on an unregulated venue is the textbook
+        # wash-trading exposure: >70% of reported volume on such exchanges is wash
+        # traded (SSRN 3530220), so this ranking selects partly on who fakes the
+        # most, not on who is most liquid. Any result produced from a universe
+        # picked this way inherits the flaw uniformly — which is the one class of
+        # defect robustness checks cannot detect. Research tool only; do not
+        # promote a universe chosen here into a live arm without re-ranking on a
+        # regulated venue's volume.
         usdt = [(r["symbol"], float(r.get("turnover24h", 0) or 0))
                 for r in rows if r["symbol"].endswith("USDT")]
         usdt.sort(key=lambda x: -x[1])

@@ -162,16 +162,28 @@ class LiveTrader:
                             f"available from entryPrice/markPrice or ticker fallback — refusing "
                             f"to silently drop it, which could open a duplicate position."
                         )
+                    size_usd = size * price
                     self.positions[sym] = LivePosition(
                         symbol=sym,
                         entry_time=datetime.now(timezone.utc),
                         entry_price=price,
                         size=size,
-                        size_usd=size * price,
+                        size_usd=size_usd,
                         order_id='reconciled',
                         stop_loss_price=price * 0.98,   # 2% default SL
                         take_profit_price=price * 1.03,
                     )
+                    # get_summary()'s total_equity = initial_capital + total_pnl +
+                    # unrealized_pnl. For a position opened THIS session that
+                    # invariant holds because initial_capital was captured before
+                    # the position existed, so the cash it consumed is already
+                    # baked in. A reconciled position predates that snapshot —
+                    # get_balance() (free USD) never included capital already
+                    # parked in it — so without this adjustment its principal
+                    # would be missing from every equity figure (dashboard state,
+                    # daily-loss baseline, session-end notification) until the
+                    # position closes and total_pnl catches up.
+                    self.account.initial_capital += size_usd
                     logger.warning(f"[RECONCILE] Found untracked position: {sym} {size:.6f} @ ${price:.2f} — added with default SL/TP")
 
         # Remove positions bot thinks are open but exchange doesn't

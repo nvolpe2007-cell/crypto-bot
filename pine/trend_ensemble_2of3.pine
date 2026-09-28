@@ -1,0 +1,114 @@
+//@version=6
+//
+// BTC trend ENSEMBLE — 2-of-3 vote, long/cash
+// ──────────────────────────────────────────────────────────────────────────────
+// PORT OF: trend_ensemble_paper.py (state: data/trend_ensemble_state.json,
+//          judged by proof_scorecard._trend_ensemble_forward)
+//
+// WHAT IT IS
+//   Three ordinary trend legs vote at each daily close; long when at least two
+//   agree, cash otherwise:
+//       1. close > SMA(100)
+//       2. close > SMA(200)
+//       3. close > close[90]        (90-day momentum)
+//
+// WHY A VOTE INSTEAD OF ONE GOOD PARAMETER — THE POINT OF THE ARM
+//   In the 5-year backtest SMA(200) ALONE tested better (+187% vs the ensemble's
+//   +141%). It was also the best cell of a sweep, which is exactly the number you
+//   should not trust. The ensemble's diversification ACROSS lookbacks is the
+//   whipsaw filter, and it leaves no single magic parameter to overfit. Choosing
+//   the ensemble over the better-looking single SMA is the robust choice, made
+//   deliberately and written down before the arm's first forward trade
+//   (2026-07-02, see RESEARCH_2026-07-01_btc_patterns_and_leverage.md).
+//
+// MEASURED (Coinbase daily 2021->2026, 0.3% round-trip cost)
+//   +141% vs BTC buy & hold's +33%; max drawdown -27% vs -67%; ~44 flips.
+//   HONEST CAVEATS: one window, bull-heavy in its last two years; at ~8-10 flips
+//   a year the n>=30 bar is a 3-4 year clock. Until then the verdict is
+//   qualitative (does it track upside and clip drawdowns?), not a t-test.
+//
+// A GATE THAT WAS TESTED AND DELIBERATELY LEFT OUT
+//   A CVD/OFI order-flow gate tested NEUTRAL on BTC (-6 pts return, -2 pts
+//   drawdown) and is omitted here. It only earned its keep on ETH/SOL. Absence
+//   is a measurement, not an oversight.
+//
+strategy("BTC trend ensemble 2-of-3 (long/cash)", overlay = true,
+     default_qty_type      = strategy.percent_of_equity,
+     default_qty_value     = 100,
+     initial_capital       = 1000,
+     commission_type       = strategy.commission.percent,
+     commission_value      = 0.27,       // 0.54% round trip = 0.27% per side
+     process_orders_on_close = true,
+     calc_on_every_tick    = false,
+     pyramiding            = 0)
+
+// ── inputs (defaults mirror TREND_ENS_* env knobs) ────────────────────────────
+smaFast   = input.int(100, "Vote 1: SMA fast   (TREND_ENS_SMA_FAST)", minval = 2, group = "Votes")
+smaSlow   = input.int(200, "Vote 2: SMA slow   (TREND_ENS_SMA_SLOW)", minval = 2, group = "Votes")
+momN      = input.int(90,  "Vote 3: momentum lookback  (TREND_ENS_MOM)", minval = 1, group = "Votes")
+votesNeed = input.int(2,   "Votes required to be long  (TREND_ENS_VOTES)", minval = 1, maxval = 3,
+     group = "Votes",
+     tooltip = "3 makes it a unanimous-consent rule (fewer, later entries); " +
+               "1 makes it an any-leg rule (many more whipsaws). 2 is the spec.")
+useHTF    = input.bool(true, "Force daily bars regardless of chart timeframe", group = "Votes")
+
+// ── data ──────────────────────────────────────────────────────────────────────
+src  = useHTF ? request.security(syminfo.tickerid, "D", close,
+                    lookahead = barmerge.lookahead_off) : close
+sF   = useHTF ? request.security(syminfo.tickerid, "D", ta.sma(close, smaFast),
+                    lookahead = barmerge.lookahead_off) : ta.sma(close, smaFast)
+sS   = useHTF ? request.security(syminfo.tickerid, "D", ta.sma(close, smaSlow),
+                    lookahead = barmerge.lookahead_off) : ta.sma(close, smaSlow)
+ref  = useHTF ? request.security(syminfo.tickerid, "D", close[momN],
+                    lookahead = barmerge.lookahead_off) : close[momN]
+
+warm = not na(sF) and not na(sS) and not na(ref)
+
+v1 = warm and src > sF
+v2 = warm and src > sS
+v3 = warm and src > ref
+votes = (v1 ? 1 : 0) + (v2 ? 1 : 0) + (v3 ? 1 : 0)
+
+var int pos = 0
+if warm
+    pos := votes >= votesNeed ? 1 : 0
+
+flipLong = warm and pos == 1 and pos[1] != 1
+flipFlat = warm and pos == 0 and pos[1] != 0
+
+if flipLong
+    strategy.entry("LONG", strategy.long)
+if flipFlat
+    strategy.close("LONG", comment = "to cash")
+
+// ── plotting ──────────────────────────────────────────────────────────────────
+plot(sF, "SMA fast", color = color.new(color.orange, 0),  linewidth = 2)
+plot(sS, "SMA slow", color = color.new(color.purple, 0),  linewidth = 2)
+barcolor(pos == 1 ? color.new(color.teal, 40) : color.new(color.gray, 60))
+bgcolor(pos == 1 ? color.new(color.teal, 93) : na, title = "In position")
+
+plotshape(flipLong, "BUY",  style = shape.labelup,   location = location.belowbar,
+     color = color.new(color.teal, 0),   text = "BUY",  textcolor = color.white, size = size.tiny)
+plotshape(flipFlat, "CASH", style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.maroon, 0), text = "CASH", textcolor = color.white, size = size.tiny)
+
+// Vote tally panel — shows which legs carry the current state.
+var table t = table.new(position.top_right, 2, 5, border_width = 1)
+f_mark(bool b) => b ? "YES" : "no"
+f_col(bool b)  => b ? color.teal : color.maroon
+if barstate.islast
+    table.cell(t, 0, 0, "close > SMA" + str.tostring(smaFast), text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 0, f_mark(v1), text_color = f_col(v1), text_size = size.small)
+    table.cell(t, 0, 1, "close > SMA" + str.tostring(smaSlow), text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, f_mark(v2), text_color = f_col(v2), text_size = size.small)
+    table.cell(t, 0, 2, "close > close[" + str.tostring(momN) + "]", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, f_mark(v3), text_color = f_col(v3), text_size = size.small)
+    table.cell(t, 0, 3, "tally", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(votes) + " / " + str.tostring(votesNeed) + " needed",
+         text_color = color.gray, text_size = size.small)
+    table.cell(t, 0, 4, "position", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 4, pos == 1 ? "LONG" : "CASH", text_size = size.small,
+         text_color = pos == 1 ? color.teal : color.gray)
+
+alertcondition(flipLong, "Ensemble: go LONG", "Ensemble {{ticker}}: votes reached threshold -> LONG")
+alertcondition(flipFlat, "Ensemble: go CASH", "Ensemble {{ticker}}: votes fell below threshold -> CASH")

@@ -75,6 +75,12 @@ def evaluate(coin: str,
         return s
 
     # ── Setup B — Post-Liquidation Flush Long (secondary) ────────────────────
+    # NOTE: `volume_spike` is a REQUIRED conjunct here, and it is computed from
+    # Bybit-reported volume — an unregulated-tier venue for wash-trading purposes.
+    # See the provenance warning in runner.py where it is computed. This gate is the
+    # single most wash-trading-exposed decision in the repo; altperp is currently
+    # shelved (config.yaml altperp.enabled: false), so it is a latent trap rather
+    # than a live one.
     tier1_long = oi.get("long_flush") and funding.get("funding_collapsed") and volume_spike
     if tier1_long:
         s.tier1_ok = True

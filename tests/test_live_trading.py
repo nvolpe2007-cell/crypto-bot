@@ -289,6 +289,24 @@ class TestReconcilePositions:
         asyncio.run(trader.reconcile_positions())
         assert "DOGE/USD" not in trader.positions
 
+    def test_untracked_position_principal_included_in_equity(self):
+        """get_balance() (free USD) is fetched BEFORE reconcile_positions() runs
+        and never included capital already parked in a pre-existing position, so
+        initial_capital must absorb that position's principal here — otherwise
+        get_summary()'s total_equity (initial_capital + total_pnl + unrealized)
+        silently drops it until the position closes and total_pnl catches up."""
+        trader = _make_trader(initial_capital=1000.0)  # free USD only, e.g. after a restart
+        trader.exchange.get_positions = AsyncMock(return_value=[
+            {"symbol": "BTC/USD", "contracts": 0.002, "entryPrice": 50_000.0}
+        ])
+        asyncio.run(trader.reconcile_positions())
+
+        assert trader.account.initial_capital == pytest.approx(1000.0 + 0.002 * 50_000.0)
+        # No price move yet (unrealized_pnl defaults to 0.0) — equity must equal
+        # free cash + the reconciled position's value, not free cash alone.
+        s = trader.get_summary()
+        assert s["total_equity"] == pytest.approx(1100.0)
+
 
 # ── open_long ────────────────────────────────────────────────────────────────────
 

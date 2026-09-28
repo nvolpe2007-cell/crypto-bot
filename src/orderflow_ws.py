@@ -188,8 +188,9 @@ class OrderFlowWS:
         Returns _STALE_SECS if no data has arrived yet.
         """
         now = time.time()
-        cvd_age  = now - self._cvd_updated.get(symbol, 0)
-        book_age = now - self._book_updated.get(symbol, 0)
+        never = now - _STALE_SECS
+        cvd_age  = now - self._cvd_updated.get(symbol, never)
+        book_age = now - self._book_updated.get(symbol, never)
         return max(cvd_age, book_age)
 
     def is_data_fresh(self, symbol: str, max_age: float = 30.0) -> bool:
