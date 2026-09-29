@@ -255,6 +255,18 @@ def _regime_short_block(ctx: CheckContext):
     return True, ctx.regime_name
 
 
+def _regime_long_block(ctx: CheckContext):
+    """Hard veto: refuse a new long while the regime is adverse for longs.
+    Mirrors _regime_short_block's TRENDING_UP veto on shorts. CRASH and
+    TRENDING_DOWN are exactly regime_detector.RegimeResult.allows_long's
+    definition of "does not allow long" — that predicate already exists but
+    was never wired into a gate, so a long could previously be opened mid-crash
+    as long as it cleared min_confidence and the soft-score threshold."""
+    if ctx.regime_name in ("CRASH", "TRENDING_DOWN"):
+        return False, f"{ctx.regime_name} blocks longs"
+    return True, ctx.regime_name
+
+
 # Multiplier above the rolling-median spread at which entries get vetoed.
 # 1.5× is the textbook setting from the algo-spread-monitor literature;
 # tightening to 1.3× or 1.2× refuses more trades during turbulent tape.
@@ -418,6 +430,7 @@ def build_long_checklist(*, soft_threshold: float = 0.4) -> Checklist:
         Check("ws_fresh",          "hard", _ws_fresh),
         Check("max_positions",    "hard", _max_positions),
         Check("ofi_aligned",       "hard", _ofi_aligned),
+        Check("regime_long_block", "hard", _regime_long_block),
         Check("sentiment",         "hard", _sentiment),
         Check("kill_filter",       "hard", _kill_filter),
         Check("atr_alive",         "hard", _atr_alive),
