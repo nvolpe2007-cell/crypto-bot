@@ -11,7 +11,8 @@ Checklist aggregator correctly:
 Covers:
   Hard checks: min_confidence, circuit_breaker, cooldown, bar_dedup,
                ws_fresh, max_positions, ofi_aligned, sentiment,
-               kill_filter, atr_alive, regime_short_block (shorts only)
+               kill_filter, atr_alive, regime_short_block (shorts only),
+               regime_long_block (longs only)
   Soft checks: rsi_healthy, adx_strong, volume_strong, lead_lag_aligned,
                funding_favorable
   Factories: build_long_checklist, build_short_checklist
@@ -27,7 +28,7 @@ from src.entry_checklist import (
     build_long_checklist, build_short_checklist,
     _min_confidence, _circuit_breaker, _cooldown, _bar_dedup,
     _ws_fresh, _max_positions, _ofi_aligned, _sentiment,
-    _kill_filter, _regime_short_block, _rsi_healthy, _adx_strong,
+    _kill_filter, _regime_short_block, _regime_long_block, _rsi_healthy, _adx_strong,
     _volume_strong, _atr_alive, _lead_lag_aligned, _funding_favorable,
     _spread_normal, _vpin_safe, _session_favorable, SpreadTracker, SPREAD_MAX_MULT,
     _ATR_ALIVE_FLOOR,
@@ -349,6 +350,32 @@ class TestRegimeShortBlock:
 
     def test_allows_shorts_in_volatile(self):
         ok, _ = _regime_short_block(_ctx(regime_name="VOLATILE"))
+        assert ok is True
+
+
+# ── Hard check: regime_long_block (longs only) ────────────────────────────────
+
+class TestRegimeLongBlock:
+    def test_blocks_longs_in_crash(self):
+        ok, reason = _regime_long_block(_ctx(regime_name="CRASH"))
+        assert ok is False
+        assert "CRASH" in reason
+
+    def test_blocks_longs_in_trending_down(self):
+        ok, reason = _regime_long_block(_ctx(regime_name="TRENDING_DOWN"))
+        assert ok is False
+        assert "TRENDING_DOWN" in reason
+
+    def test_allows_longs_in_ranging(self):
+        ok, _ = _regime_long_block(_ctx(regime_name="RANGING"))
+        assert ok is True
+
+    def test_allows_longs_in_trending_up(self):
+        ok, _ = _regime_long_block(_ctx(regime_name="TRENDING_UP"))
+        assert ok is True
+
+    def test_allows_longs_in_volatile(self):
+        ok, _ = _regime_long_block(_ctx(regime_name="VOLATILE"))
         assert ok is True
 
 
@@ -695,6 +722,29 @@ class TestBuildLongChecklist:
         names = [c.name for c in cl.checks]
         assert "regime_short_block" not in names
 
+    def test_has_regime_long_block(self):
+        cl = build_long_checklist()
+        names = [c.name for c in cl.checks]
+        assert "regime_long_block" in names
+
+    def test_regime_long_block_is_hard(self):
+        cl = build_long_checklist()
+        check = next(c for c in cl.checks if c.name == "regime_long_block")
+        assert check.kind == "hard"
+
+    def test_blocks_crash_long(self):
+        cl = build_long_checklist()
+        ctx = _ctx(side="buy", regime_name="CRASH")
+        result = cl.run(ctx)
+        assert result.passed is False
+        assert "regime_long_block" in result.failed_hard
+
+    def test_allows_long_in_ranging(self):
+        cl = build_long_checklist()
+        ctx = _ctx(side="buy", regime_name="RANGING")
+        result = cl.run(ctx)
+        assert "regime_long_block" not in result.failed_hard
+
     def test_soft_threshold_default_is_sensible(self):
         cl = build_long_checklist()
         assert 0.0 < cl.soft_threshold <= 1.0
@@ -706,8 +756,8 @@ class TestBuildLongChecklist:
     def test_all_hard_checks_are_hard(self):
         cl = build_long_checklist()
         hard_names = {"min_confidence", "circuit_breaker", "cooldown", "bar_dedup",
-                      "ws_fresh", "max_positions", "ofi_aligned", "sentiment",
-                      "kill_filter", "atr_alive", "spread_normal", "vpin_safe"}
+                      "ws_fresh", "max_positions", "ofi_aligned", "regime_long_block",
+                      "sentiment", "kill_filter", "atr_alive", "spread_normal", "vpin_safe"}
         for c in cl.checks:
             if c.name in hard_names:
                 assert c.kind == "hard", f"{c.name} should be hard"
@@ -728,6 +778,11 @@ class TestBuildShortChecklist:
         cl = build_short_checklist()
         names = [c.name for c in cl.checks]
         assert "regime_short_block" in names
+
+    def test_does_not_have_regime_long_block(self):
+        cl = build_short_checklist()
+        names = [c.name for c in cl.checks]
+        assert "regime_long_block" not in names
 
     def test_regime_short_block_is_hard(self):
         cl = build_short_checklist()
