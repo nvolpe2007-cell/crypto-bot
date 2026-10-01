@@ -315,7 +315,46 @@ class LiveTrader:
                 self.notifier.send_error(f"SELL FAILED {symbol} @ ${current_price:.2f} — {e} — close manually on Kraken!")
             return None
 
+        # Verify fill — mirror open_long()'s check. Kraken market orders can
+        # return status='' on the initial response before the fill is fully
+        # processed; without this, an unconfirmed sell would still delete the
+        # position below, leaving _sltp_watcher() no longer protecting a
+        # position that may still be live on Kraken.
+        status     = order.get('status', '')
         exec_price = float(order.get('average') or order.get('price') or current_price)
+        order_id   = order.get('id', '')
+
+        if status == '' and order_id:
+            logger.warning(
+                f"[LIVE] Sell order {order_id} returned empty status — polling for fill confirmation"
+            )
+            try:
+                polled     = await self.exchange.fetch_order(order_id, symbol)
+                status     = polled.get('status', '')
+                polled_price = float(polled.get('average') or polled.get('price') or 0)
+                if polled_price > 0:
+                    exec_price = polled_price
+                polled_fee = float((polled.get('fee') or {}).get('cost', 0))
+                if polled_fee > 0:
+                    order = {**order, 'fee': {'cost': polled_fee}}
+            except Exception as e:
+                logger.warning(
+                    f"[LIVE] fetch_order({order_id}) failed during sell verify: {e} "
+                    f"— treating empty status as unconfirmed"
+                )
+                status = 'unknown'
+
+        if status not in ('closed', 'filled'):
+            logger.error(
+                f"[LIVE] Sell order {order_id} status={status!r} — not confirmed filled, "
+                f"keeping position open (will be retried; sltp_watcher keeps protecting it)"
+            )
+            if self.notifier:
+                self.notifier.send_error(
+                    f"{symbol} sell order {order_id} status {status!r} — check Kraken manually"
+                )
+            return None
+
         exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
         self.account.total_fees += exit_fee
 

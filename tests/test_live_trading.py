@@ -764,6 +764,126 @@ class TestCloseLong:
         assert trade.pnl_pct < 0  # must agree in sign with pnl, not report a gross +2%
 
 
+class TestCloseLongStatusVerification:
+    """close_long() must verify the sell actually filled before deleting the
+    position, mirroring open_long()'s TestOpenLongStatusVerification — an
+    unconfirmed sell must NOT be treated as a closed position, since
+    _sltp_watcher() stops protecting anything no longer in trader.positions."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _setup_position(self, trader, symbol="BTC/USD", entry_price=50_000.0,
+                        size=0.001, size_usd=50.0, entry_fee=0.0):
+        sig = _make_signal(close=entry_price)
+        trader.positions[symbol] = LivePosition(
+            symbol=symbol,
+            entry_time=datetime.now(timezone.utc),
+            entry_price=entry_price,
+            size=size,
+            size_usd=size_usd,
+            order_id="entry-order",
+            stop_loss_price=entry_price * 0.98,
+            take_profit_price=entry_price * 1.03,
+            entry_signal=sig,
+            entry_fee=entry_fee,
+        )
+
+    def test_closed_status_does_not_call_fetch_order(self):
+        """An explicit 'closed' status is unambiguous — no poll needed."""
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 51_000.0,
+            "fee": {"cost": 0.13},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade is not None
+        trader.exchange.fetch_order.assert_not_called()
+
+    def test_empty_status_calls_fetch_order_for_verification(self):
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "", "average": 51_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "closed",
+            "average": 51_000.0, "fee": {"cost": 0.13},
+        })
+        self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        trader.exchange.fetch_order.assert_called_once_with("exit-pending", "BTC/USD")
+
+    def test_empty_status_confirmed_by_poll_closes_position(self):
+        """When fetch_order() confirms the fill, the position must still be
+        closed out (trade recorded, position removed) — same as before this
+        fix, just with the poll in between."""
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "", "average": 0.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "closed",
+            "average": 51_000.0, "fee": {"cost": 0.13},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade is not None
+        assert trade.exit_price == pytest.approx(51_000.0)
+        assert "BTC/USD" not in trader.positions
+        assert len(trader.account.closed_trades) == 1
+
+    def test_empty_status_still_empty_after_poll_keeps_position_open(self):
+        """If the sell is still unconfirmed after polling, the position must
+        stay in trader.positions (so sltp_watcher keeps protecting it) and no
+        Trade/PnL may be recorded from a fill that may not have happened."""
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "", "average": 51_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "", "average": 51_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade is None
+        assert "BTC/USD" in trader.positions
+        assert len(trader.account.closed_trades) == 0
+        assert trader.account.total_pnl == 0.0
+
+    def test_empty_status_fetch_order_exception_keeps_position_open(self):
+        """If fetch_order() itself raises, treat the fill as unconfirmed —
+        don't assume success and wipe the position."""
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "", "average": 51_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trader.exchange.fetch_order = AsyncMock(side_effect=RuntimeError("timeout"))
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade is None
+        assert "BTC/USD" in trader.positions
+
+    def test_open_status_still_rejected_without_poll(self):
+        """A non-empty but non-terminal status ('open') must not be treated
+        as filled, and must not trigger a poll (only empty status does)."""
+        trader = _make_trader()
+        self._setup_position(trader)
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit-pending", "status": "open", "average": 51_000.0,
+            "fee": {"cost": 0.0},
+        })
+        trade = self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+        assert trade is None
+        assert "BTC/USD" in trader.positions
+        trader.exchange.fetch_order.assert_not_called()
+
+
 # ── update_unrealized ─────────────────────────────────────────────────────────────
 
 class TestUpdateUnrealized:
