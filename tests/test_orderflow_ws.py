@@ -126,6 +126,34 @@ class TestDataAgeSecs:
         assert age == pytest.approx(5.0, abs=1.0)
 
 
+class TestGetSpreadPct:
+    """Regression coverage for the fraction-vs-percentage scale mismatch:
+    get_spread_pct() must return a FRACTION (0.0008), matching every other
+    `*_pct` field this lane actually consumes (entry_checklist.py's
+    CheckContext.current_spread_pct/median_spread_pct, SpreadTracker.push()),
+    not an actual percentage (0.08). No call sites exist yet, so nothing
+    live depended on the old, 100x-too-large value — this just stops the
+    first future caller from inheriting it silently."""
+
+    def test_returns_fraction_not_percentage(self):
+        ofw = _make_ofw()
+        ofw._book["BTC/USD"] = {"bids": {99.0: 1.0}, "asks": {101.0: 1.0}}
+        ofw._book_updated["BTC/USD"] = time.time()
+        # mid=100, spread=2 → 2/100 = 0.02 as a fraction, NOT 2.0 as a pct.
+        assert ofw.get_spread_pct("BTC/USD") == pytest.approx(0.02)
+
+    def test_returns_none_when_book_is_stale(self):
+        from src.orderflow_ws import _STALE_SECS
+        ofw = _make_ofw()
+        ofw._book["BTC/USD"] = {"bids": {99.0: 1.0}, "asks": {101.0: 1.0}}
+        ofw._book_updated["BTC/USD"] = time.time() - _STALE_SECS - 1
+        assert ofw.get_spread_pct("BTC/USD") is None
+
+    def test_returns_none_when_no_book_data(self):
+        ofw = _make_ofw()
+        assert ofw.get_spread_pct("BTC/USD") is None
+
+
 class TestConfirmsBuySell:
     def test_confirms_buy_fail_open_when_no_data(self):
         ofw = _make_ofw()
