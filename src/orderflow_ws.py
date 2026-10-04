@@ -198,7 +198,16 @@ class OrderFlowWS:
         return self.data_age_secs(symbol) <= max_age
 
     def get_spread_pct(self, symbol: str) -> Optional[float]:
-        """Best-ask minus best-bid as % of mid price. None if book data is stale."""
+        """Best-ask minus best-bid as a FRACTION of mid price (e.g. 0.0008 =
+        8bp) — despite the name, this matches every other `*_pct` field in
+        the directional lane (CheckContext.current_spread_pct/
+        median_spread_pct and SpreadTracker.push() in entry_checklist.py are
+        fractions too, not percentages). Do NOT multiply by 100: this method
+        has no call sites yet, and a prior run flagged that it returned an
+        actual percentage here while every consumer in the lane expects a
+        fraction — a 100x scale mismatch that would silently defeat
+        SPREAD_MAX_MULT the moment something wires this in. None if book
+        data is stale."""
         if time.time() - self._book_updated.get(symbol, 0) > _STALE_SECS:
             return None
         book = self._book.get(symbol, {})
@@ -211,7 +220,7 @@ class OrderFlowWS:
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
             return None
-        return (best_ask - best_bid) / mid * 100
+        return (best_ask - best_bid) / mid
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
