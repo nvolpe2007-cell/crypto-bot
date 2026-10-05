@@ -26,6 +26,7 @@ import pandas as pd
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
+from .entry_checklist import _ATR_ALIVE_FLOOR
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
 from .exchange import ExchangeConnection, CircuitBreakerOpen
@@ -681,6 +682,12 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                         and not killed and not daily_loss_halted):
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
                         continue
+                    if not _atr_alive(sig):
+                        logger.debug(
+                            f"[LIVE] {symbol} skip entry — atr/px below cost "
+                            f"floor {_ATR_ALIVE_FLOOR*100:.2f}% (dead volatility)"
+                        )
+                        continue
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
                     if size_usd < 5.0:
@@ -798,6 +805,25 @@ async def start_live_session(exchange, symbols, timeframe, notifier, sentiment,
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _atr_alive(sig: ScientificSignal) -> bool:
+    """Cost-aware volatility floor for the LIVE (real-money) entry path.
+
+    paper_trading routes every entry through entry_checklist's `atr_alive`
+    hard veto, which refuses a setup whose expected per-bar move (ATR) is
+    below the round-trip cost — a structurally negative-EV trade that can
+    only bleed out via fees (see CLAUDE.md "Core principle"). live_trading
+    has never run that check: it gates entries on confidence alone, so a
+    real-money order can fire in dead-volatility conditions paper already
+    knows to refuse. Mirrors entry_checklist._atr_alive exactly, including
+    its fail-open behavior when ATR/price data is unavailable.
+    """
+    atr = getattr(sig, 'atr', None)
+    px  = getattr(sig, 'close', None)
+    if not atr or not px:
+        return True
+    return (atr / px) >= _ATR_ALIVE_FLOOR
+
 
 def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
     """Ratchet pos.stop_loss_price up as price makes new highs (chandelier exit) —
