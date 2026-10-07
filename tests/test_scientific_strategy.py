@@ -371,6 +371,45 @@ class TestScientificStrategyEvaluate:
         if result.signal == Signal.HOLD:
             assert result.size_mult == 0.0
 
+    # ── regime+ADX candidate-generation symmetry ───────────────────────────────
+    #
+    # _has_sell_signal() forces a SELL candidate on TRENDING_DOWN + ADX>22 alone
+    # (no OFI/lead-lag/EMA-cross/RSI needed). _has_buy_signal() must do the same
+    # for TRENDING_UP, per the comment above both: "This ensures we find shorts
+    # in downtrends and longs in uptrends". All other signals are pinned neutral
+    # via monkeypatch so only the regime+ADX clause can produce a direction.
+
+    def _eval_regime_adx_only(self, monkeypatch, regime, adx_value=30.0):
+        import src.scientific_strategy as ss_mod
+
+        def _flat_ema(series, length=9, **_):
+            return pd.Series(np.full(len(series), 100.0), index=series.index)
+
+        def _flat_rsi(series, length=14, **_):
+            return pd.Series(np.full(len(series), 50.0), index=series.index)
+
+        def _flat_adx(high, low, close, length=14, **_):
+            return pd.DataFrame(
+                {f"ADX_{length}": np.full(len(close), adx_value)}, index=close.index
+            )
+
+        monkeypatch.setattr(ss_mod.ta, "ema", _flat_ema)
+        monkeypatch.setattr(ss_mod.ta, "rsi", _flat_rsi)
+        monkeypatch.setattr(ss_mod.ta, "adx", _flat_adx)
+
+        return self._eval(_make_df(n=100), ofi=0.0, lead_dir=None, regime=regime)
+
+    def test_trending_down_high_adx_forces_sell_with_no_other_signal(self, monkeypatch):
+        result = self._eval_regime_adx_only(monkeypatch, regime="TRENDING_DOWN")
+        assert result is not None
+        assert result.signal == Signal.SELL
+
+    def test_trending_up_high_adx_forces_buy_with_no_other_signal(self, monkeypatch):
+        """Mirror of the TRENDING_DOWN case above — was HOLD before the fix."""
+        result = self._eval_regime_adx_only(monkeypatch, regime="TRENDING_UP")
+        assert result is not None
+        assert result.signal == Signal.BUY
+
     # ── confidence scoring mechanics ───────────────────────────────────────────
 
     def test_aligned_ofi_raises_confidence_vs_neutral(self):
