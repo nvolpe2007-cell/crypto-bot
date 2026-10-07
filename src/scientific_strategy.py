@@ -222,6 +222,11 @@ class ScientificStrategy:
             if lead_dir == 'BUY':      return True
             if ema_cross_up:           return True
             if rsi_v < 32:             return True
+            # Mirror of the TRENDING_DOWN sell clause below — without this,
+            # a strong uptrend only reaches a BUY candidate when OFI/lead-lag/
+            # EMA/RSI happen to agree, while an equally strong downtrend always
+            # gets a SELL candidate from regime alone.
+            if regime == 'TRENDING_UP' and adx_v > 22: return True
             return False
 
         def _has_sell_signal() -> bool:
