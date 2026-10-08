@@ -17,7 +17,10 @@ Covers:
 
 import pytest
 from datetime import datetime
-from src.paper_trading import PaperTrader, PaperPosition, _SubsystemFailureTracker
+from src.indicators import Signal
+from src.paper_trading import (
+    PaperTrader, PaperPosition, _SubsystemFailureTracker, _fast_track_counter_trend,
+)
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -694,3 +697,30 @@ class TestSubsystemFailureTracker:
         # Both can alert again on a fresh failure streak
         assert t.record_failure("BTC/USD") is False   # only 1 failure so far
         assert t.record_failure("ETH/USD") is False
+
+
+# ── _fast_track_counter_trend ────────────────────────────────────────────────
+#
+# The OFI+lead-lag fast-track entry path vetoed a SELL signal shorting into
+# TRENDING_UP, but had no mirror-image veto for a BUY signal going long into
+# TRENDING_DOWN — letting the bot open longs straight into a strong downtrend,
+# the exact counter-trend risk this gate exists to block on the other side.
+# _fast_track_counter_trend centralizes the check so both directions are vetoed.
+
+class TestFastTrackCounterTrend:
+    def test_sell_into_trending_up_is_counter_trend(self):
+        assert _fast_track_counter_trend(Signal.SELL, 'TRENDING_UP') is True
+
+    def test_buy_into_trending_down_is_counter_trend(self):
+        assert _fast_track_counter_trend(Signal.BUY, 'TRENDING_DOWN') is True
+
+    def test_buy_into_trending_up_is_not_counter_trend(self):
+        assert _fast_track_counter_trend(Signal.BUY, 'TRENDING_UP') is False
+
+    def test_sell_into_trending_down_is_not_counter_trend(self):
+        assert _fast_track_counter_trend(Signal.SELL, 'TRENDING_DOWN') is False
+
+    @pytest.mark.parametrize('regime', ['RANGING', 'VOLATILE', 'UNKNOWN'])
+    def test_neither_direction_blocked_in_neutral_regimes(self, regime):
+        assert _fast_track_counter_trend(Signal.BUY, regime) is False
+        assert _fast_track_counter_trend(Signal.SELL, regime) is False

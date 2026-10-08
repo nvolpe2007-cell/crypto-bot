@@ -232,6 +232,21 @@ def _diagnose(side: str, pnl: float, exit_reason: str, holding_min: float,
     return issues, positives
 
 
+def _fast_track_counter_trend(ft_signal: Signal, regime_name: str) -> bool:
+    """True when a fast-track OFI+lead-lag signal would fight the prevailing trend.
+
+    A SELL fast-track signal shorting into ``TRENDING_UP``, or the mirror-image BUY
+    fast-track signal going long into ``TRENDING_DOWN``, is the counter-trend setup
+    this gate exists to veto. ``TRENDING_UP``/``TRENDING_DOWN`` are treated as a
+    matched adverse pair everywhere else in this module (``_diagnose`` above), so
+    the veto must cover both sides symmetrically, not just SELL-into-TRENDING_UP.
+    """
+    return (
+        (ft_signal == Signal.SELL and regime_name == 'TRENDING_UP')
+        or (ft_signal == Signal.BUY and regime_name == 'TRENDING_DOWN')
+    )
+
+
 def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
     now = datetime.now(timezone.utc)
     entry_dt = trade.entry_time if isinstance(trade.entry_time, datetime) else now
@@ -1841,8 +1856,9 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                         ofi_dir = 'BUY' if ofi_now > 0 else 'SELL'
                         if ofi_dir == lead_dir_now and regime_name != 'CRASH':
                             ft_signal = Signal.BUY if ofi_dir == 'BUY' else Signal.SELL
-                            # Don't short into a strong uptrend
-                            if not (ft_signal == Signal.SELL and regime_name == 'TRENDING_UP'):
+                            # Don't trade counter-trend (short into an uptrend, or
+                            # long into a downtrend) — see _fast_track_counter_trend.
+                            if not _fast_track_counter_trend(ft_signal, regime_name):
                                 ft_conf = 55.0 + min(15.0, (abs(ofi_now) - 0.30) * 50)  # 55-70 range
                                 sig = ScientificSignal(
                                     signal          = ft_signal,
