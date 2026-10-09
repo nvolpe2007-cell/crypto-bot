@@ -205,8 +205,8 @@ class ScientificStrategy:
         ofi = ofi_calc.get_smoothed(symbol) if ofi_calc else None
         ofi_dir = 'NEUTRAL'
         if ofi is not None:
-            if ofi >  0.15: ofi_dir = 'BULLISH'
-            elif ofi < -0.15: ofi_dir = 'BEARISH'
+            if ofi >  self.ofi_min: ofi_dir = 'BULLISH'
+            elif ofi < -self.ofi_min: ofi_dir = 'BEARISH'
 
         # ── Lead-lag signal ────────────────────────────────────────────────────
         lead_dir      = lead_lag.get_signal(symbol) if lead_lag else None
