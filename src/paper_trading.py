@@ -441,6 +441,24 @@ class _SubsystemFailureTracker:
         return self._counts.get(sym, 0)
 
 
+def _funding_extreme_blocks(fr: Optional[float], side: str, threshold: float = 0.001) -> Optional[str]:
+    """Hard kill-filter veto: block entries on EITHER side once |funding rate|
+    exceeds `threshold` per 8h. `side` is accepted but intentionally NOT used to
+    narrow the block to the side that's actually paying the rate — unlike the
+    soft `_funding_favorable` check (entry_checklist.py), which only downweights
+    the side paying it (fr>0 unfavorable for buy, fr<0 unfavorable for sell), this
+    hard gate treats an extreme print of either sign as a crowded/unstable-market
+    signal for both sides, including the side that would collect it. That's a
+    real behavioral difference between the two funding checks in the same
+    pipeline, not obviously a bug (extreme funding often precedes violent moves
+    that hurt both directions) — left unchanged pending forward-test evidence
+    either way. See worklog/2026-08-26-dispatch-funding-extreme-kill-filter-direction.md.
+    """
+    if fr is not None and abs(fr) > threshold:
+        return f"FUNDING_EXTREME ({fr:.4f}/8h)"
+    return None
+
+
 # ── Main paper trading session ─────────────────────────────────────────────────
 
 async def run_paper_trading_session(exchange: ExchangeConnection,
@@ -1359,10 +1377,13 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
         imbalance, and CVD-vs-price divergence.
         WS-stale, daily-loss, max-positions, correlation are handled elsewhere.
         Returns reason string if should skip, else None."""
-        # Funding rate extreme — when paying >0.1% per 8h, longs are very expensive
+        # Funding rate extreme — blocks BOTH sides regardless of who's paying;
+        # see _funding_extreme_blocks() docstring for why this differs from the
+        # side-aware soft check.
         fr = _get_funding_rate(sym)
-        if fr is not None and abs(fr) > 0.001:
-            return f"FUNDING_EXTREME ({fr:.4f}/8h)"
+        funding_reason = _funding_extreme_blocks(fr, side)
+        if funding_reason:
+            return funding_reason
         # Whale print — current candle volume > 10× SMA20 suggests a market mover
         try:
             if len(df) >= 21:
