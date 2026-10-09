@@ -264,8 +264,12 @@ class ScientificStrategy:
                 direction = 'BUY' if ofi_val > 0 else 'SELL'
             elif lead_dir:
                 direction = lead_dir
-            elif regime in ('TRENDING_DOWN', 'CRASH'):
+            elif regime == 'TRENDING_DOWN':
                 direction = 'SELL'
+            # Note: regime == 'CRASH' can never reach here — the hard block
+            # above always sets has_buy = False (or returns HOLD) for CRASH,
+            # so this branch would only ever see has_sell True, has_buy False,
+            # which is already resolved by the "only one direction" check.
             elif regime == 'TRENDING_UP':
                 direction = 'BUY'
             elif rsi_v < 35:
@@ -349,7 +353,6 @@ class ScientificStrategy:
         # 6. Funding rate score (0-10 pts)
         funding_score = 0.0
         if funding_rate is not None:
-            annual = funding_rate * 3 * 365 * 100
             if is_buy:
                 if funding_rate < -0.001:   funding_score = 10.0  # paid to be long
                 elif funding_rate < 0.0005: funding_score = 5.0   # neutral-positive
