@@ -604,6 +604,59 @@ def _rebalance_forward() -> dict | None:
     return dict(label='Rebalanced allocation (crypto+gold+cash, FORWARD)', executable=True, **s)
 
 
+def _real_money_forward() -> dict | None:
+    """REAL MONEY. The owner's manually-executed Trend Signal (Honest) trades
+    (scripts/real_ledger.py -> data/real_money_ledger.json). Every other arm on
+    this scorecard is a simulation whose fills we invent; this one has actual
+    fills, actual fees and actual slippage, so it is the only record that can
+    falsify the cost assumptions the paper arms all share.
+
+    PRE-REGISTERED, so it is judged at the SINGLE-arm bar (t>2) and excluded
+    from `k`. The Šidák correction exists to punish best-of-k cherry-picking;
+    this arm was committed to in advance, on one fixed rule, before any trade
+    existed — there is no selection to correct for, and inflating k would
+    wrongly tighten every other arm's bar because the owner started trading.
+
+    Clustered by entry WEEK, like the swing arm: the basket is correlated
+    majors plus index ETFs, so positions opened the same week are not
+    independent bets."""
+    path = DATA / 'real_money_ledger.json'
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    closed = sorted(d.get('closed', []), key=lambda t: t.get('exit_ts') or '')
+    if not closed:
+        return None
+
+    # Recompute net from the recorded fills rather than trusting a stored total,
+    # so a corrected fill price or fee in the JSON flows straight through.
+    def _net(t: dict) -> float:
+        qty = float(t.get('qty', 0.0))
+        gross = qty * (float(t.get('exit_fill_price', 0.0))
+                       - float(t.get('entry_fill_price', 0.0)))
+        return gross - float(t.get('entry_fee_usd', 0.0)) - float(t.get('exit_fee_usd', 0.0))
+
+    def _week(t: dict) -> str:
+        try:
+            iso = datetime.strptime(str(t.get('entry_signal_date'))[:10],
+                                    '%Y-%m-%d').isocalendar()
+            return f'{iso[0]}-W{iso[1]:02d}'
+        except (TypeError, ValueError):
+            return 'unknown'
+
+    nets = [_net(t) for t in closed]
+    s = _stats(nets, [_week(t) for t in closed])
+    out = dict(label='Trend Signal (Honest) — REAL MONEY, manual',
+               executable=True, pre_registered=True, **s)
+    # Discipline: trades whose exit was NOT the rule's SELL, plus signals the
+    # owner never took. Either one means the live record has drifted off the
+    # measured strategy, so the verdict has to say so instead of scoring it as
+    # if the rule were followed.
+    out['discretionary_exits'] = sum(1 for t in closed if t.get('exit_reason') != 'signal')
+    out['skipped_signals'] = len(d.get('skipped', []))
+    return out
+
+
 def _directional() -> dict | None:
     csvf = DATA / 'trade_journal.csv'
     if not csvf.exists():
@@ -647,6 +700,19 @@ def _regime_forward() -> dict | None:
 def _verdict(a: dict, t_family: float = T_MIN, k: int = 1) -> str:
     if not a['executable']:
         return 'FANTASY (not executable on a US Kraken-spot account)'
+    # A PRE-REGISTERED arm faces the single-arm bar: Šidák corrects for picking
+    # the best of k candidates, and a rule committed to in advance is not a pick.
+    if a.get('pre_registered'):
+        t_family, k = T_MIN, 1
+    # Discipline flags come before the statistics on purpose. If signals were
+    # skipped or positions closed off-signal, the trades in this record are not
+    # the strategy that was measured, and no t-stat on them means what it says.
+    drift = a.get('discretionary_exits', 0) + a.get('skipped_signals', 0)
+    if drift:
+        return (f'NOT JUDGED — {a.get("skipped_signals", 0)} signal(s) skipped, '
+                f'{a.get("discretionary_exits", 0)} discretionary exit(s). This record '
+                f'is a different strategy from the one that was backtested; fix the '
+                f'execution before reading anything into its {a["n"]} trades.')
     if a['n'] < N_MIN:
         return f'NOT PROVEN — only {a["n"]} trades (need {N_MIN}+)'
     if a['expectancy'] <= 0:
@@ -780,9 +846,13 @@ def build_arms() -> tuple:
                               'Leveraged perp 3x + take-profit, 8-coin universe (FORWARD, paper)'),
         _pairs_forward(),
         _rebalance_forward(),
+        _real_money_forward(),
         _directional(),
     ] if a]
-    k = len(arms)
+    # Pre-registered arms are excluded from k: they were committed to in advance,
+    # so they are not candidates the family-wise correction is guarding against,
+    # and counting them would tighten every OTHER arm's bar for no reason.
+    k = sum(1 for a in arms if not a.get('pre_registered'))
     t_family = _family_t_bar(k)
     return arms, k, t_family
 
