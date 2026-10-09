@@ -232,6 +232,29 @@ def _diagnose(side: str, pnl: float, exit_reason: str, holding_min: float,
     return issues, positives
 
 
+def _resolve_dual_direction(sig, orig_buy: bool, orig_p: float, opp_p: float,
+                             orig_rejected: bool, opp_rejected: bool,
+                             dual_margin: float) -> str:
+    """Apply the dual-direction probe's verdict by mutating ``sig.signal`` in place.
+
+    ``ScientificSignal.is_buy``/``is_sell`` are read-only properties derived from
+    ``.signal`` and ``.size_mult`` — they have no setter. Assigning to them directly
+    (as this used to do) raises ``AttributeError``, which the caller's broad
+    ``except Exception`` swallowed, so neither the flip nor the reject verdict was
+    ever actually applied even though it was logged as if it had been.
+
+    Returns 'flip', 'reject', or 'unchanged'.
+    """
+    delta = opp_p - orig_p
+    if delta > dual_margin and not opp_rejected:
+        sig.signal = Signal.SELL if orig_buy else Signal.BUY
+        return 'flip'
+    if not orig_rejected and not opp_rejected and abs(delta) <= dual_margin:
+        sig.signal = Signal.HOLD
+        return 'reject'
+    return 'unchanged'
+
+
 def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
     now = datetime.now(timezone.utc)
     entry_dt = trade.entry_time if isinstance(trade.entry_time, datetime) else now
@@ -1931,18 +1954,18 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             macro_state=macro_provider.current(),
                             symbol=symbol,
                         )
-                        _delta = _opp.calibrated_p - _orig.calibrated_p
-                        if _delta > _dual_margin and not _opp.rejected:
+                        _verdict = _resolve_dual_direction(
+                            sig, _orig_buy, _orig.calibrated_p, _opp.calibrated_p,
+                            _orig.rejected, _opp.rejected, _dual_margin,
+                        )
+                        if _verdict == 'flip':
                             logger.info(
                                 f"[DUAL-FLIP] {symbol} "
                                 f"{'BUY' if _orig_buy else 'SELL'}→"
                                 f"{'SELL' if _orig_buy else 'BUY'} "
                                 f"orig P={_orig.calibrated_p:.2f} opp P={_opp.calibrated_p:.2f}"
                             )
-                            sig.is_buy  = (not _orig_buy)
-                            sig.is_sell = _orig_buy
-                        elif (not _orig.rejected and not _opp.rejected
-                              and abs(_delta) <= _dual_margin):
+                        elif _verdict == 'reject':
                             # Both directions clear the gate within margin →
                             # contradictory edges → reject the whole bar.
                             logger.info(
@@ -1951,8 +1974,6 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                                 f"short P={_opp.calibrated_p if _orig_buy else _orig.calibrated_p:.2f}) — noisy tape"
                             )
                             funnel.bump('skip:dual_noisy')
-                            sig.is_buy = False
-                            sig.is_sell = False
                     except Exception as _e:
                         logger.debug(f"[DUAL] probe failed for {symbol}: {_e}")
 
