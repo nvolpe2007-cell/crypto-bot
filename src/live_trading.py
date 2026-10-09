@@ -11,7 +11,8 @@ Safety guarantees:
   - Fee tracking: actual fees pulled from order response
   - Daily loss circuit breaker: halts NEW entries if realized loss exceeds
     MAX_DAILY_LOSS, without abandoning SL/TP protection on any open position
-  - Min confidence: 70 (higher bar than paper's 60)
+  - Min confidence: 70 (higher bar than paper's adaptive 35-45, see
+    paper_trading._adapt['min_confidence'])
 """
 
 import asyncio
@@ -42,7 +43,7 @@ from .state import write_state, read_state
 
 logger = logging.getLogger(__name__)
 
-LIVE_MIN_CONFIDENCE = 70.0   # higher bar than paper (60) — real money
+LIVE_MIN_CONFIDENCE = 70.0   # higher bar than paper's adaptive 35-45 — real money
 EVAL_INTERVAL       = 2.0    # seconds between signal evaluations per symbol
 FEE_RATE            = 0.0026  # Kraken taker fee (0.26%) — overridden by actual order fee
 ATR_TRAIL_MULT      = 2.5    # chandelier exit: trail = highest_since_entry - ATR_TRAIL_MULT × entry ATR
