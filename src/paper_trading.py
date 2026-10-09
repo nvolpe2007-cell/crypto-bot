@@ -2710,6 +2710,7 @@ def _save_open_positions(trader):
                 'margin_locked':    pos.margin_locked,
                 'funding_accrued':  pos.funding_accrued,
                 'last_funding_ts':  _iso(pos.last_funding_ts) if pos.last_funding_ts else None,
+                'liquidation_price': pos.liquidation_price,
             })
         payload = json.dumps(_sanitize({
             'saved_at': datetime.now(timezone.utc).isoformat(),
@@ -2786,6 +2787,7 @@ def _load_open_positions(trader):
                     margin_locked        = float(p.get('margin_locked', 0.0)),
                     funding_accrued      = float(p.get('funding_accrued', 0.0)),
                     last_funding_ts      = last_funding_ts,
+                    liquidation_price    = float(p.get('liquidation_price', 0.0)),
                 )
                 trader.account.positions[p['symbol']] = pos
                 restored += 1
