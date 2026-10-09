@@ -203,7 +203,15 @@ class EMACrossRSI:
 
     def get_latest_signal(self, df: pd.DataFrame) -> Optional[IndicatorResult]:
         """Get the most recent signal from dataframe"""
-        if df.empty or len(df) < self.slow_ema:
+        # Crossover detection needs the slow EMA valid on both the last row
+        # AND the row before it (via .shift(1)) — pandas_ta.ema() seeds with
+        # min_periods=length, so the first `slow_ema - 1` rows are NaN, and
+        # the slow EMA isn't valid two rows in a row until `slow_ema + 1`
+        # rows exist. At exactly `slow_ema` rows the prior gate let this
+        # through, but ema_slow.shift(1) was NaN on the last row, so every
+        # NaN comparison is False and BUY/SELL never fire — silently
+        # returning a spurious HOLD instead of None for "not enough data".
+        if df.empty or len(df) < self.slow_ema + 1:
             return None
 
         df = self.calculate(df)
