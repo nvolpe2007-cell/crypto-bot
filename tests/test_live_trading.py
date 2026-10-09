@@ -763,6 +763,32 @@ class TestCloseLong:
         assert trade.pnl_pct == pytest.approx(trade.pnl / cost_basis * 100)
         assert trade.pnl_pct < 0  # must agree in sign with pnl, not report a gross +2%
 
+    def test_notifier_total_equity_includes_other_open_positions_unrealized_pnl(self):
+        """Regression: total_equity passed to the Telegram notifier on a close must match
+        get_summary()'s formula (initial_capital + total_pnl + unrealized_pnl of positions
+        still open) — not just initial_capital + total_pnl. The closed position is deleted
+        before this is computed, but any OTHER open position's unrealized PnL must still
+        be counted, or the notification understates equity.
+        """
+        trader = _make_trader(initial_capital=1000.0)
+        self._setup_position(trader, symbol="BTC/USD", entry_price=50_000.0,
+                             size=0.001, size_usd=50.0)
+        trader.positions["ETH/USD"] = _open_position(
+            symbol="ETH/USD", entry_price=3_000.0, size=0.01, size_usd=30.0,
+        )
+        trader.positions["ETH/USD"].unrealized_pnl = 7.0
+        trader.notifier = MagicMock()
+        trader.exchange.create_order = AsyncMock(return_value={
+            "id": "exit", "status": "closed", "average": 51_000.0,
+            "fee": {"cost": 0.13},
+        })
+        self._run(trader.close_long("BTC/USD", 51_000.0, "SIGNAL"))
+
+        assert trader.notifier.send_trade_analysis.called
+        kwargs = trader.notifier.send_trade_analysis.call_args.kwargs
+        expected = trader.account.initial_capital + trader.account.total_pnl + 7.0
+        assert kwargs["total_equity"] == pytest.approx(expected)
+
 
 # ── update_unrealized ─────────────────────────────────────────────────────────────
 
