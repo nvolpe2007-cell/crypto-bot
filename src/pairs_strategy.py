@@ -151,7 +151,14 @@ class PairsStrategy:
         mean = spreads.mean()
         std  = spreads.std()
         if std < 1e-9:
-            return None
+            # A degenerate (near-zero) rolling std means every sample in the
+            # window — including the latest — already sits at the mean, i.e.
+            # the spread has fully converged. That's 0σ, not undefined: an
+            # undefined z-score here would make should_exit() (which treats
+            # None as "not reverted") block the exit forever once the tape
+            # goes quiet. 0.0 still fails the entry threshold (ZSCORE_THRESHOLD),
+            # so _evaluate_pair's gating is unchanged.
+            return 0.0
         return float((spreads[-1] - mean) / std)
 
     def _evaluate_pair(self, pair: Tuple[str, str],
