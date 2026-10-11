@@ -51,6 +51,7 @@ class PaperPosition:
     # Probability gate output
     prob_win:        float = 0.0
     edges_used:      List[str] = field(default_factory=list)
+    prob_model_version: int = 0
     # Conviction tier + trailing stop state (set on entry, updated each tick)
     tier:                str   = 'scalp'
     intended_hold_min:   int   = 0

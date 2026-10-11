@@ -2700,6 +2700,7 @@ def _save_open_positions(trader):
                 # Probability gate context
                 'prob_win':         pos.prob_win,
                 'edges_used':       pos.edges_used,
+                'prob_model_version': pos.prob_model_version,
                 # Entry context snapshot
                 'spread_at_entry':  pos.spread_at_entry,
                 'sentiment_fng':    pos.sentiment_fng,
@@ -2776,6 +2777,7 @@ def _load_open_positions(trader):
                     # Probability gate context
                     prob_win             = float(p.get('prob_win', 0.0)),
                     edges_used           = list(p.get('edges_used', [])),
+                    prob_model_version   = int(p.get('prob_model_version', 0)),
                     # Entry context snapshot
                     spread_at_entry      = float(p.get('spread_at_entry', 0.0)),
                     sentiment_fng        = p.get('sentiment_fng'),
