@@ -385,6 +385,23 @@ class TestAtrAlive:
         ok, _ = _atr_alive(_ctx(sig=_Sig(atr=None, close=None)))
         assert ok is True
 
+    def test_fails_when_atr_exactly_zero(self):
+        # A genuinely dead-volatility tape (flat/duplicate candles) computes
+        # atr == 0.0, not None. That is the single most extreme case this
+        # gate exists to block, so it must fail, not fail-open like the
+        # not-yet-computed (None) case above.
+        ok, reason = _atr_alive(_ctx(sig=_Sig(atr=0.0, close=100.0)))
+        assert ok is False
+        assert "atr" in reason.lower()
+
+    def test_passes_when_close_zero_or_negative(self):
+        # Unusable price → can't compute a ratio; fail open rather than
+        # dividing by zero.
+        ok, _ = _atr_alive(_ctx(sig=_Sig(atr=1.0, close=0.0)))
+        assert ok is True
+        ok, _ = _atr_alive(_ctx(sig=_Sig(atr=1.0, close=-5.0)))
+        assert ok is True
+
 
 # ── Soft check: rsi_healthy ───────────────────────────────────────────────────
 
