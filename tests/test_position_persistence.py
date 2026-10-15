@@ -54,6 +54,7 @@ def _spot_position(
         target_usd_at_entry  = 103.0,
         prob_win             = 0.62,
         edges_used           = ['ofi', 'lead_lag', 'regime'],
+        prob_model_version   = 3,
         spread_at_entry      = 0.5,
         sentiment_fng        = 55,
         sentiment_btc_dom    = 52.3,
@@ -326,6 +327,41 @@ class TestProbabilityGateContextRoundTrip:
         _load_open_positions(trader2)
 
         assert trader2.account.positions['SOL/USD'].edges_used == []
+
+    def test_prob_model_version_survives(self, clean_positions_file):
+        """Regression: prob_model_version was set on entry but never saved/
+        restored, so a restart silently reset it to 0 on every open position.
+        calibration.MIN_MODEL_VERSION / ExpectancyGate.min_model_version then
+        filter the eventual trade-journal row out of the fit entirely, as if
+        it were stale pre-versioning data — even though the trade was opened
+        under the current model and should count."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+
+        _save_open_positions(trader)
+        trader2 = _fresh_trader()
+        _load_open_positions(trader2)
+
+        assert trader2.account.positions['BTC/USD'].prob_model_version == 3
+
+    def test_prob_model_version_defaults_to_zero_when_absent(self, clean_positions_file):
+        """A snapshot written before this field existed must still load
+        (old value defaults to 0, same as a fresh position)."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _spot_position()
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        del data['positions'][0]['prob_model_version']
+        with open(clean_positions_file, 'w') as f:
+            json.dump(data, f)
+
+        trader2 = _fresh_trader()
+        n = _load_open_positions(trader2)
+
+        assert n == 1
+        assert trader2.account.positions['BTC/USD'].prob_model_version == 0
 
 
 class TestEntryContextRoundTrip:
