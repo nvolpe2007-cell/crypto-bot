@@ -13,6 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DATA_DIR    = os.environ.get("DASHBOARD_DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data"))
 REFRESH_SEC = int(os.environ.get("DASHBOARD_REFRESH_SEC", "10"))
+# Greg's (chief-of-staff bot) paper book, written by its tools/paper-trade.py. Read-only here.
+GREG_BOOK_DIR = os.environ.get("DASHBOARD_GREG_BOOK_DIR", "/home/agent/chief-of-staff/paper")
+GREG_START_EQUITY = 1000.0
 
 _PAGE = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -185,6 +188,16 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-
     <div class="trade-list" id="trade-list"><div class="empty">No closed trades yet</div></div>
   </div>
 
+  <div id="greg-section" style="display:none">
+    <div class="section-header">
+      <span class="section-title">Greg's Paper Book · paper money only</span>
+      <span class="badge" id="greg-badge">—</span>
+    </div>
+    <div class="metric-grid" id="greg-metrics"></div>
+    <div class="positions-grid" id="greg-open" style="margin-top:12px"></div>
+    <div class="trade-list" id="greg-closed" style="margin-top:12px"></div>
+  </div>
+
 </main>
 </div>
 
@@ -194,6 +207,51 @@ const $ = id => document.getElementById(id);
 const cls = v => v > 0 ? 'green' : v < 0 ? 'red' : 'muted';
 const fmt$ = (v, d=2) => (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(d);
 const fmtPct = v => (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+// Greg's book carries free text (theses, close reasons): always escape before innerHTML.
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = (v, d=2) => Number(v || 0).toLocaleString(undefined, {maximumFractionDigits: d});
+
+function renderGreg(g) {
+  if (!g) { $('greg-section').style.display = 'none'; return; }
+  $('greg-section').style.display = '';
+  const pnl = g.equity - g.start_equity;
+  const s = g.stats || {};
+  $('greg-badge').textContent = g.open.length + ' open · ' + (s.n || 0) + ' closed';
+  const cards = [
+    {label:'Paper Equity', val:'$' + g.equity.toFixed(2), sub:'started $' + g.start_equity.toFixed(0), color:cls(pnl)},
+    {label:'Paper P&L', val:(pnl>=0?'+':'') + fmt$(pnl), sub:'realized, after fees', color:cls(pnl)},
+    {label:'Unrealized', val:(g.unrealized>=0?'+':'') + fmt$(g.unrealized), sub:g.open.length + ' open', color:cls(g.unrealized)},
+    {label:'Win Rate', val:s.n ? Math.round(s.win_rate*100) + '%' : '—', sub:(s.n||0) + ' closed' + (s.n && s.n < 30 ? ' · too few to judge' : ''), color:'muted'},
+    {label:'Avg R', val:s.n ? (s.avg_r>=0?'+':'') + s.avg_r.toFixed(2) + 'R' : '—', sub:'per closed trade', color:cls(s.avg_r||0)},
+  ];
+  $('greg-metrics').innerHTML = cards.map(m =>
+    '<div class="metric-card"><div class="mc-label">'+m.label+'</div><div class="mc-val '+m.color+'">'+m.val+'</div>' +
+    '<div class="mc-sub">'+m.sub+'</div></div>').join('');
+  $('greg-open').innerHTML = g.open.length ? g.open.map(p => {
+    const sd = p.side === 'long' ? 'long' : 'short';
+    return '<div class="pos-card '+sd+'">' +
+      '<div class="pos-symbol">'+esc(p.pair)+'<span class="pos-side '+sd+'">'+(sd==='long'?'▲ LONG':'▼ SHORT')+'</span></div>' +
+      '<div class="pos-field"><div class="pos-field-label">Entry</div><div class="pos-field-val">$'+num(p.entry, 4)+'</div></div>' +
+      '<div class="pos-field"><div class="pos-field-label">Now</div><div class="pos-field-val '+cls(p.unrealized||0)+'">'+(p.price?'$'+num(p.price, 4):'—')+'</div>' +
+        '<div style="font-size:10px" class="'+cls(p.unrealized||0)+'">'+(p.unrealized==null?'':(p.unrealized>=0?'+':'')+fmt$(p.unrealized))+'</div></div>' +
+      '<div class="pos-field"><div class="pos-field-label">Stop / Target</div>' +
+        '<div style="font-size:11px;color:var(--red);font-family:monospace">✕ $'+num(p.stop, 4)+'</div>' +
+        '<div style="font-size:11px;color:var(--green);font-family:monospace">▲ $'+num(p.take, 4)+'</div></div>' +
+      '<div class="pos-field"><div class="pos-field-label">Risk</div><div class="pos-field-val">$'+num(p.risk_usd)+'</div>' +
+        '<div class="muted" style="font-size:10px">'+num(p.reward_risk)+'R target</div></div>' +
+      '<div class="muted" style="grid-column:1/-1;font-size:11px">why: '+esc(p.thesis)+'</div>' +
+      '</div>';
+  }).join('') : '<div class="empty">No open paper positions</div>';
+  $('greg-closed').innerHTML = g.closed.length ? [...g.closed].reverse().map(t =>
+    '<div class="trade-row">' +
+    '<div style="font-weight:600">'+esc(t.pair)+' <span class="'+(t.side==='long'?'green':'red')+'">'+(t.side==='long'?'L':'S')+'</span></div>' +
+    '<div><span class="reason-badge '+(t.reason==='target'?'take_profit':t.reason==='stop'?'liquidation':'flip')+'">'+esc(String(t.reason).slice(0,12))+'</span></div>' +
+    '<div class="mono muted" style="font-size:11px">$'+num(t.entry, 4)+'</div>' +
+    '<div class="mono muted" style="font-size:11px">$'+num(t.exit, 4)+'</div>' +
+    '<div class="mono '+cls(t.pnl)+'" style="font-weight:600">'+(t.pnl>=0?'+':'')+fmt$(t.pnl)+' · '+(t.r_multiple>=0?'+':'')+Number(t.r_multiple).toFixed(2)+'R</div>' +
+    '<div class="muted" style="font-size:11px">'+new Date(t.closed_at*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})+'</div></div>'
+  ).join('') : '<div class="empty">No closed paper trades yet</div>';
+}
 
 function drawChart(curve) {
   const canvas = $('equity-chart');
@@ -263,6 +321,8 @@ async function tick() {
     $('live-dot').style.background = 'var(--red)';
     return;
   }
+
+  renderGreg(d.greg_book);
 
   const lev = d.lev_perp || {};
   const eq = lev.equity || 1000;
@@ -403,9 +463,72 @@ window.addEventListener('resize', () => {
 </body></html>"""
 
 
+def _load_greg_book(book_dir=None, prices=None):
+    """Greg's paper book (open positions + closed trades) as a dashboard dict, or None if absent.
+
+    Never raises on bad data: a torn ledger line is skipped, a missing book returns None.
+    `prices` maps base symbol -> last price (from state.json) for unrealized P&L.
+    """
+    book_dir = book_dir or GREG_BOOK_DIR
+    pos_file = os.path.join(book_dir, "positions.json")
+    trades_file = os.path.join(book_dir, "trades.jsonl")
+    if not os.path.exists(pos_file) and not os.path.exists(trades_file):
+        return None
+    try:
+        with open(pos_file, encoding="utf-8") as f:
+            positions = json.load(f)
+    except (OSError, ValueError):
+        positions = []
+    closed = []
+    if os.path.exists(trades_file):
+        with open(trades_file, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    closed.append(json.loads(line))
+                except ValueError:
+                    continue
+    prices = prices or {}
+    unrealized = 0.0
+    open_rows = []
+    for p in positions:
+        row = {k: p.get(k) for k in ("id", "pair", "side", "entry", "stop", "take", "qty",
+                                     "risk_usd", "reward_risk", "thesis", "opened_at")}
+        px = prices.get(p.get("pair"))
+        if px and p.get("entry") and p.get("qty"):
+            sign = 1 if p.get("side") == "long" else -1
+            row["price"] = float(px)
+            row["unrealized"] = round(sign * (float(px) - p["entry"]) * p["qty"], 4)
+            unrealized += row["unrealized"]
+        else:
+            row["price"], row["unrealized"] = None, None
+        open_rows.append(row)
+    pnls = [float(t.get("pnl", 0)) for t in closed]
+    n = len(pnls)
+    stats = {"n": n,
+             "win_rate": (sum(1 for x in pnls if x > 0) / n) if n else 0.0,
+             "avg_r": (sum(float(t.get("r_multiple", 0)) for t in closed) / n) if n else 0.0,
+             "total_pnl": round(sum(pnls), 4)}
+    keep = ("id", "pair", "side", "entry", "exit", "reason", "pnl", "r_multiple", "closed_at")
+    return {"start_equity": GREG_START_EQUITY,
+            "equity": round(GREG_START_EQUITY + sum(pnls), 4),
+            "unrealized": round(unrealized, 4),
+            "open": open_rows,
+            "closed": [{k: t.get(k) for k in keep} for t in closed[-20:]],
+            "stats": stats}
+
+
 def _load_state():
     """Read lev_perp_state.json and state.json, merge into a response dict."""
     out = {}
+    try:
+        with open(os.path.join(DATA_DIR, "state.json")) as f:
+            bases = {k.split("/")[0]: v for k, v in json.load(f).get("prices", {}).items()}
+        bases.setdefault("BTC", bases.get("XBT"))
+    except (OSError, ValueError):
+        bases = {}
+    greg = _load_greg_book(prices={k: v for k, v in bases.items() if v})
+    if greg is not None:
+        out["greg_book"] = greg
     lev_file = os.path.join(DATA_DIR, "lev_perp_state.json")
     if os.path.exists(lev_file):
         with open(lev_file) as f:
