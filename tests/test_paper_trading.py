@@ -17,7 +17,9 @@ Covers:
 
 import pytest
 from datetime import datetime
-from src.paper_trading import PaperTrader, PaperPosition, _SubsystemFailureTracker
+from src.paper_trading import (
+    PaperTrader, PaperPosition, _SubsystemFailureTracker, _regime_forces_exit,
+)
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -694,3 +696,35 @@ class TestSubsystemFailureTracker:
         # Both can alert again on a fresh failure streak
         assert t.record_failure("BTC/USD") is False   # only 1 failure so far
         assert t.record_failure("ETH/USD") is False
+
+
+# ── _regime_forces_exit ──────────────────────────────────────────────────────
+#
+# The signal-driven exit loop used to fast-exit a SHORT on a regime flip to
+# TRENDING_UP but had no mirror-image fast-exit for a LONG on TRENDING_DOWN,
+# even though every other regime-aware gate in this codebase (_diagnose,
+# RegimeResult.allows_long, entry_checklist's regime-block checks) treats the
+# two as a matched adverse pair. _regime_forces_exit centralizes that pairing
+# so both exit branches call the same symmetric logic.
+
+class TestRegimeForcesExit:
+    def test_long_forced_out_on_trending_down(self):
+        assert _regime_forces_exit('buy', 'TRENDING_DOWN') is True
+
+    def test_short_forced_out_on_trending_up(self):
+        assert _regime_forces_exit('short', 'TRENDING_UP') is True
+
+    def test_long_not_forced_out_on_trending_up(self):
+        assert _regime_forces_exit('buy', 'TRENDING_UP') is False
+
+    def test_short_not_forced_out_on_trending_down(self):
+        assert _regime_forces_exit('short', 'TRENDING_DOWN') is False
+
+    @pytest.mark.parametrize('regime', ['RANGING', 'VOLATILE', 'CRASH', 'UNKNOWN'])
+    def test_neither_side_forced_out_on_neutral_regimes(self, regime):
+        assert _regime_forces_exit('buy', regime) is False
+        assert _regime_forces_exit('short', regime) is False
+
+    def test_unknown_position_side_never_forces_exit(self):
+        assert _regime_forces_exit('flat', 'TRENDING_DOWN') is False
+        assert _regime_forces_exit('flat', 'TRENDING_UP') is False

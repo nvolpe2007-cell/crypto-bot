@@ -232,6 +232,22 @@ def _diagnose(side: str, pnl: float, exit_reason: str, holding_min: float,
     return issues, positives
 
 
+def _regime_forces_exit(pos_side: str, regime_name: str) -> bool:
+    """True when a regime flip alone should force an immediate, non-debounced exit.
+
+    A short is fast-exited on ``TRENDING_UP`` (the regime turning against it); a long
+    must be fast-exited on the mirror-image ``TRENDING_DOWN``. These two are treated as
+    a matched adverse pair everywhere else in this module (``_diagnose``) and in
+    ``regime_detector.RegimeResult.allows_long``/``entry_checklist``'s regime-block
+    checks, so the exit side must stay symmetric too.
+    """
+    if pos_side == 'buy':
+        return regime_name == 'TRENDING_DOWN'
+    if pos_side == 'short':
+        return regime_name == 'TRENDING_UP'
+    return False
+
+
 def _record_to_journal(journal, trade, symbol, reason, sig, regime, pos=None):
     now = datetime.now(timezone.utc)
     entry_dt = trade.entry_time if isinstance(trade.entry_time, datetime) else now
@@ -2226,9 +2242,15 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
                             )
 
                 # ── EXIT LONG ───────────────────────────────────────────────────
-                elif sig.signal == Signal.SELL and pos_side == 'buy':
-                    opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
-                    if opposing_streak[symbol] < SIGNAL_EXIT_STREAK:
+                elif pos_side == 'buy' and (
+                    sig.signal == Signal.SELL or _regime_forces_exit('buy', regime_name)
+                ):
+                    # Regime flip to TRENDING_DOWN is a fast-exit (no debounce);
+                    # signal flip requires the streak. Mirrors the short side below.
+                    fast_exit = _regime_forces_exit('buy', regime_name)
+                    if not fast_exit:
+                        opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
+                    if not fast_exit and opposing_streak[symbol] < SIGNAL_EXIT_STREAK:
                         logger.debug(f"[EXIT-DEBOUNCE] {symbol} long: opposing "
                                      f"{opposing_streak[symbol]}/{SIGNAL_EXIT_STREAK}")
                     else:
@@ -2248,11 +2270,11 @@ async def run_paper_trading_session(exchange: ExchangeConnection,
 
                 # ── EXIT SHORT ──────────────────────────────────────────────────
                 elif pos_side == 'short' and (
-                    sig.signal == Signal.BUY or regime_name == 'TRENDING_UP'
+                    sig.signal == Signal.BUY or _regime_forces_exit('short', regime_name)
                 ):
                     # Regime flip to TRENDING_UP is a fast-exit (no debounce);
                     # signal flip requires the streak.
-                    fast_exit = regime_name == 'TRENDING_UP'
+                    fast_exit = _regime_forces_exit('short', regime_name)
                     if not fast_exit:
                         opposing_streak[symbol] = opposing_streak.get(symbol, 0) + 1
                     if not fast_exit and opposing_streak[symbol] < SIGNAL_EXIT_STREAK:
