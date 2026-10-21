@@ -134,7 +134,7 @@ class ScientificStrategy:
 
     def __init__(self,
                  ofi_min:          float = 0.15,
-                 lead_lag_min:     float = 0.003,
+                 lead_lag_min:     float = 0.003,   # NOTE: stored but not read anywhere
                  min_confidence:   float = 45.0):   # lower default — learner raises it adaptively
         self.ofi_min        = ofi_min
         self.lead_lag_min   = lead_lag_min
@@ -209,6 +209,20 @@ class ScientificStrategy:
             elif ofi < -0.15: ofi_dir = 'BEARISH'
 
         # ── Lead-lag signal ────────────────────────────────────────────────────
+        # NOTE: unlike ofi_dir above (gated by self.ofi_min), lead_dir/lead_strength
+        # are used unconditionally below — self.lead_lag_min is never compared
+        # against anything. Confirmed via git history this is not a regression
+        # (unlike the ofi_min bug fixed elsewhere): lead_lag_min has been accepted
+        # and stored, but never read past __init__, since this parameter was first
+        # introduced (3bf3444) — there is no prior "working" state to restore. A
+        # real fix isn't a one-line self.ofi_min-style swap either: get_strength()
+        # returns a 0-1 time/size-decay factor (LeadLagDetector.get_strength),
+        # not the same units as this 0.003 (~0.3%) default, which reads like a raw
+        # BTC-move-percentage threshold — so a correct gate needs either a new
+        # LeadLagDetector accessor for raw magnitude or a redefinition of what this
+        # parameter means. Left as a documented open question rather than guessed
+        # at inside what should be a mechanical bugfix. See
+        # worklog/2026-09-11-dispatch-lead-lag-min-dead-parameter.md.
         lead_dir      = lead_lag.get_signal(symbol) if lead_lag else None
         lead_strength = lead_lag.get_strength(symbol) if lead_lag else 0.0
 
