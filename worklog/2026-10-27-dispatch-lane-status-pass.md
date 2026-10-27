@@ -37,9 +37,12 @@ Per CLAUDE.md option (c): read-only status/health pass. No `src/` or `tests/` ch
    - Net: no new bug found, but this is now independently re-verified rather than re-asserted
      — the backlog's content quality is holding up under a second look, which is a different
      (and more useful) thing to know than "I looked again and agree with myself."
-3. `python -m pytest tests/ -q` → pending at time of writing this entry (dependency install +
-   full run exceeded the single-command timeout; result folded into this same push once it
-   completes, or into tomorrow's entry if it finishes after this commit).
+3. `python -m pytest tests/ -q` → **3639 passed, 0 failed.** Unchanged from every run since
+   2026-10-16 — suite still fully green, no regression. (Fresh-container quirk, same as every
+   run: `requirements.txt` install hit a `cryptography` uninstall conflict before reaching
+   `fastapi`, which broke collection on `test_bot_main.py`/`test_dashboard.py` until `python -m
+   pip install fastapi` was run directly — not a code issue, just the recurring stray-Python
+   environment gotcha the 2026-10-15 entry already flagged.)
 
 ## Why no re-escalation this run
 
