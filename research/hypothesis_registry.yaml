@@ -588,3 +588,70 @@ hypotheses:
       at this horizon — do not re-propose without new data. Gamma levels are
       UNTESTED (no historical per-strike OI); only forward logging (PR #112)
       can test them.
+  - id: kalshi-btc-15m-updown
+    name: Kalshi KXBTC15M (15m BTC Up/Down) — fair-value mispricing (paper)
+    family: prediction-markets
+    hypothesis: >
+      Kalshi's CFTC-regulated 15-minute BTC up/down markets misprice P(Up)
+      mid-window relative to a volatility-scaled digital fair value (exact
+      floor_strike target, 60s-average settlement, basis-corrected spot) by
+      more than Kalshi's quadratic taker fee, WITHOUT relying on a latency
+      lead over the quote.
+    preregistered: >
+      Filed 2026-10-27 BEFORE any Kalshi result was seen. One judged config:
+      decision minutes 5,7,9,11,13; buy the side whose net edge (fair - ask -
+      fee/contract) >= 0.03; ask in 0.10-0.90; $10 stake; one trade per
+      window; hold to settlement; fee ceil_cent(0.07*C*P*(1-P)); sigma from
+      60 prior 1m bars. Everything else is a counted variant.
+    goal_bar: >
+      Owner goal (2026-10-27): n >= 200 forward settled trades on live asks
+      with win rate >= 65% AND win rate above break-even (avg ask + fee per
+      contract) at t >= 3.0 after Sidak for variants tried AND net P&L > 0,
+      AND the backtest edge survives the one-minute BTC-delay test. Failing
+      any of these in the backtest or forward run = NO EDGE verdict.
+    code: kalshi_bot/, scripts/kalshi_backtest.py
+    backtest: scripts/kalshi_backtest.py
+    evidence:
+      - date: 2026-10-27
+        script: scripts/kalshi_backtest.py --days 30
+        window: 2848 settled KXBTC15M windows, 2026-09-27 -> 2026-10-27;
+          Kalshi 1m yes_ask/yes_bid closes (real executable quotes);
+          Coinbase 1m BTC, basis-corrected to floor_strike at each open
+        result: >
+          Settlement proxy matches the real result 95.9% (median |proxy -
+          expiration_value| $6.94). Model Brier 0.1446 vs market mid 0.1385:
+          the MARKET is better calibrated. Pre-registered config: n=1985,
+          win 39.7% vs break-even 43.0% (model said 49.2%), pnl/contract
+          -0.0325, t=-3.40, -10.1%/stake. IS n=1000 t=-2.57; OOS n=985
+          t=-2.24 - negative in both halves. One-minute BTC-delay test:
+          n=2506, win 41.7% vs break-even 44.2%, t=-2.93. All 6 sweep
+          variants negative (t -2.12 to -2.99). 7 variants counted; bar
+          t>=3.0. Win rate is nowhere near 65%.
+      - date: 2026-10-27
+        script: scripts/kalshi_backtest.py --days 30 (after code review)
+        window: same 30 days; one previously failed fetch recovered
+        result: >
+          Follow-up after an independent code review found no side, timing,
+          fee or variance bug. Fixes: failed fetches no longer cached, the
+          lag-1 run now counted (8 variants; bar still t>=3.0), runner now
+          decides only at minutes 5,7,9,11,13 with the full 60-bar vol like
+          the backtest. Re-run: n=1986, win 39.7% vs break-even 43.0%,
+          t=-3.43. Verdict unchanged. Reviewer's one model idea - add
+          basis-proxy noise to the variance (overconfidence) - is UNTESTED;
+          it would be a new pre-registered variant, not a fix to this one.
+    deployment_gate:
+      requires: n/a - verdict reached
+      blocked_by: significantly NEGATIVE on real Kalshi asks with a fresh
+        BTC price; the model buys exactly when it disagrees with a market
+        that is better informed than it (adverse selection), and the fee
+        turns roughly zero gross into a loss
+    status: sit-out
+    notes: |
+      Owner goal outcome (B) NO EDGE, reached on the backtest, so the forward
+      paper run was not needed to decide it. kalshi_bot/runner.py is built and
+      smoke-tested but should NOT be installed on the VPS for this config.
+      Combined with polymarket-btc-updown-fair-value and
+      polymarket-btc-5m-orderflow-trend: three measurements, two venues, no
+      edge in short-horizon BTC up/down from spot-vs-target fair value,
+      patterns, order flow or trend. Do not re-propose without a genuinely
+      new information source (not a re-tune of this model).
