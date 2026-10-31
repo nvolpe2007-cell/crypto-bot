@@ -75,3 +75,23 @@ PR #168 opened as draft, subscribed to PR activity. Backlog is now 42 open direc
 PRs touching these files (unchanged bottleneck — reviewer throughput, not finding
 availability; see #166 for the ongoing status thread). Not duplicating that escalation
 here since nothing about it changed this run.
+
+## Post-open: CI red, not this PR's fault, fixed anyway
+
+`check_run.completed` fired red on `test (3.12)` at the first push (`6a2c68d`):
+`tests/test_market_sentiment.py::TestTickRefreshCadence::test_rebuilds_snapshot_and_checks_alerts_when_any_fetch_runs`
+failed (`assert built["n"] == 1` → `assert 0 == 1`) — a file this PR's diff never touches.
+Root cause: the test sets `m._t_fg = m._t_cg = m._t_bc = 0.0` meaning "all due," but
+`_tick()` compares against `time.monotonic()`, which starts from an arbitrary reference
+(often VM boot). On a freshly-booted GitHub Actions runner, `time.monotonic()` can still
+be under the smallest refresh window (60s) when this test runs, so `tasks` stays empty
+and `_build_snapshot()` never fires — a runner-uptime race, confirmed non-reproducing
+locally (uptime ~950s) across repeated 3.11/3.12 full-suite runs.
+
+A fix for exactly this already existed, unmerged, on `dispatch/lane-status-pass-1019`
+(commit `fc74634`, 2026-10-29 — use a relative delta instead of the absolute `0.0`,
+matching this class's sibling tests). Cherry-picked it into this PR (now at `4eaeeac`)
+rather than waiting on that PR to merge first, per the CI-red handling rule (port an
+existing fix rather than widen the PR or wait). Commented on #168 with the diagnosis.
+`python -m pytest tests/ -q`: 3641 passed, 0 failed on 3.11 and 3.12. CI re-running on
+the new push as of this entry.
