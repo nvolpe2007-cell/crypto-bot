@@ -61,6 +61,13 @@ class PairsStrategy:
         self._divergence_start: Dict[Tuple[str, str], Optional[float]] = {
             p: None for p in self._pairs
         }
+        # divergence_sign: which side (A-leads vs B-leads) that divergence is on,
+        # so a leadership flip (z crossing from +threshold to -threshold without
+        # dipping back below threshold in between) is treated as a fresh
+        # divergence instead of inheriting the old direction's age.
+        self._divergence_sign: Dict[Tuple[str, str], Optional[int]] = {
+            p: None for p in self._pairs
+        }
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -183,7 +190,18 @@ class PairsStrategy:
             self._divergence_start[pair] = None
             return None
 
-        # Track how long this divergence has been active
+        # Track how long this divergence has been active — reset if the
+        # leader/lagger roles just flipped (spread crossed from +z to -z, or
+        # vice versa, without dipping back below ZSCORE_THRESHOLD in between).
+        # Without this, `age` keeps counting from the OLD direction's start
+        # time, so a brand-new divergence in the new direction can be rejected
+        # as stale (age > MAX_DIVERGENCE_AGE) or shortchanged on the freshness
+        # bonus purely because of unrelated history for the opposite direction.
+        sign = 1 if z > 0 else -1
+        if self._divergence_sign[pair] != sign:
+            self._divergence_start[pair] = None
+        self._divergence_sign[pair] = sign
+
         if self._divergence_start[pair] is None:
             self._divergence_start[pair] = now
         age = now - self._divergence_start[pair]
