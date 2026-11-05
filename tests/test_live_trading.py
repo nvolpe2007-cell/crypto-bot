@@ -66,9 +66,11 @@ from src.live_trading import (
     _daily_loss_halted,
     _sltp_circuit_alert,
     _sltp_circuit_cleared,
+    _atr_alive,
     run_live_trading_session,
     FEE_RATE,
     ATR_TRAIL_MULT,
+    _ATR_ALIVE_FLOOR,
 )
 from src.scientific_strategy import ScientificSignal
 import src.kill_switch as kill_switch
@@ -627,6 +629,41 @@ class TestUpdateChandelierStop:
         pos = self._pos(entry=50_000.0, sl=0.0, atr=400.0)
         _update_chandelier_stop(pos, 55_000.0)
         assert pos.stop_loss_price == pytest.approx(55_000.0 - ATR_TRAIL_MULT * 400.0)
+
+
+# ── _atr_alive ───────────────────────────────────────────────────────────────────
+#
+# paper_trading routes every entry through entry_checklist's `atr_alive` hard
+# veto, refusing setups whose ATR can't clear the round-trip cost (CLAUDE.md's
+# "Core principle" — costs dominate, and this gate is what keeps the bot from
+# churning out negative-EV trades in dead volatility). Before this fix,
+# live_trading's real-money entry path never ran any such check — it gated
+# purely on confidence. These tests guard that the live loop now refuses the
+# same dead-volatility setups paper already refuses, mirroring
+# entry_checklist._atr_alive's threshold and fail-open behavior exactly.
+
+class TestAtrAlive:
+    def test_atr_above_floor_passes(self):
+        sig = _make_signal(atr=500.0, close=50_000.0)  # ratio 1.0% >> floor
+        assert _atr_alive(sig) is True
+
+    def test_atr_below_floor_blocks(self):
+        # floor default = max(0.0005, 0.5 * 0.003) = 0.0015 (0.15%)
+        below = _ATR_ALIVE_FLOOR * 0.5
+        sig = _make_signal(atr=50_000.0 * below, close=50_000.0)
+        assert _atr_alive(sig) is False
+
+    def test_atr_exactly_at_floor_passes(self):
+        sig = _make_signal(atr=50_000.0 * _ATR_ALIVE_FLOOR, close=50_000.0)
+        assert _atr_alive(sig) is True
+
+    def test_missing_atr_fails_open(self):
+        sig = _make_signal(atr=0.0, close=50_000.0)
+        assert _atr_alive(sig) is True
+
+    def test_missing_close_fails_open(self):
+        sig = _make_signal(atr=500.0, close=0.0)
+        assert _atr_alive(sig) is True
 
 
 # ── close_long ───────────────────────────────────────────────────────────────────
