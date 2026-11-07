@@ -83,6 +83,7 @@ def _perp_position(entry_price: float = 65_000.0) -> PaperPosition:
         margin_locked        = 21.67,
         funding_accrued      = -0.015,
         last_funding_ts      = datetime(2024, 6, 2, 8, 0, 0, tzinfo=timezone.utc),
+        liquidation_price    = entry_price * 0.72,
     )
 
 
@@ -292,6 +293,60 @@ class TestPerpStateRoundTrip:
 
         assert trader2.account.positions['ETH/USD'].is_perp is False
         assert trader2.account.positions['ETH/USD'].leverage == pytest.approx(1.0)
+
+
+class TestLiquidationPriceRoundTrip:
+    """liquidation_price is the perp liquidation guard that
+    PaperTrader.update_unrealized_pnl() checks every tick (only when > 0 —
+    see src/paper_trader.py). It was missing from both _save_open_positions'
+    output and _load_open_positions' PaperPosition(...) reconstruction, so a
+    restart (deploy, crash recovery, VPS reboot) while a leveraged perp
+    position was open silently reset it to the dataclass default of 0.0 —
+    which reads as "no liquidation price" and disables the liquidation check
+    entirely for that position until it closes by some other exit."""
+
+    def test_liquidation_price_survives(self, clean_positions_file):
+        trader = _fresh_trader()
+        pos = _perp_position()
+        trader.account.positions['BTC/USD'] = pos
+
+        _save_open_positions(trader)
+        trader2 = _fresh_trader()
+        _load_open_positions(trader2)
+
+        restored = trader2.account.positions['BTC/USD']
+        assert restored.liquidation_price == pytest.approx(pos.liquidation_price)
+        assert restored.liquidation_price > 0
+
+    def test_spot_position_liquidation_price_is_zero(self, clean_positions_file):
+        trader = _fresh_trader()
+        trader.account.positions['ETH/USD'] = _spot_position()
+
+        _save_open_positions(trader)
+        trader2 = _fresh_trader()
+        _load_open_positions(trader2)
+
+        assert trader2.account.positions['ETH/USD'].liquidation_price == pytest.approx(0.0)
+
+    def test_old_snapshot_without_field_defaults_to_zero(self, clean_positions_file):
+        """A snapshot written before this fix (no 'liquidation_price' key) must
+        still load without raising — defaulting to 0.0 (no live-impact
+        regression vs. the pre-fix behavior for already-saved files)."""
+        trader = _fresh_trader()
+        trader.account.positions['BTC/USD'] = _perp_position()
+        _save_open_positions(trader)
+
+        with open(clean_positions_file) as f:
+            data = json.load(f)
+        del data['positions'][0]['liquidation_price']
+        with open(clean_positions_file, 'w') as f:
+            json.dump(data, f)
+
+        trader2 = _fresh_trader()
+        n = _load_open_positions(trader2)
+
+        assert n == 1
+        assert trader2.account.positions['BTC/USD'].liquidation_price == pytest.approx(0.0)
 
 
 class TestProbabilityGateContextRoundTrip:
