@@ -674,7 +674,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 pos      = trader.positions.get(symbol)
                 pos_side = pos.entry_signal.signal if pos and pos.entry_signal else None
 
-                current_equity = trader.account.initial_capital + trader.account.total_pnl
+                current_equity = trader.get_summary()['total_equity']
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
                 if (sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE
