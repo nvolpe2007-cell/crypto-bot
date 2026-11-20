@@ -540,7 +540,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                     if exit_reason:
                         trade = await trader.close_long(sym, price, exit_reason)
                         if trade:
-                            equity = trader.account.initial_capital + trader.account.total_pnl
+                            equity = trader.get_summary()['total_equity']
                             equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
                             recent_trades.append(_trade_dict(trade, sym, exit_reason))
 
@@ -743,7 +743,7 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 elif sig.signal == Signal.SELL and pos is not None:
                     trade = await trader.close_long(symbol, current_price, "SIGNAL")
                     if trade:
-                        equity = trader.account.initial_capital + trader.account.total_pnl
+                        equity = trader.get_summary()['total_equity']
                         equity_curve.append({'t': _ts(), 'v': round(equity, 2)})
                         recent_trades.append(_trade_dict(trade, symbol, "SIGNAL"))
 
