@@ -816,11 +816,12 @@ def _atr_alive(sig: ScientificSignal) -> bool:
     has never run that check: it gates entries on confidence alone, so a
     real-money order can fire in dead-volatility conditions paper already
     knows to refuse. Mirrors entry_checklist._atr_alive exactly, including
-    its fail-open behavior when ATR/price data is unavailable.
+    its fail-open behavior when ATR/price data is unavailable (None) and its
+    veto of a genuinely flat tape (ATR == 0.0, see PR #162).
     """
     atr = getattr(sig, 'atr', None)
     px  = getattr(sig, 'close', None)
-    if not atr or not px:
+    if atr is None or px is None or px <= 0:
         return True
     return (atr / px) >= _ATR_ALIVE_FLOOR
 

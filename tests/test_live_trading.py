@@ -658,8 +658,15 @@ class TestAtrAlive:
         assert _atr_alive(sig) is True
 
     def test_missing_atr_fails_open(self):
-        sig = _make_signal(atr=0.0, close=50_000.0)
+        sig = _make_signal(atr=500.0, close=50_000.0)
+        sig.atr = None
         assert _atr_alive(sig) is True
+
+    def test_zero_atr_blocks(self):
+        # A flat tape computes atr == 0.0 (not None) -- the most extreme
+        # dead-vol case. Must be vetoed, matching entry_checklist (PR #162).
+        sig = _make_signal(atr=0.0, close=50_000.0)
+        assert _atr_alive(sig) is False
 
     def test_missing_close_fails_open(self):
         sig = _make_signal(atr=500.0, close=0.0)
