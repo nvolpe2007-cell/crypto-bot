@@ -366,7 +366,7 @@ def _atr_alive(ctx: CheckContext):
     See journal audit note on _ATR_ALIVE_FLOOR above."""
     atr = getattr(ctx.sig, "atr", None)
     px  = getattr(ctx.sig, "close", None)
-    if not atr or not px:
+    if atr is None or px is None or px <= 0:
         return True, "no atr/price"
     ratio = atr / px
     if ratio >= _ATR_ALIVE_FLOOR:
