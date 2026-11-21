@@ -26,6 +26,7 @@ import pandas as pd
 
 from .indicators import Signal, prepare_ohlcv_dataframe
 from .scientific_strategy import ScientificStrategy, ScientificSignal, compute_position_size, _size_multiplier as _get_size_mult
+from .entry_checklist import _ATR_ALIVE_FLOOR
 from .trade_journal import TradeJournal, TradeRecord
 from .learner import Learner
 from .exchange import ExchangeConnection, CircuitBreakerOpen
@@ -315,7 +316,46 @@ class LiveTrader:
                 self.notifier.send_error(f"SELL FAILED {symbol} @ ${current_price:.2f} — {e} — close manually on Kraken!")
             return None
 
+        # Verify fill — mirror open_long()'s check. Kraken market orders can
+        # return status='' on the initial response before the fill is fully
+        # processed; without this, an unconfirmed sell would still delete the
+        # position below, leaving _sltp_watcher() no longer protecting a
+        # position that may still be live on Kraken.
+        status     = order.get('status', '')
         exec_price = float(order.get('average') or order.get('price') or current_price)
+        order_id   = order.get('id', '')
+
+        if status == '' and order_id:
+            logger.warning(
+                f"[LIVE] Sell order {order_id} returned empty status — polling for fill confirmation"
+            )
+            try:
+                polled     = await self.exchange.fetch_order(order_id, symbol)
+                status     = polled.get('status', '')
+                polled_price = float(polled.get('average') or polled.get('price') or 0)
+                if polled_price > 0:
+                    exec_price = polled_price
+                polled_fee = float((polled.get('fee') or {}).get('cost', 0))
+                if polled_fee > 0:
+                    order = {**order, 'fee': {'cost': polled_fee}}
+            except Exception as e:
+                logger.warning(
+                    f"[LIVE] fetch_order({order_id}) failed during sell verify: {e} "
+                    f"— treating empty status as unconfirmed"
+                )
+                status = 'unknown'
+
+        if status not in ('closed', 'filled'):
+            logger.error(
+                f"[LIVE] Sell order {order_id} status={status!r} — not confirmed filled, "
+                f"keeping position open (will be retried; sltp_watcher keeps protecting it)"
+            )
+            if self.notifier:
+                self.notifier.send_error(
+                    f"{symbol} sell order {order_id} status {status!r} — check Kraken manually"
+                )
+            return None
+
         exit_fee   = float(order.get('fee', {}).get('cost', 0) or pos.size_usd * FEE_RATE)
         self.account.total_fees += exit_fee
 
@@ -674,12 +714,18 @@ async def run_live_trading_session(exchange:          ExchangeConnection,
                 pos      = trader.positions.get(symbol)
                 pos_side = pos.entry_signal.signal if pos and pos.entry_signal else None
 
-                current_equity = trader.account.initial_capital + trader.account.total_pnl
+                current_equity = trader.get_summary()['total_equity']
 
                 # ── LONG ENTRY ─────────────────────────────────────────────────
                 if (sig.is_buy and pos is None and sig.confidence >= LIVE_MIN_CONFIDENCE
                         and not killed and not daily_loss_halted):
                     if sentiment_monitor and not sentiment_monitor.allows_long(symbol):
+                        continue
+                    if not _atr_alive(sig):
+                        logger.debug(
+                            f"[LIVE] {symbol} skip entry — atr/px below cost "
+                            f"floor {_ATR_ALIVE_FLOOR*100:.2f}% (dead volatility)"
+                        )
                         continue
 
                     size_usd = compute_position_size(sig.confidence, current_equity)
@@ -798,6 +844,26 @@ async def start_live_session(exchange, symbols, timeframe, notifier, sentiment,
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _atr_alive(sig: ScientificSignal) -> bool:
+    """Cost-aware volatility floor for the LIVE (real-money) entry path.
+
+    paper_trading routes every entry through entry_checklist's `atr_alive`
+    hard veto, which refuses a setup whose expected per-bar move (ATR) is
+    below the round-trip cost — a structurally negative-EV trade that can
+    only bleed out via fees (see CLAUDE.md "Core principle"). live_trading
+    has never run that check: it gates entries on confidence alone, so a
+    real-money order can fire in dead-volatility conditions paper already
+    knows to refuse. Mirrors entry_checklist._atr_alive exactly, including
+    its fail-open behavior when ATR/price data is unavailable (None) and its
+    veto of a genuinely flat tape (ATR == 0.0, see PR #162).
+    """
+    atr = getattr(sig, 'atr', None)
+    px  = getattr(sig, 'close', None)
+    if atr is None or px is None or px <= 0:
+        return True
+    return (atr / px) >= _ATR_ALIVE_FLOOR
+
 
 def _update_chandelier_stop(pos: LivePosition, current_price: float) -> None:
     """Ratchet pos.stop_loss_price up as price makes new highs (chandelier exit) —
