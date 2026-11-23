@@ -61,3 +61,36 @@ recorded here for whoever next reviews the backlog rather than pushed as an inte
 `python -m pytest tests/ -q` → 3653 passed, 0 failed. No source files touched — worklog-only
 change on the existing status-pass branch/PR (#182), per the established convention of reusing
 this branch across consecutive status-pass days instead of opening a new PR each time.
+
+## Addendum (later the same UTC day): CI went red on #182 — root-caused and fixed, cross-lane
+
+A `test (3.11)` CI run on this PR failed with `tests/test_market_sentiment.py::TestTickRefreshCadence
+::test_rebuilds_snapshot_and_checks_alerts_when_any_fetch_runs` — `assert built["n"] == 1` got `0`.
+Not this PR's diff (worklog-only, no `src/`/`tests/` change up to that point) and not a master
+regression (master unchanged at `d4b487c` since day 37, both of whose CI runs were green) — so
+per the "find the root cause, don't just re-run" rule, traced it instead of assuming flake:
+
+The test sets `m._t_fg = m._t_cg = m._t_bc = 0.0` meaning "all due", then asserts `_tick()` fetches
+and rebuilds. `_tick()`'s due-check is `time.monotonic() - self._t_fg >= _REFRESH_FG` (etc.), and
+`time.monotonic()` is time-since-an-arbitrary-epoch (on Linux, since boot) — **not** time-since-zero.
+On a long-lived container it's comfortably over the largest threshold (3600s), so the test passes;
+on a fresh CI runner where the test executes within ~60s of the VM booting, `time.monotonic()` can
+itself be under `_REFRESH_BC` (60s), making every due-check false, `tasks` stays empty, and neither
+`_build_snapshot` nor `_check_alerts` ever runs — exactly the observed `0 == 1`. Reproduced locally:
+this container's `time.monotonic()` was ~99s mid-session and the test passed in isolation; the
+failure only manifests when the runner's absolute monotonic clock is still small at that point in
+the suite, which is a property of the CI VM's age, not of any code this PR touches.
+
+**Fix** (`tests/test_market_sentiment.py`, one line): changed the sentinel from `0.0` to `-1e9`, so
+the due-check is satisfied regardless of what `time.monotonic()` happens to be on the host — no
+behavior change to `src/market_sentiment.py` itself, test-only. Full suite re-run clean: 3653
+passed, 0 failed.
+
+This file isn't in the directional lane's file list (`src/paper_trading.py`,
+`src/scientific_strategy.py`, `src/entry_checklist.py`, `src/live_trading.py`,
+`src/pairs_strategy.py`, `src/orderflow_ws.py`, `src/indicators.py`), so noting the cross-lane
+touch here per the coordination rule: `src/market_sentiment.py` / its tests aren't explicitly
+owned in the lane map either (not in directional, not in the brain/risk/observability list) —
+treating this as a shared-infra test-flakiness fix rather than a lane-owned change, since it's
+one line, test-only, and was blocking this PR's CI. Applied on this PR's branch since that's
+where the failure surfaced and this run is already watching it for exactly this reason.
