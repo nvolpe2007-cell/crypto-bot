@@ -1,0 +1,16 @@
+# Canonical stockbot ORB interactive Telegram alert cron line (source of truth).
+#
+# LONG-ONLY setup alerts for SPY/QQQ/AAPL/NVDA (STOCKBOT_SYMBOLS in .env). Each
+# tick: scans for a fresh ORB breakout and posts a chart with "trade for me
+# (paper)" / "I'll take it myself" buttons; also polls Telegram for button
+# presses on alerts still pending. Sources .env for TELEGRAM_BOT_TOKEN/
+# TELEGRAM_CHAT_ID (Telegram creds) and STOCKBOT_TELEGRAM/STOCKBOT_SYMBOLS/
+# STOCKBOT_DIR (feature config) — matches the meme_radar/callout_scorecard
+# pattern of jobs that need .env, unlike the plain forward-test runners.
+#
+# Window: 13:00-21:55 UTC covers 9:30am-4:00pm ET across both EDT (UTC-4) and
+# EST (UTC-5) with slack either side; decide()'s own ET wall-clock gating means
+# ticks outside the real session just no-op (fetches bars, finds nothing to do).
+# Uses /usr/bin/python3 (system), where matplotlib/pandas/numpy/yfinance were
+# installed — NOT ./venv/bin/python, which doesn't have them.
+*/5 13-21 * * 1-5 cd /opt/crypto-bot && set -a && . ./.env && set +a && /usr/bin/python3 -m stockbot.orb_alerts >> logs/stockbot_orb_alerts.log 2>&1

@@ -6,3 +6,6 @@ numpy>=1.24
 # Optional: only for the Alpaca PAPER live runner (stockbot.live_paper). Lazy-
 # imported, so the backtest works without it.
 # alpaca-py>=0.20
+# Optional: only for orb_alerts.py's chart image (Telegram setup alerts). Lazy-
+# imported; without it, orb_alerts falls back to a text-only alert.
+# matplotlib>=3.8
