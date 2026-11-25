@@ -230,6 +230,13 @@ def _max_positions(ctx: CheckContext):
 
 
 def _ofi_aligned(ctx: CheckContext):
+    # NOTE: vetoes on ANY negative ofi_score, including the weakest/noise-level
+    # opposing tier scientific_strategy.py assigns (magnitude < 0.15 -> -3.0).
+    # scientific_strategy.py's module docstring describes this as blocking only
+    # "strongly opposing" OFI -- that's stricter than what's documented. See
+    # tests/test_entry_checklist.py::TestOfiAligned and the worklog entry that
+    # flagged this divergence; left as-is pending a human decision on whether
+    # to loosen the threshold (a live-frequency-affecting change).
     if ctx.sig.ofi is None:
         return True, "no ofi"
     if ctx.sig.ofi_score < 0:

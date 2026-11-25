@@ -300,6 +300,19 @@ class TestOfiAligned:
         assert ok is False
         assert "ofi" in reason.lower()
 
+    def test_fails_even_on_weak_noise_level_opposition_not_just_strong(self):
+        # Pins current behavior: scientific_strategy.py's module docstring says
+        # "OFI must not be strongly opposing", but this hard check vetoes on
+        # ANY negative ofi_score — including the weakest opposing tier
+        # (magnitude < 0.15, scored -3.0 in scientific_strategy.py), which is
+        # noise-level, not "strong" opposition. Flagged for human review in
+        # worklog rather than changed here, since loosening this hard gate
+        # would affect live trade frequency (CLAUDE.md: don't loosen gates to
+        # force more trades without forward-test evidence).
+        ok, reason = _ofi_aligned(_ctx(sig=_Sig(ofi=-0.02, ofi_score=-3.0)))
+        assert ok is False
+        assert "ofi" in reason.lower()
+
 
 # ── Hard check: sentiment ─────────────────────────────────────────────────────
 
