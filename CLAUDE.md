@@ -19,6 +19,14 @@ any agent's private memory. Rules:
    construction (2026-07-28: 21 of 25 open PRs `CONFLICTING`, this file the common factor).
    One file per entry means two agents never collide. Read with
    `python scripts/worklog_index.py`.
+6. **Consecutive no-op "status pass" runs (option c) reuse the one open status-pass PR/branch —
+   don't open a new one each day.** Add a new dated file under `worklog/` as usual (rule 5 still
+   applies — no shared file to collide on), but push it as another commit onto the existing
+   `dispatch/lane-status-pass-*` branch/PR if the last one is still open and unmerged, instead of
+   branching again. Open a fresh branch only once that PR merges, or once a run has an actual code
+   change to make. This was added 2026-11-16 after 4 straight no-op days (PRs #179–#182) each
+   opened a new branch for the identical "nothing new" finding, growing the backlog by one
+   never-merged PR per day with no offsetting value — see `worklog/2026-11-16-dispatch-*.md`.
 
 ## Project Location
 `D:\crypto-bot\` (authoritative). Deployed to a Hetzner VPS at `178.105.41.226`.

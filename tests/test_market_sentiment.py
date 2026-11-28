@@ -314,7 +314,7 @@ class TestTickRefreshCadence:
         monkeypatch.setattr(m, "_build_snapshot", lambda: built.__setitem__("n", built["n"] + 1))
         monkeypatch.setattr(m, "_check_alerts", lambda: alerted.__setitem__("n", alerted["n"] + 1))
 
-        m._t_fg = m._t_cg = m._t_bc = 0.0  # all due
+        m._t_fg = m._t_cg = m._t_bc = -1e9  # all due, regardless of this host's monotonic epoch
         asyncio.run(m._tick())
         assert built["n"] == 1
         assert alerted["n"] == 1
